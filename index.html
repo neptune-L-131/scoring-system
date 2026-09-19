@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>计分系统</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="app-header">
+  <div>
+    <div class="app-title">计分系统</div>
+    <div class="app-date" id="todayDate"></div>
+  </div>
+  <div class="header-btns">
+    <span class="hchip" id="exemptChip" onclick="goTab('cycle')" title="查看周期设定" style="display:none"></span>
+    <button class="hbtn" id="themeToggle" onclick="toggleTheme()">🌙</button>
+    <button class="hbtn" id="installBtn" onclick="installApp()">下载至桌面</button>
+    <button class="hbtn" onclick="exportData()">导出</button>
+    <button class="hbtn" onclick="document.getElementById('importFile').click()">导入</button>
+    <input type="file" id="importFile" accept=".json" style="display:none" onchange="importData(event)">
+  </div>
+</div>
+
+<div class="tab-bar">
+  <div class="tab" data-tab="work" onclick="goTab('work')">打工</div>
+  <div class="tab" data-tab="bank" onclick="goTab('bank')">银行</div>
+  <div class="tab" data-tab="shop" onclick="goTab('shop')">商店</div>
+  <div class="tab" data-tab="cycle" onclick="goTab('cycle')">周期</div>
+</div>
+
+<div class="page">
+
+<!-- ==================== 打工 ==================== -->
+<div class="panel active" id="panel-work">
+  <div class="score-bar">
+    <div class="score-cell">
+      <div class="label">活力点</div>
+      <div class="num" id="wVitality">0</div>
+    </div>
+    <div class="score-cell">
+      <div class="label">进度值</div>
+      <div class="num" id="wProgress">0</div>
+      <div class="sub" id="wProgressSub"></div>
+    </div>
+    <div class="score-cell">
+      <div class="label">成果点</div>
+      <div class="num" id="wAchievement">0</div>
+    </div>
+  </div>
+
+  <!-- Domain pills -->
+  <div class="domain-pills" id="domainPills"></div>
+
+  <!-- Collections -->
+  <div class="sec-head sec-head-major">
+    <div class="sec-title">任务集合</div>
+    <div style="display:flex;gap:6px">
+      <button class="btn btn-sm" onclick="openTaskModal()">+ 新建任务</button>
+      <button class="btn btn-sm" onclick="toggleInline('collAdd')">+ 新集合</button>
+    </div>
+  </div>
+  <div class="inline-add" id="collAdd" style="display:none">
+    <input type="text" id="collAddName" placeholder="输入集合名称" maxlength="20" autocomplete="off">
+    <button class="btn btn-sm" onclick="addCollection()">添加</button>
+  </div>
+  <div id="taskGroups"></div>
+
+  <div class="sec-head sec-head-major" style="margin-top:24px">
+    <div class="sec-title">档案馆 <span class="sec-meta" id="archiveMeta"></span></div>
+  </div>
+  <div id="archiveGroups"></div>
+</div>
+
+<!-- ==================== 银行 ==================== -->
+<div class="panel" id="panel-bank">
+  <div class="score-bar">
+    <div class="score-cell"><div class="label">活力点</div><div class="num" id="bVitality">0</div><div class="sub" id="bVitalitySub"></div></div>
+    <div class="score-cell"><div class="label">进度值</div><div class="num" id="bProgress">0</div><div class="sub" id="bProgressSub"></div></div>
+    <div class="score-cell"><div class="label">成果点</div><div class="num" id="bAchievement">0</div><div class="sub" id="bAchSub"></div></div>
+  </div>
+
+  <div class="sec-head">
+    <div class="sec-title">能力雷达</div>
+    <button class="btn btn-sm" onclick="openMetricModal()">+ 自定义指标</button>
+  </div>
+  <div class="chart-box" id="radarBox">
+    <div class="empty" id="radarEmpty" style="display:none"></div>
+    <svg class="radar-svg" id="radarChart" viewBox="0 0 300 300"></svg>
+  </div>
+  <div class="metric-chips" id="metricChips"></div>
+
+  <div class="loan-box" id="loanBox" style="display:none"></div>
+
+  <div class="sec-head"><div class="sec-title">收支总览</div></div>
+  <div class="bank-grid">
+    <div class="stat-box"><div class="st-label">活力点收入</div><div class="st-val" id="vIncome">0</div><div class="st-sub">消费 <span id="vSpend">0</span></div></div>
+    <div class="stat-box"><div class="st-label">进度值收入</div><div class="st-val" id="pIncome">0</div><div class="st-sub">打卡 <span id="totalCheckins">0</span> 次</div></div>
+    <div class="stat-box"><div class="st-label">成果点收入</div><div class="st-val" id="aIncome">0</div><div class="st-sub">解锁 <span id="achUnlocked">0</span> 个</div></div>
+    <div class="stat-box"><div class="st-label">成果点消费</div><div class="st-val" id="aSpend">0</div><div class="st-sub">购买 <span id="totalPurchases">0</span> 件</div></div>
+  </div>
+
+  <div class="sec-head sec-head-major" style="margin-top:8px">
+    <div class="sec-title">成果里程碑</div>
+    <button class="btn btn-sm" onclick="openAchModal()">+ 新建里程碑</button>
+  </div>
+  <div id="achGroups"></div>
+
+  <div class="chart-box">
+    <div class="ch-head">
+      <div class="ch-title">近 7 日趋势</div>
+      <div class="ch-legend">
+        <span class="lg-v clickable" onclick="toggleChartSeries('vitality')">活力</span>
+        <span class="lg-p clickable" onclick="toggleChartSeries('progress')">进度</span>
+        <span class="lg-a clickable" onclick="toggleChartSeries('achievement')">成果</span>
+        <button class="ch-toggle" id="trendModeBtn" onclick="toggleTrendMode()">日增</button>
+      </div>
+    </div>
+    <svg class="chart-svg" id="trendChart" viewBox="0 0 700 140" preserveAspectRatio="none"></svg>
+  </div>
+
+  <div class="chart-box">
+    <div class="ch-head">
+      <div class="ch-title">活力效能分析</div>
+      <div class="ch-legend">
+        <span class="lg-v">产出</span>
+        <span class="lg-p">投资</span>
+        <span class="lg-bar-out">消费</span>
+      </div>
+    </div>
+    <svg class="chart-svg" id="flowChart" viewBox="0 0 700 180" preserveAspectRatio="none"></svg>
+  </div>
+
+  <div class="chart-box">
+    <div class="ch-head">
+      <div class="ch-title">周综合对比</div>
+      <div class="ch-legend">
+        <span class="lg-p">总体分数</span>
+        <span class="lg-v">投资率(%)</span>
+      </div>
+      <div class="wc-summary" id="weekCompareSummary"></div>
+    </div>
+    <svg class="chart-svg" id="weekCompareChart" viewBox="0 0 700 220" preserveAspectRatio="none"></svg>
+  </div>
+  <div class="chart-tooltip" id="chartTooltip" style="display:none"></div>
+
+  <div class="sec-head"><div class="sec-title">流水记录</div><div class="sec-meta" id="logMeta"></div></div>
+  <div class="log-list" id="logList"></div>
+</div>
+
+<!-- ==================== 商店 ==================== -->
+<div class="panel" id="panel-shop">
+  <div class="score-bar">
+    <div class="score-cell"><div class="label">活力点</div><div class="num" id="sVitality">0</div></div>
+    <div class="score-cell" style="grid-column:span 2"><div class="label">成果点</div><div class="num" id="sAchievement">0</div></div>
+  </div>
+
+  <div class="sec-head"><div class="sec-title">商品</div><button class="btn btn-sm" onclick="openProdModal()">+ 上架商品</button></div>
+  <div class="sec-head" style="margin-bottom:8px"><div class="sec-title" style="font-size:13px;color:var(--text-3)">商品分类</div><button class="btn btn-sm" onclick="toggleInline('shopCatAdd')">+ 新分类</button></div>
+  <div class="inline-add" id="shopCatAdd" style="display:none">
+    <input type="text" id="shopCatAddName" placeholder="输入分类名称" maxlength="20" autocomplete="off">
+    <button class="btn btn-sm" onclick="addShopCategory()">添加</button>
+  </div>
+  <div id="shopList"></div>
+
+  <div class="sec-head" style="margin-top:24px"><div class="sec-title">购买记录</div></div>
+  <div class="log-list" id="purchaseList"></div>
+</div>
+
+<!-- ==================== 周期 ==================== -->
+<div class="panel" id="panel-cycle">
+  <div class="score-bar">
+    <div class="score-cell"><div class="label">豁免卡余额</div><div class="num" id="cyCardBal">0</div><div class="sub" id="cyCardSub"></div></div>
+    <div class="score-cell"><div class="label">运行中活动</div><div class="num" id="cyGranted" style="font-size:16px">0</div><div class="sub" id="cyGrantedSub"></div></div>
+    <div class="score-cell"><div class="label">下次结算</div><div class="num" id="cyNext" style="font-size:16px">—</div><div class="sub" id="cyNextSub"></div></div>
+  </div>
+
+  <div class="sec-head sec-head-major">
+    <div class="sec-title">周期活动</div>
+    <div style="display:flex;gap:6px">
+      <div class="sec-meta" style="align-self:center">设定周期规则，自动发放奖励 / 道具</div>
+      <button class="btn btn-sm" onclick="openActivityModal()">+ 新建活动</button>
+    </div>
+  </div>
+  <div id="cycleActivities"></div>
+
+  <div class="sec-head sec-head-major" style="margin-top:24px">
+    <div class="sec-title">断更豁免卡</div>
+  </div>
+  <div class="rule-card" id="exemptUsePanel"></div>
+</div>
+
+</div>
+
+<!-- ===== Task Modal ===== -->
+<div class="modal-bg" id="taskModal">
+  <div class="modal">
+    <h2 id="taskModalTitle">新建任务</h2>
+    <input type="hidden" id="taskId">
+    <div class="fg">
+      <label>任务名称</label>
+      <input type="text" id="taskName" placeholder="例如：晨跑30分钟" maxlength="30" autocomplete="off">
+    </div>
+    <div class="fg">
+      <label>解释/定义 <span class="h">为AI助手提供任务说明（不显示在卡片上）</span></label>
+      <textarea id="taskDesc" rows="2" placeholder="例如：每天早晨跑步30分钟，锻炼身体并培养自律习惯" style="resize:vertical;font-family:inherit"></textarea>
+    </div>
+    <div class="fg">
+      <label>所属集合</label>
+      <select id="taskCollection"></select>
+    </div>
+    <div class="fg">
+      <label>分值类型 <span class="h">可同时选中，打卡时同时获得</span></label>
+      <div class="type-pick">
+        <div class="type-opt v" id="tpV" onclick="toggleScoreType('vitality')">活力点</div>
+        <div class="type-opt p" id="tpP" onclick="toggleScoreType('progress')">进度值</div>
+      </div>
+    </div>
+    <div class="fg" id="domainFG" style="display:none">
+      <label>进度领域 <span class="h">可多选，进度值将均分到所选领域</span></label>
+      <div id="taskDomainList" class="domain-checklist"></div>
+    </div>
+    <div class="fg">
+      <label>初始数值 <span class="h">每次打卡基础分（支持小数）</span></label>
+      <input type="number" id="taskInitial" value="10" min="0" step="0.1">
+    </div>
+    <div class="fg-row">
+      <div class="fg"><label>利率 <span class="h">每连胜1天加成%</span></label><input type="number" id="taskInterest" value="10" min="0" step="0.1"></div>
+      <div class="fg"><label>债率 <span class="h">断更1天扣成%</span></label><input type="number" id="taskDebt" value="5" min="0" step="0.1"></div>
+    </div>
+    <div class="fg">
+      <label>活力点花费 <span class="h">每次打卡消耗的活力点，0=无消耗</span></label>
+      <input type="number" id="taskCost" value="0" min="0" step="0.1">
+    </div>
+    <div class="fg" id="recalcFG" style="display:none">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" id="taskRecalc" style="width:auto;flex-shrink:0">
+        <span>重新计算历史数据 <span class="h" id="recalcHint">用新参数重放所有打卡记录</span></span>
+      </label>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal('taskModal')">取消</button>
+      <button class="btn" id="taskSaveBtn">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Achievement Modal ===== -->
+<div class="modal-bg" id="achModal">
+  <div class="modal">
+    <h2 id="achModalTitle">新建里程碑</h2>
+    <input type="hidden" id="achId">
+    <div class="fg">
+      <label>里程碑名称</label>
+      <input type="text" id="achName" placeholder="例如：初露锋芒" maxlength="20" autocomplete="off">
+    </div>
+    <div class="fg">
+      <label>所属领域</label>
+      <select id="achDomain"></select>
+    </div>
+    <div class="fg">
+      <label>进度值门槛 <span class="h">该领域进度达到此值解锁（支持小数）</span></label>
+      <input type="number" id="achThreshold" value="100" min="0" step="0.1">
+    </div>
+    <div class="fg">
+      <label>成果点数 <span class="h">解锁后获得（支持小数）</span></label>
+      <input type="number" id="achPoints" value="1" min="0.1" step="0.1">
+    </div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal('achModal')">取消</button>
+      <button class="btn" id="achSaveBtn">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Metric (Radar) Modal ===== -->
+<div class="modal-bg" id="metricModal">
+  <div class="modal">
+    <h2 id="metricModalTitle">自定义指标</h2>
+    <input type="hidden" id="metricId">
+    <div class="fg">
+      <label>指标名称</label>
+      <input type="text" id="metricName" placeholder="例如：综合成长" maxlength="12" autocomplete="off">
+    </div>
+    <div class="fg">
+      <label>关联领域 <span class="h">可多选，指标值 = 所选领域进度之和</span></label>
+      <div class="domain-checklist" id="metricDomainList"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal('metricModal')">取消</button>
+      <button class="btn" id="metricSaveBtn">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Activity (周期活动) Modal ===== -->
+<div class="modal-bg" id="activityModal">
+  <div class="modal">
+    <h2 id="activityModalTitle">新建周期活动</h2>
+    <input type="hidden" id="activityId">
+
+    <div class="acc open" id="accBasic">
+      <div class="acc-head" onclick="toggleAcc('accBasic')">
+        <div class="acc-title">基本信息</div>
+        <div class="acc-sum" id="accBasicSum"></div>
+        <span class="acc-arrow">▾</span>
+      </div>
+      <div class="acc-body">
+        <div class="fg">
+          <label>活动名称</label>
+          <input type="text" id="activityName" placeholder="例如：周进步奖励" maxlength="20" autocomplete="off">
+        </div>
+        <div class="fg-row">
+          <div class="fg">
+            <label>周期 <span class="h">积分按周期独立统计，历史累计不参与</span></label>
+            <select id="activityPeriod" onchange="activityPeriodChanged()">
+              <option value="day">每天</option>
+              <option value="week" selected>每周</option>
+              <option value="month">每月</option>
+            </select>
+          </div>
+          <div class="fg" id="activityAnchorFg">
+            <label>周起始日</label>
+            <select id="activityAnchor">
+              <option value="1">周一</option><option value="2">周二</option><option value="3">周三</option>
+              <option value="4">周四</option><option value="5">周五</option><option value="6">周六</option><option value="7">周日</option>
+            </select>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="acc" id="accCond">
+      <div class="acc-head" onclick="toggleAcc('accCond')">
+        <div class="acc-title">前提条件</div>
+        <div class="acc-sum" id="accCondSum"></div>
+        <span class="acc-arrow">▾</span>
+      </div>
+      <div class="acc-body">
+        <div class="fg">
+          <label>满足方式</label>
+          <select id="activityCondMode" onchange="updateActivitySummary()">
+            <option value="all">全部满足（且）</option>
+            <option value="any">任一满足（或）</option>
+          </select>
+        </div>
+        <div class="fg">
+          <label>前提项 <span class="h">每项由「状态A｜主体A｜要求｜时间限定｜状态B」五字段构成；不添加=无条件触发</span></label>
+          <div id="activityCondItems"></div>
+          <button class="btn btn-sm" style="margin-top:4px" onclick="addCondItem()">+ 添加前提</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="acc" id="accResult">
+      <div class="acc-head" onclick="toggleAcc('accResult')">
+        <div class="acc-title">奖励结果</div>
+        <div class="acc-sum" id="accResultSum"></div>
+        <span class="acc-arrow">▾</span>
+      </div>
+      <div class="acc-body">
+        <div class="fg">
+          <label>奖励项 <span class="h">分类选择，可指定关联任务/领域（不指定也行）</span></label>
+          <div id="activityResultDetails"></div>
+          <button class="btn btn-sm" style="margin-top:4px" onclick="addRewardRow()">+ 添加奖励项</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="modal-foot" style="flex-wrap:wrap">
+      <button class="btn" onclick="closeModal('activityModal')">取消</button>
+      <button class="btn btn-danger" id="activityDeleteBtn" style="display:none;flex:0 0 auto" onclick="askDelActivityFromModal()">删除活动</button>
+      <button class="btn" id="activitySaveBtn">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Activity Delete Modal ===== -->
+<div class="modal-bg" id="activityDeleteModal">
+  <div class="modal">
+    <h2>删除周期活动</h2>
+    <p style="font-size:13px;color:var(--text-2);line-height:1.7;margin-bottom:18px" id="activityDeleteMsg"></p>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <button class="btn" onclick="doDeleteActivity(false)">删除并保留历史获得</button>
+      <button class="btn btn-danger" onclick="doDeleteActivity(true)">删除并撤销历史获得</button>
+      <button class="btn" onclick="closeModal('activityDeleteModal')">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Product Modal ===== -->
+<div class="modal-bg" id="prodModal">
+  <div class="modal">
+    <h2 id="prodModalTitle">上架商品</h2>
+    <input type="hidden" id="prodId">
+    <div class="fg"><label>商品名称</label><input type="text" id="prodName" placeholder="例如：看一部电影" maxlength="30" autocomplete="off"></div>
+    <div class="fg"><label>分类</label><select id="prodCategory"></select></div>
+    <div class="fg"><label>描述 <span class="h">选填</span></label><input type="text" id="prodDesc" placeholder="简单说明" maxlength="50" autocomplete="off"></div>
+    <div class="fg">
+      <label>支付货币</label>
+      <div class="type-pick">
+        <div class="type-opt v" id="ppV" onclick="pickCurrency('vitality')">活力点</div>
+        <div class="type-opt a" id="ppA" onclick="pickCurrency('achievement')">成果点</div>
+      </div>
+    </div>
+    <div class="fg"><label>价格 <span class="h">支持小数</span></label><input type="number" id="prodPrice" value="10" min="0.1" step="0.1"></div>
+    <div class="fg"><label>库存 <span class="h">-1 = 无限</span></label><input type="number" id="prodStock" value="-1" min="-1" step="1"></div>
+    <div class="fg">
+      <label>债率 <span class="h">贷款购买时，每日额外利息%</span></label>
+      <input type="number" id="prodDebtRate" value="0" min="0" step="0.1">
+    </div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal('prodModal')">取消</button>
+      <button class="btn" id="prodSaveBtn">保存</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-bg" id="installModal">
+  <div class="modal">
+    <h2>添加至桌面</h2>
+    <div class="fg">
+      <p style="font-size:13px;line-height:1.6;color:var(--text-2)">您的浏览器不支持自动安装，请按以下步骤手动添加：</p>
+      <ol style="font-size:13px;line-height:2.2;color:var(--text-2);padding-left:20px;margin-top:8px">
+        <li>点击浏览器底部或右上角的 <strong>菜单</strong>（⋮ 或 ≡ 图标）</li>
+        <li>选择 <strong>"添加到主屏幕"</strong> 或 <strong>"添加书签"</strong></li>
+        <li>确认添加，桌面将出现应用图标</li>
+      </ol>
+      <p style="font-size:12px;color:var(--text-3);margin-top:10px">应用已支持离线使用，添加后无需网络即可打开。若浏览器菜单中无此选项，可将本页加入书签后从书签管理中创建桌面快捷方式。</p>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal('installModal')">知道了</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toastWrap"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
