@@ -40,6 +40,13 @@ const COND_RANGES=[
 ];
 function validRange(r){return r==='period'||r==='total'||r==='recent'||r==='today';}
 function normOp(op){return ['>','<','<=','>='].indexOf(op)>=0?op:'>=';}
+// 将旧数据中 target/domainId（仅指领域）迁移为 targetType/target；若已有合法 targetType 则保留
+function applyCondTarget(o,it){
+  const tt=it.targetType;
+  if((tt==='task'||tt==='domain')&&it.target){o.targetType=tt;o.target=it.target;return;}
+  if(it.metric==='progress'&&(it.target||it.domainId)){o.targetType='domain';o.target=it.domainId||it.target;return;}
+  o.targetType='all';
+}
 const COND_LEGACY_MAP={
   'progress_total':{metric:'progress',range:'total'},
   'progress_domain':{metric:'progress',range:'total'},
@@ -64,22 +71,22 @@ function normalizeCondItem(it){
   if(validRange(it.range)){
     if(COND_METRIC_KEYS.indexOf(it.metric)<0)return null;
     const o={range:it.range,metric:it.metric,op:normOp(it.op),value:Number(it.value)||0};
-    if(it.metric==='progress'&&it.target)o.target=it.target;
     if(it.range==='recent')o.days=Math.max(1,Math.round(Number(it.days)||7));
+    applyCondTarget(o,it);
     return o;
   }
   // 2) Previous 5-field scope format (scope→range)
   if(COND_METRIC_KEYS.indexOf(it.metric)>=0){
     const range=it.scope==='total'?'total':'period';
     const o={range:range,metric:it.metric,op:normOp(it.op),value:Number(it.value)||0};
-    if(it.metric==='progress'&&it.target)o.target=it.target;
+    applyCondTarget(o,it);
     return o;
   }
   // 3) Legacy metric-name migration
   const lm=COND_LEGACY_MAP[it.metric];
   if(!lm)return null;
   const o={range:lm.range,metric:lm.metric,op:normOp(it.op),value:Number(it.value)||0};
-  if(lm.metric==='progress'&&(it.domainId||it.target))o.target=it.domainId||it.target;
+  applyCondTarget(o,it);
   return o;
 }
 function normalizeCondNode(node){
@@ -240,6 +247,7 @@ function fmtTime(ts){
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 function totalProgress(){return Object.values(state.scores.progress||{}).reduce((s,v)=>s+v,0)}
 function domainName(id){const d=state.domains.find(x=>x.id===id);return d?d.name:'未知'}
+function taskName(id){const t=state.tasks.find(x=>x.id===id);return t?t.name:'未知'}
 function collectionName(id){const c=state.collections.find(x=>x.id===id);return c?c.name:'未分类'}
 function domainProgress(id){return(state.scores.progress[id])||(0)}
 function metricValue(m){return (m.domainIds||[]).reduce((s,did)=>s+domainProgress(did),0)}
@@ -341,25 +349,63 @@ function evalNode(node,act,ts){
   }
   return evalCondItem(node,act,ts);
 }
-function rangeStats(start,end){
+// 日志所属领域 id（缺省时回退到其任务的领域）
+function logDomainsOf(l){
+  let dids=(l.dom||'').split(',').filter(Boolean);
+  if(!dids.length&&l.taskId){
+    const t=state.tasks.find(x=>x.id===l.taskId);
+    if(t)dids=getTaskDomainIds(t);
+  }
+  return dids;
+}
+// 日志是否命中某主体（全部/领域/任务）
+function logMatchesTarget(l,targetType,target){
+  if(!targetType||targetType==='all'||!target)return true;
+  if(targetType==='task')return l.taskId===target;
+  if(targetType==='domain')return logDomainsOf(l).indexOf(target)>=0;
+  return true;
+}
+// 任务/领域对象是否命中某主体
+function taskMatchesTarget(t,targetType,target){
+  if(!targetType||targetType==='all'||!target)return true;
+  if(targetType==='task')return t.id===target;
+  if(targetType==='domain')return getTaskDomainIds(t).indexOf(target)>=0;
+  return true;
+}
+function domainMatchesTarget(d,targetType,target){
+  if(!targetType||targetType==='all'||!target)return true;
+  if(targetType==='domain')return d.id===target;
+  return true;
+}
+function rangeStats(start,end,targetType,target){
   let vitality=0,achievement=0,progressTotal=0,checkins=0,newTasks=0,newDomains=0;
   const progressByDomain={};
+  const progressByTask={};
   state.logs.forEach(l=>{
-    if(l.time>=start&&l.time<end){
-      const hasV=l.st==='vitality'||l.st==='both';
-      const hasP=l.st==='progress'||l.st==='both';
-      if(hasV)vitality+=l.amt;
-      if(hasP){
-        progressTotal+=l.amt;
-        (l.dom||'').split(',').filter(Boolean).forEach(d=>progressByDomain[d]=(progressByDomain[d]||0)+l.amt);
+    if(l.time<start||l.time>=end)return;
+    if(!logMatchesTarget(l,targetType,target))return;
+    if(logHasType(l,'vitality'))vitality+=l.amt;
+    if(logHasType(l,'progress')){
+      progressTotal+=l.amt;
+      const dids=logDomainsOf(l);
+      if(dids.length){
+        const share=l.amt/dids.length;
+        dids.forEach(d=>{progressByDomain[d]=(progressByDomain[d]||0)+share;});
+      }else{
+        progressByDomain['d_default']=(progressByDomain['d_default']||0)+l.amt;
       }
-      if(l.st==='achievement')achievement+=l.amt;
-      if(l.src==='checkin')checkins++;
+      if(l.taskId)progressByTask[l.taskId]=(progressByTask[l.taskId]||0)+l.amt;
     }
+    if(l.st==='achievement')achievement+=l.amt;
+    if(l.src==='checkin')checkins++;
   });
-  state.tasks.forEach(t=>{if(t.createdAt&&t.createdAt>=start&&t.createdAt<end)newTasks++;});
-  state.domains.forEach(d=>{if(d.createdAt&&d.createdAt>=start&&d.createdAt<end)newDomains++;});
-  return {vitality:vitality,achievement:achievement,progressTotal:progressTotal,progressByDomain:progressByDomain,checkins:checkins,newTasks:newTasks,newDomains:newDomains};
+  state.tasks.forEach(t=>{
+    if(t.createdAt&&t.createdAt>=start&&t.createdAt<end&&taskMatchesTarget(t,targetType,target))newTasks++;
+  });
+  state.domains.forEach(d=>{
+    if(d.createdAt&&d.createdAt>=start&&d.createdAt<end&&domainMatchesTarget(d,targetType,target))newDomains++;
+  });
+  return {vitality:vitality,achievement:achievement,progressTotal:progressTotal,progressByDomain:progressByDomain,progressByTask:progressByTask,checkins:checkins,newTasks:newTasks,newDomains:newDomains};
 }
 function condWindowByRange(range,act,ts,days){
   if(range==='today'){const s=dayStartTs(ts);return {start:s,end:s+864e5};}
@@ -369,21 +415,37 @@ function condWindowByRange(range,act,ts,days){
 function evalCondItem(it,act,ts){
   const v=Number(it.value)||0;
   const range=validRange(it.range)?it.range:(it.scope==='total'?'total':'period');
+  const tt=(it.targetType==='task'||it.targetType==='domain')?it.targetType:'all';
+  const target=it.target||'';
   let val=null;
   if(range==='total'){
-    if(it.metric==='checkins')val=state.tasks.reduce((s,t)=>s+(t.checkInCount||0),0);
-    else if(it.metric==='vitality')val=state.scores.vitality||0;
-    else if(it.metric==='achievement')val=state.scores.achievement||0;
-    else if(it.metric==='progress')val=it.target?domainProgress(it.target):totalProgress();
-    else if(it.metric==='new_tasks')val=state.tasks.filter(t=>t.createdAt).length;
-    else if(it.metric==='new_domains')val=state.domains.filter(d=>d.createdAt).length;
+    if(it.metric==='checkins'){
+      if(tt==='task')val=(state.tasks.find(t=>t.id===target)||{}).checkInCount||0;
+      else if(tt==='domain')val=state.tasks.filter(t=>getTaskDomainIds(t).indexOf(target)>=0).reduce((s,t)=>s+(t.checkInCount||0),0);
+      else val=state.tasks.reduce((s,t)=>s+(t.checkInCount||0),0);
+    }else if(it.metric==='vitality'){
+      if(tt==='all')val=state.scores.vitality||0;
+      else val=rangeStats(0,ts+1,tt,target).vitality;
+    }else if(it.metric==='achievement'){
+      val=state.scores.achievement||0;
+    }else if(it.metric==='progress'){
+      if(tt==='domain')val=domainProgress(target);
+      else if(tt==='task')val=(rangeStats(0,ts+1,'task',target).progressByTask[target]||0);
+      else val=totalProgress();
+    }else if(it.metric==='new_tasks'){
+      if(tt==='domain')val=state.tasks.filter(t=>t.createdAt&&getTaskDomainIds(t).indexOf(target)>=0).length;
+      else val=state.tasks.filter(t=>t.createdAt).length;
+    }else if(it.metric==='new_domains'){
+      if(tt==='domain')val=state.domains.some(d=>d.id===target&&d.createdAt)?1:0;
+      else val=state.domains.filter(d=>d.createdAt).length;
+    }
   }else{
     const w=condWindowByRange(range,act,ts,it.days);
-    const st=rangeStats(w.start,w.end);
+    const st=rangeStats(w.start,w.end,tt,target);
     if(it.metric==='checkins')val=st.checkins;
     else if(it.metric==='vitality')val=st.vitality;
     else if(it.metric==='achievement')val=st.achievement;
-    else if(it.metric==='progress')val=it.target?(st.progressByDomain[it.target]||0):st.progressTotal;
+    else if(it.metric==='progress')val=(tt==='task'?(st.progressByTask[target]||0):(tt==='domain'?(st.progressByDomain[target]||0):st.progressTotal));
     else if(it.metric==='new_tasks')val=st.newTasks;
     else if(it.metric==='new_domains')val=st.newDomains;
   }
@@ -2216,14 +2278,27 @@ const COND_METRICS=[
   {v:'new_tasks',n:'新增任务'},
   {v:'new_domains',n:'新增领域'}
 ];
+const COND_TARGET_TYPES=[{v:'all',n:'全部'},{v:'domain',n:'按领域'},{v:'task',n:'按任务'}];
+// 指标可用的主体类型：打卡/活力/进度支持全部+领域+任务；成果点仅全部；新增任务/新增领域支持全部+领域
+function condTargetTypesFor(metric){
+  if(metric==='achievement')return ['all'];
+  if(metric==='new_tasks'||metric==='new_domains')return ['all','domain'];
+  return ['all','domain','task'];
+}
 function rangeLabel(range,days){
   if(range==='recent')return '最近'+(days||7)+'天';
   const r=COND_RANGES.find(x=>x.v===range);
   return r?r.n:'本周期';
 }
+function subjectLabel(it){
+  if(it.targetType==='task'&&it.target)return taskName(it.target);
+  if(it.targetType==='domain'&&it.target)return domainName(it.target);
+  return '';
+}
 function metricLabel(it){
-  if(it.metric==='progress')return it.target?('进度值·'+domainName(it.target)):'进度值';
-  return (COND_METRICS.find(m=>m.v===it.metric)||{}).n||it.metric;
+  const mn=(COND_METRICS.find(m=>m.v===it.metric)||{}).n||it.metric;
+  const sub=subjectLabel(it);
+  return sub?sub+mn:mn;
 }
 function opLabel(op){return {'<=':'≤','>=':'≥','>':'>','<':'<'}[op]||'≥';}
 function rangeTimeWord(it,act){
@@ -2399,7 +2474,7 @@ function condMetricChipText(it){
   return rangeLabel(it.range,it.days)+' · '+metricLabel(it);
 }
 function condItemRow(it,path){
-  it=it||{range:'period',metric:'checkins',op:'>=',value:1};
+  it=it||{range:'period',metric:'checkins',op:'>=',value:1,targetType:'all'};
   return '<div class="cond-chip-line">'
     +'<button class="cc-chip cc-metric" title="点击修改指标" onclick="openCondMetricPanel(\''+path+'\',this)">'+esc(condMetricChipText(it))+'</button>'
     +'<button class="cc-chip cc-op" title="点击修改运算符" onclick="openCondOpPanel(\''+path+'\',this)">'+esc(opLabel(it.op))+'</button>'
@@ -2445,8 +2520,8 @@ function renderCondTree(){
   updateCondPreview();
   updateActivitySummary();
 }
-function addCondItem(parentPath){condListAt(parentPath).push({range:'period',metric:'checkins',op:'>=',value:1});renderCondTree();}
-function addCondGroup(parentPath){condListAt(parentPath).push({group:true,mode:'all',items:[{range:'period',metric:'checkins',op:'>=',value:1}]});renderCondTree();}
+function addCondItem(parentPath){condListAt(parentPath).push({range:'period',metric:'checkins',op:'>=',value:1,targetType:'all'});renderCondTree();}
+function addCondGroup(parentPath){condListAt(parentPath).push({group:true,mode:'all',items:[{range:'period',metric:'checkins',op:'>=',value:1,targetType:'all'}]});renderCondTree();}
 function removeCondNode(path){
   if(!path)return;
   const parts=path.split('/').map(Number);
@@ -2519,11 +2594,23 @@ function renderCondPanel(){
       html+='<button class="cp-opt" onclick="pickCondMetric(\''+m.v+'\')">'+m.n+'</button>';
     });
     html+='</div>';
+  }else if(p.step==='targetType'){
+    html='<div class="cp-title">统计主体</div><div class="cp-opts">';
+    condTargetTypesFor(p.metric).forEach(tt=>{
+      const n=(COND_TARGET_TYPES.find(x=>x.v===tt)||{}).n||tt;
+      html+='<button class="cp-opt" onclick="pickCondTargetType(\''+tt+'\')">'+n+'</button>';
+    });
+    html+='</div>';
   }else if(p.step==='domain'){
     html='<div class="cp-title">选择领域</div><div class="cp-opts">';
-    html+='<button class="cp-opt" onclick="commitCondMetric(\'\')">全部领域</button>';
     state.domains.forEach(d=>{
-      html+='<button class="cp-opt" onclick="commitCondMetric(\''+d.id+'\')">'+esc(d.name)+'</button>';
+      html+='<button class="cp-opt" onclick="commitCondTarget(\'domain\',\''+d.id+'\')">'+esc(d.name)+'</button>';
+    });
+    html+='</div>';
+  }else if(p.step==='task'){
+    html='<div class="cp-title">选择任务</div><div class="cp-opts">';
+    state.tasks.forEach(t=>{
+      html+='<button class="cp-opt" onclick="commitCondTarget(\'task\',\''+t.id+'\')">'+esc(t.name)+'</button>';
     });
     html+='</div>';
   }
@@ -2558,25 +2645,29 @@ function confirmCondDays(){
 }
 function pickCondMetric(metric){
   condPanel.metric=metric;
-  if(metric==='progress'){
-    condPanel.step='domain';
+  const allowed=condTargetTypesFor(metric);
+  if(allowed.length===1){ // 仅支持全部（如成果点）
+    commitCondTarget('all','');
+  }else{
+    condPanel.step='targetType';
     renderCondPanel();
     positionCondPanel(condPanel.anchor);
-  }else{
-    commitCondMetric(null);
   }
 }
-function commitCondMetric(target){
+function pickCondTargetType(tt){
+  if(tt==='all'){commitCondTarget('all','');}
+  else if(tt==='domain'){condPanel.step='domain';renderCondPanel();positionCondPanel(condPanel.anchor);}
+  else if(tt==='task'){condPanel.step='task';renderCondPanel();positionCondPanel(condPanel.anchor);}
+}
+function commitCondTarget(targetType,target){
   const it=condNodeAt(condPanel.path);
   if(it&&!it.group){
     it.range=condPanel.range;
     if(condPanel.range==='recent')it.days=condPanel.days;else delete it.days;
     it.metric=condPanel.metric;
-    if(it.metric==='progress'){
-      if(target)it.target=validateDomain(target);else delete it.target;
-    }else{
-      delete it.target;
-    }
+    it.targetType=targetType;
+    if(targetType==='all')delete it.target;
+    else it.target=target;
   }
   closeCondPanel();
   renderCondTree();
@@ -2620,7 +2711,13 @@ function editCondValue(path,btn){
   input.select();
 }
 document.addEventListener('click',function(e){
-  if(condPanel.visible&&!e.target.closest('#condPanel')&&!e.target.closest('.cc-chip'))closeCondPanel();
+  if(!condPanel.visible)return;
+  // 用 composedPath 判定：面板内部点击后按钮可能因 innerHTML 重渲染脱离 DOM，
+  // 此时 e.target.closest 会返回 null；composedPath 仍保留派发时的祖先链，可正确识别面板内点击。
+  const path=(e.composedPath&&e.composedPath())||[];
+  const inPanel=path.some(n=>n&&n.getAttribute&&n.getAttribute('id')==='condPanel');
+  const inChip=path.some(n=>n&&n.classList&&n.classList.contains('cc-chip'));
+  if(!inPanel&&!inChip)closeCondPanel();
 });
 function rewardRowHTML(item){
   item=item||{type:'vitality',amount:10};
