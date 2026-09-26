@@ -43,6 +43,7 @@ function normOp(op){return ['>','<','<=','>='].indexOf(op)>=0?op:'>=';}
 // 将旧数据中 target/domainId（仅指领域）迁移为 targetType/target；若已有合法 targetType 则保留
 function applyCondTarget(o,it){
   const tt=it.targetType;
+  if(tt==='new_task'){o.targetType='new_task';return;}
   if((tt==='task'||tt==='domain')&&it.target){o.targetType=tt;o.target=it.target;return;}
   if(it.metric==='progress'&&(it.target||it.domainId)){o.targetType='domain';o.target=it.domainId||it.target;return;}
   o.targetType='all';
@@ -247,7 +248,7 @@ function fmtTime(ts){
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
 function totalProgress(){return Object.values(state.scores.progress||{}).reduce((s,v)=>s+v,0)}
 function domainName(id){const d=state.domains.find(x=>x.id===id);return d?d.name:'未知'}
-function taskName(id){const t=state.tasks.find(x=>x.id===id);return t?t.name:'未知'}
+function taskNameLabel(id){const t=state.tasks.find(x=>x.id===id);return t?t.name:'未知'}
 function collectionName(id){const c=state.collections.find(x=>x.id===id);return c?c.name:'未分类'}
 function domainProgress(id){return(state.scores.progress[id])||(0)}
 function metricValue(m){return (m.domainIds||[]).reduce((s,did)=>s+domainProgress(did),0)}
@@ -407,6 +408,20 @@ function rangeStats(start,end,targetType,target){
   });
   return {vitality:vitality,achievement:achievement,progressTotal:progressTotal,progressByDomain:progressByDomain,progressByTask:progressByTask,checkins:checkins,newTasks:newTasks,newDomains:newDomains};
 }
+function opSatisfied(val,op,v){
+  if(op==='>')return val>v;
+  if(op==='<')return val<v;
+  if(op==='<=')return val<=v;
+  return val>=v;
+}
+// 单个任务在 [start,end) 窗口内的指标取值（用于「本周期新增任务」的逐任务判定）
+function taskMetricValue(taskId,metric,start,end){
+  const st=rangeStats(start,end,'task',taskId);
+  if(metric==='checkins')return st.checkins;
+  if(metric==='progress')return st.progressByTask[taskId]||0;
+  if(metric==='vitality')return st.vitality;
+  return 0;
+}
 function condWindowByRange(range,act,ts,days){
   if(range==='today'){const s=dayStartTs(ts);return {start:s,end:s+864e5};}
   if(range==='recent'){const d=Math.max(1,Math.round(Number(days)||7));return {start:ts-d*864e5,end:ts};}
@@ -415,8 +430,21 @@ function condWindowByRange(range,act,ts,days){
 function evalCondItem(it,act,ts){
   const v=Number(it.value)||0;
   const range=validRange(it.range)?it.range:(it.scope==='total'?'total':'period');
-  const tt=(it.targetType==='task'||it.targetType==='domain')?it.targetType:'all';
+  const tt=(it.targetType==='task'||it.targetType==='domain'||it.targetType==='new_task')?it.targetType:'all';
   const target=it.target||'';
+  // 「本周期新增任务」动态主体：逐新任务独立判定，任一命中即满足，绝不跨任务相加
+  if(tt==='new_task'){
+    const metric=it.metric;
+    if(range==='total'){
+      return state.tasks.filter(t=>t.createdAt).some(t=>{
+        const mv=metric==='checkins'?(t.checkInCount||0):taskMetricValue(t.id,metric,0,ts+1);
+        return opSatisfied(mv,it.op,v);
+      });
+    }
+    const w=condWindowByRange(range,act,ts,it.days);
+    return state.tasks.filter(t=>t.createdAt&&t.createdAt>=w.start&&t.createdAt<w.end)
+      .some(t=>opSatisfied(taskMetricValue(t.id,metric,w.start,w.end),it.op,v));
+  }
   let val=null;
   if(range==='total'){
     if(it.metric==='checkins'){
@@ -450,12 +478,7 @@ function evalCondItem(it,act,ts){
     else if(it.metric==='new_domains')val=st.newDomains;
   }
   if(val===null)return true;
-  switch(it.op){
-    case '>':return val>v;
-    case '<':return val<v;
-    case '<=':return val<=v;
-    default:return val>=v;
-  }
+  return opSatisfied(val,it.op,v);
 }
 function applyResult(act,ts){
   const items=(act.result&&act.result.items)||[];
@@ -2278,25 +2301,29 @@ const COND_METRICS=[
   {v:'new_tasks',n:'新增任务'},
   {v:'new_domains',n:'新增领域'}
 ];
-const COND_TARGET_TYPES=[{v:'all',n:'全部'},{v:'domain',n:'按领域'},{v:'task',n:'按任务'}];
-// 指标可用的主体类型：打卡/活力/进度支持全部+领域+任务；成果点仅全部；新增任务/新增领域支持全部+领域
+const COND_TARGET_TYPES=[{v:'all',n:'全部'},{v:'domain',n:'按领域'},{v:'task',n:'按任务'},{v:'new_task',n:'本周期新增的任务'}];
+// 指标可用的主体类型：打卡/活力/进度支持全部+领域+任务+「本周期新增任务」；成果点仅全部；新增任务/新增领域支持全部+领域
 function condTargetTypesFor(metric){
   if(metric==='achievement')return ['all'];
   if(metric==='new_tasks'||metric==='new_domains')return ['all','domain'];
-  return ['all','domain','task'];
+  return ['all','domain','task','new_task'];
 }
 function rangeLabel(range,days){
   if(range==='recent')return '最近'+(days||7)+'天';
   const r=COND_RANGES.find(x=>x.v===range);
   return r?r.n:'本周期';
 }
+function metricNameLabel(it){
+  return (COND_METRICS.find(m=>m.v===it.metric)||{}).n||it.metric;
+}
 function subjectLabel(it){
-  if(it.targetType==='task'&&it.target)return taskName(it.target);
+  if(it.targetType==='task'&&it.target)return taskNameLabel(it.target);
   if(it.targetType==='domain'&&it.target)return domainName(it.target);
   return '';
 }
 function metricLabel(it){
-  const mn=(COND_METRICS.find(m=>m.v===it.metric)||{}).n||it.metric;
+  const mn=metricNameLabel(it);
+  if(it.targetType==='new_task')return '新增任务·'+mn;
   const sub=subjectLabel(it);
   return sub?sub+mn:mn;
 }
@@ -2318,6 +2345,7 @@ function condNodeLabel(node){
   return condItemLabel(node);
 }
 function condNLLeaf(it,act){
+  if(it.targetType==='new_task')return rangeTimeWord(it,act)+'新增任务中，任意单个任务'+metricNameLabel(it)+' '+opLabel(it.op)+' '+fmt(it.value);
   return rangeTimeWord(it,act)+metricLabel(it)+' '+opLabel(it.op)+' '+fmt(it.value);
 }
 function condNLNode(node,act){
@@ -2656,6 +2684,7 @@ function pickCondMetric(metric){
 }
 function pickCondTargetType(tt){
   if(tt==='all'){commitCondTarget('all','');}
+  else if(tt==='new_task'){commitCondTarget('new_task','');}
   else if(tt==='domain'){condPanel.step='domain';renderCondPanel();positionCondPanel(condPanel.anchor);}
   else if(tt==='task'){condPanel.step='task';renderCondPanel();positionCondPanel(condPanel.anchor);}
 }
@@ -2666,7 +2695,7 @@ function commitCondTarget(targetType,target){
     if(condPanel.range==='recent')it.days=condPanel.days;else delete it.days;
     it.metric=condPanel.metric;
     it.targetType=targetType;
-    if(targetType==='all')delete it.target;
+    if(targetType==='all'||targetType==='new_task')delete it.target;
     else it.target=target;
   }
   closeCondPanel();
