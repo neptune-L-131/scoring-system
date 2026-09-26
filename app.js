@@ -6,6 +6,8 @@ const THEME_KEY='score_sys_theme';
 let state=load();
 let editCurrency='vitality';
 let editTypes=['vitality'];
+let condDraft={mode:'all',items:[]};
+let condPanel={visible:false,kind:'metric',path:'',step:'range',range:'period',days:7,metric:'checkins'};
 
 // ===== Theme =====
 function initTheme(){
@@ -30,44 +32,63 @@ initTheme();
 
 function cardName(c){return c==='exemption'?'断更豁免卡':(c||'卡');}
 const COND_METRIC_KEYS=['checkins','vitality','progress','achievement','new_tasks','new_domains'];
+const COND_RANGES=[
+  {v:'period',n:'本周期'},
+  {v:'total',n:'累计'},
+  {v:'recent',n:'最近N天'},
+  {v:'today',n:'今天'}
+];
+function validRange(r){return r==='period'||r==='total'||r==='recent'||r==='today';}
+function normOp(op){return ['>','<','<=','>='].indexOf(op)>=0?op:'>=';}
+const COND_LEGACY_MAP={
+  'progress_total':{metric:'progress',range:'total'},
+  'progress_domain':{metric:'progress',range:'total'},
+  'checkins_period':{metric:'checkins',range:'period'},
+  'checkins_total':{metric:'checkins',range:'total'},
+  'new_task_period':{metric:'new_tasks',range:'period'},
+  'new_domain_period':{metric:'new_domains',range:'period'}
+};
 function defaultActivities(){
   return[
     {id:'act_exemption',name:'断更豁免卡',enabled:true,period:'week',anchor:1,
      condition:{mode:'all',items:[]},
      result:{items:[{type:'card',card:'exemption',amount:1,cap:3}]},lastRun:null},
     {id:'act_score_up',name:'进步奖励',enabled:false,period:'week',anchor:1,
-     condition:{mode:'all',items:[{metric:'checkins',op:'>=',scope:'period',value:3}]},
+     condition:{mode:'all',items:[{range:'period',metric:'checkins',op:'>=',value:3}]},
      result:{items:[{type:'vitality',amount:10}]},lastRun:null}
   ];
 }
 function normalizeCondItem(it){
   if(!it)return null;
-  // New 5-field format (metric / target / op / scope / value)
+  // 1) New range leaf format
+  if(validRange(it.range)){
+    if(COND_METRIC_KEYS.indexOf(it.metric)<0)return null;
+    const o={range:it.range,metric:it.metric,op:normOp(it.op),value:Number(it.value)||0};
+    if(it.metric==='progress'&&it.target)o.target=it.target;
+    if(it.range==='recent')o.days=Math.max(1,Math.round(Number(it.days)||7));
+    return o;
+  }
+  // 2) Previous 5-field scope format (scope→range)
   if(COND_METRIC_KEYS.indexOf(it.metric)>=0){
-    const o={metric:it.metric,op:['>','<','<=','>='].indexOf(it.op)>=0?it.op:'>=',scope:it.scope==='total'?'total':'period',value:Number(it.value)||0};
+    const range=it.scope==='total'?'total':'period';
+    const o={range:range,metric:it.metric,op:normOp(it.op),value:Number(it.value)||0};
     if(it.metric==='progress'&&it.target)o.target=it.target;
     return o;
   }
-  // Legacy migration
-  const m=it.metric;
-  if(m==='score_up'||m==='week_up')return null;
-  let metric,scope='period',target;
-  if(m==='vitality'){metric='vitality';scope='total';}
-  else if(m==='achievement'){metric='achievement';scope='total';}
-  else if(m==='progress_total'){metric='progress';scope='total';}
-  else if(m==='progress_domain'){metric='progress';scope='total';target=it.domainId||'d_default';}
-  else if(m==='checkins'||m==='checkins_period'){metric='checkins';scope='period';}
-  else if(m==='checkins_total'){metric='checkins';scope='total';}
-  else if(m==='new_tasks'||m==='new_task_period'){metric='new_tasks';scope='period';}
-  else if(m==='new_domains'||m==='new_domain_period'){metric='new_domains';scope='period';}
-  else{metric='checkins';scope='period';}
-  const o={metric:metric,op:['>','<','<=','>='].indexOf(it.op)>=0?it.op:'>=',scope:scope,value:Number(it.value)||0};
-  if(metric==='progress'&&target)o.target=target;
+  // 3) Legacy metric-name migration
+  const lm=COND_LEGACY_MAP[it.metric];
+  if(!lm)return null;
+  const o={range:lm.range,metric:lm.metric,op:normOp(it.op),value:Number(it.value)||0};
+  if(lm.metric==='progress'&&(it.domainId||it.target))o.target=it.domainId||it.target;
   return o;
 }
+function normalizeCondNode(node){
+  if(node&&node.group)return {group:true,mode:node.mode==='any'?'any':'all',items:(node.items||[]).map(normalizeCondNode).filter(Boolean)};
+  return normalizeCondItem(node);
+}
 function normalizeCondition(c){
-  if(c&&c.mode&&Array.isArray(c.items))
-    return {mode:c.mode==='any'?'any':'all',items:c.items.map(normalizeCondItem).filter(Boolean)};
+  if(c&&Array.isArray(c.items))
+    return {mode:c.mode==='any'?'any':'all',items:c.items.map(normalizeCondNode).filter(Boolean)};
   return {mode:'all',items:[]};
 }
 function normalizeRewardItem(it){
@@ -309,17 +330,22 @@ function prevPeriodRange(act,ts){
 }
 function evalCondition(act,ts){
   const c=act.condition||{mode:'all',items:[]};
-  const items=c.items||[];
-  if(!items.length)return true;
-  const res=items.map(it=>evalCondItem(it,act,ts));
-  return c.mode==='any'?res.some(Boolean):res.every(Boolean);
+  return evalNode({group:true,mode:c.mode==='any'?'any':'all',items:c.items||[]},act,ts);
 }
-function periodStats(act,ts){
-  const r=prevPeriodRange(act,ts);
+function evalNode(node,act,ts){
+  if(node&&node.group&&Array.isArray(node.items)){
+    const items=node.items;
+    if(!items.length)return true;
+    const res=items.map(n=>evalNode(n,act,ts));
+    return node.mode==='any'?res.some(Boolean):res.every(Boolean);
+  }
+  return evalCondItem(node,act,ts);
+}
+function rangeStats(start,end){
   let vitality=0,achievement=0,progressTotal=0,checkins=0,newTasks=0,newDomains=0;
   const progressByDomain={};
   state.logs.forEach(l=>{
-    if(l.time>=r.start&&l.time<r.end){
+    if(l.time>=start&&l.time<end){
       const hasV=l.st==='vitality'||l.st==='both';
       const hasP=l.st==='progress'||l.st==='both';
       if(hasV)vitality+=l.amt;
@@ -331,28 +357,35 @@ function periodStats(act,ts){
       if(l.src==='checkin')checkins++;
     }
   });
-  state.tasks.forEach(t=>{if(t.createdAt&&t.createdAt>=r.start&&t.createdAt<r.end)newTasks++;});
-  state.domains.forEach(d=>{if(d.createdAt&&d.createdAt>=r.start&&d.createdAt<r.end)newDomains++;});
+  state.tasks.forEach(t=>{if(t.createdAt&&t.createdAt>=start&&t.createdAt<end)newTasks++;});
+  state.domains.forEach(d=>{if(d.createdAt&&d.createdAt>=start&&d.createdAt<end)newDomains++;});
   return {vitality:vitality,achievement:achievement,progressTotal:progressTotal,progressByDomain:progressByDomain,checkins:checkins,newTasks:newTasks,newDomains:newDomains};
+}
+function condWindowByRange(range,act,ts,days){
+  if(range==='today'){const s=dayStartTs(ts);return {start:s,end:s+864e5};}
+  if(range==='recent'){const d=Math.max(1,Math.round(Number(days)||7));return {start:ts-d*864e5,end:ts};}
+  return prevPeriodRange(act,ts);
 }
 function evalCondItem(it,act,ts){
   const v=Number(it.value)||0;
-  const scope=(it.scope==='total')?'total':'period';
+  const range=validRange(it.range)?it.range:(it.scope==='total'?'total':'period');
   let val=null;
-  if(it.metric==='checkins'){
-    val=scope==='total'?state.tasks.reduce((s,t)=>s+(t.checkInCount||0),0):periodStats(act,ts).checkins;
-  }else if(it.metric==='vitality'){
-    val=scope==='total'?(state.scores.vitality||0):periodStats(act,ts).vitality;
-  }else if(it.metric==='achievement'){
-    val=scope==='total'?(state.scores.achievement||0):periodStats(act,ts).achievement;
-  }else if(it.metric==='progress'){
-    const ps=periodStats(act,ts);
-    if(it.target)val=scope==='total'?domainProgress(it.target):(ps.progressByDomain[it.target]||0);
-    else val=scope==='total'?totalProgress():ps.progressTotal;
-  }else if(it.metric==='new_tasks'){
-    val=scope==='total'?state.tasks.filter(t=>t.createdAt).length:periodStats(act,ts).newTasks;
-  }else if(it.metric==='new_domains'){
-    val=scope==='total'?state.domains.filter(d=>d.createdAt).length:periodStats(act,ts).newDomains;
+  if(range==='total'){
+    if(it.metric==='checkins')val=state.tasks.reduce((s,t)=>s+(t.checkInCount||0),0);
+    else if(it.metric==='vitality')val=state.scores.vitality||0;
+    else if(it.metric==='achievement')val=state.scores.achievement||0;
+    else if(it.metric==='progress')val=it.target?domainProgress(it.target):totalProgress();
+    else if(it.metric==='new_tasks')val=state.tasks.filter(t=>t.createdAt).length;
+    else if(it.metric==='new_domains')val=state.domains.filter(d=>d.createdAt).length;
+  }else{
+    const w=condWindowByRange(range,act,ts,it.days);
+    const st=rangeStats(w.start,w.end);
+    if(it.metric==='checkins')val=st.checkins;
+    else if(it.metric==='vitality')val=st.vitality;
+    else if(it.metric==='achievement')val=st.achievement;
+    else if(it.metric==='progress')val=it.target?(st.progressByDomain[it.target]||0):st.progressTotal;
+    else if(it.metric==='new_tasks')val=st.newTasks;
+    else if(it.metric==='new_domains')val=st.newDomains;
   }
   if(val===null)return true;
   switch(it.op){
@@ -2183,18 +2216,38 @@ const COND_METRICS=[
   {v:'new_tasks',n:'新增任务'},
   {v:'new_domains',n:'新增领域'}
 ];
-const COND_SCOPES=[
-  {v:'period',n:'本周期'},
-  {v:'total',n:'累计'}
-];
+function rangeLabel(range,days){
+  if(range==='recent')return '最近'+(days||7)+'天';
+  const r=COND_RANGES.find(x=>x.v===range);
+  return r?r.n:'本周期';
+}
+function metricLabel(it){
+  if(it.metric==='progress')return it.target?('进度值·'+domainName(it.target)):'进度值';
+  return (COND_METRICS.find(m=>m.v===it.metric)||{}).n||it.metric;
+}
+function opLabel(op){return {'<=':'≤','>=':'≥','>':'>','<':'<'}[op]||'≥';}
+function rangeTimeWord(it,act){
+  if(it.range==='today')return '今天';
+  if(it.range==='recent')return '最近'+(it.days||7)+'天';
+  if(it.range==='total')return '累计';
+  if(act.period==='day')return '昨日';
+  if(act.period==='month')return '上月';
+  return '上周';
+}
 function condItemLabel(it){
   if(!it)return '';
-  let name;
-  if(it.metric==='progress')name=(it.target?domainName(it.target):'全部领域')+'进度';
-  else name=(COND_METRICS.find(m=>m.v===it.metric)||{}).n||it.metric;
-  const scopeTxt=(it.scope==='total')?'·累计':'·本周期';
-  const opTxt={'<=':'≤','>=':'≥'}[it.op]||(it.op||'≥');
-  return name+scopeTxt+' '+opTxt+fmt(it.value);
+  return rangeLabel(it.range,it.days)+' · '+metricLabel(it)+' '+opLabel(it.op)+' '+fmt(it.value);
+}
+function condNodeLabel(node){
+  if(node&&node.group)return '（'+((node.items||[]).map(condNodeLabel).join(node.mode==='any'?' 或 ':' 且 '))+'）';
+  return condItemLabel(node);
+}
+function condNLLeaf(it,act){
+  return rangeTimeWord(it,act)+metricLabel(it)+' '+opLabel(it.op)+' '+fmt(it.value);
+}
+function condNLNode(node,act){
+  if(node&&node.group)return '（'+((node.items||[]).map(n=>condNLNode(n,act)).join(node.mode==='any'?' 或 ':' 且 '))+'）';
+  return condNLLeaf(node,act);
 }
 function rewardItemLabel(it){
   if(!it)return '';
@@ -2213,10 +2266,51 @@ function rewardItemLabel(it){
 function actMetaLabel(a){
   const c=a.condition||{mode:'all',items:[]};
   const condItems=c.items||[];
-  const condTxt=condItems.length?condItems.map(condItemLabel).join(c.mode==='any'?' 或 ':' 且 '):'无条件';
+  const condTxt=condItems.length?condItems.map(condNodeLabel).join(c.mode==='any'?' 或 ':' 且 '):'无条件';
   const resItems=(a.result&&a.result.items)||[];
   const resTxt=resItems.length?resItems.map(rewardItemLabel).join('、'):'无';
   return '前提：'+condTxt+'　结果：'+resTxt;
+}
+function readRewardItems(){
+  const rewardItems=[];
+  document.querySelectorAll('#activityResultDetails .reward-row').forEach(row=>{
+    const type=row.querySelector('.rr-type').value;
+    const amount=Math.max(0,Number(row.querySelector('.rr-amount').value)||0);
+    if(amount<=0&&type!=='card')return;
+    if(type==='card'){
+      rewardItems.push({type:'card',card:'exemption',amount:Math.round(amount),cap:Math.max(1,Math.round(Number(row.querySelector('.rr-cap').value)||3))});
+    }else if(type==='progress'){
+      const did=row.querySelector('.rr-domain').value;
+      const r={type:'progress',amount:amount};
+      if(did)r.domainId=did;
+      rewardItems.push(r);
+    }else if(type==='vitality'){
+      const tid=row.querySelector('.rr-task').value;
+      const r={type:'vitality',amount:amount};
+      if(tid)r.taskId=tid;
+      rewardItems.push(r);
+    }else if(type==='achievement'){
+      rewardItems.push({type:'achievement',amount:amount});
+    }
+  });
+  return rewardItems;
+}
+function updateCondPreview(){
+  const el=document.getElementById('condPreview');
+  if(!el)return;
+  const items=condDraft.items||[];
+  const mode=condDraft.mode==='any'?'any':'all';
+  const period=document.getElementById('activityPeriod').value;
+  const anchor=parseInt(document.getElementById('activityAnchor').value,10)||1;
+  const anchorNames=['','周一','周二','周三','周四','周五','周六','周日'];
+  const when=period==='day'?'每天结算时':period==='month'?'每月结算时':('每'+anchorNames[anchor]+'结算时');
+  const actLike={period:period};
+  let condTxt;
+  if(!items.length)condTxt='无条件触发';
+  else condTxt=items.map(n=>condNLNode(n,actLike)).join(mode==='any'?' 或 ':' 且 ');
+  const rewards=readRewardItems();
+  const resTxt=rewards.length?rewards.map(rewardItemLabel).join('、'):'（未设置奖励）';
+  el.innerHTML='<span class="cp-badge">预览</span>'+esc(when)+'，若 '+esc(condTxt)+'，则发放 '+esc(resTxt)+'。';
 }
 function openActivityModal(id){
   const a=id?state.activities.find(x=>x.id===id):null;
@@ -2225,11 +2319,11 @@ function openActivityModal(id){
   document.getElementById('activityName').value=a?a.name:'';
   document.getElementById('activityPeriod').value=a?a.period:'week';
   document.getElementById('activityAnchor').value=a?(a.anchor||1):1;
-  const c=(a&&a.condition)||{mode:'all',items:[]};
-  document.getElementById('activityCondMode').value=(c.mode==='any')?'any':'all';
+  condDraft=normalizeCondition((a&&a.condition)||{mode:'all',items:[]});
+  document.getElementById('activityCondMode').value=(condDraft.mode==='any')?'any':'all';
   document.getElementById('activityDeleteBtn').style.display=id?'':'none';
-  renderCondItems(c.items||[]);
   renderActivityResultDetails(a?a.result:null);
+  renderCondTree();
   activityPeriodChanged();
   // 折叠分区：基本信息展开，前提与奖励默认收起以保持简洁（标题栏显示摘要）
   setAcc('accBasic',true);
@@ -2242,6 +2336,7 @@ function openActivityModal(id){
 function activityPeriodChanged(){
   const p=document.getElementById('activityPeriod').value;
   document.getElementById('activityAnchorFg').style.display=(p==='week')?'':'none';
+  updateCondPreview();
   updateActivitySummary();
 }
 function toggleAcc(id){const el=document.getElementById(id);if(el)el.classList.toggle('open');}
@@ -2256,10 +2351,9 @@ function updateActivitySummary(){
     if(basicSum)basicSum.textContent=p==='week'?('每周 · '+anchorNames[a]):periodLabel(p);
   }
   const condMode=document.getElementById('activityCondMode');
-  const condBox=document.getElementById('activityCondItems');
   const condSum=document.getElementById('accCondSum');
-  if(condSum&&condBox){
-    const n=condBox.querySelectorAll('.cond-row').length;
+  if(condSum){
+    const n=countCondLeaves(condDraft.items||[]);
     const m=(condMode&&condMode.value==='any')?'任一':'全部';
     condSum.textContent=n?((m==='任一'?'任一满足':'全部满足')+' · '+n+' 项'):'无条件';
   }
@@ -2270,40 +2364,264 @@ function updateActivitySummary(){
     resSum.textContent=n?(n+' 项奖励'):'未设置';
   }
 }
-function condItemHTML(it){
-  it=it||{metric:'checkins',op:'>=',scope:'period',value:3};
-  const metricOpts=COND_METRICS.map(o=>'<option value="'+o.v+'"'+((it.metric||'checkins')===o.v?' selected':'')+'>'+o.n+'</option>').join('');
-  const opOpts=[['>=','≥'],['>','>'],['<=','≤'],['<','<']].map(o=>'<option value="'+o[0]+'"'+((it.op||'>=')===o[0]?' selected':'')+'>'+o[1]+'</option>').join('');
-  const targetOpts='<option value="">全部领域</option>'+state.domains.map(d=>'<option value="'+d.id+'"'+((it.target||'')===d.id?' selected':'')+'>'+esc(d.name)+'</option>').join('');
-  const scopeOpts=COND_SCOPES.map(o=>'<option value="'+o.v+'"'+((it.scope||'period')===o.v?' selected':'')+'>'+o.n+'</option>').join('');
-  const isProgress=(it.metric==='progress');
-  return '<div class="cond-row">'
-    +'<select class="ci-metric" onchange="condItemTypeChanged(this)" title="状态A：前提指标">'+metricOpts+'</select>'
-    +'<select class="ci-target" style="display:'+(isProgress?'':'none')+'" title="主体A：关联领域（不选=全部）">'+targetOpts+'</select>'
-    +'<select class="ci-op" title="要求：比较关系">'+opOpts+'</select>'
-    +'<select class="ci-scope" title="时间限定B：统计范围">'+scopeOpts+'</select>'
-    +'<input type="number" class="ci-value" step="0.1" value="'+(it.value!==undefined?it.value:3)+'" title="状态B：目标值">'
-    +'<button class="rr-del" onclick="removeCondRow(this)">×</button>'
+// ===== 条件芯片编辑器（嵌套条件组 + 点选面板）=====
+function countCondLeaves(items){
+  return (items||[]).reduce((s,node)=>{
+    if(node&&node.group)return s+countCondLeaves(node.items);
+    return s+1;
+  },0);
+}
+function condListAt(parentPath){
+  if(!parentPath)return condDraft.items;
+  const parts=parentPath.split('/').map(Number);
+  let list=condDraft.items;
+  for(const idx of parts){
+    const node=list[idx];
+    if(!node||!node.group)return condDraft.items;
+    list=node.items;
+  }
+  return list;
+}
+function condNodeAt(path){
+  if(!path)return null;
+  const parts=path.split('/').filter(Boolean).map(Number);
+  let list=condDraft.items;
+  let node=null;
+  for(let i=0;i<parts.length;i++){
+    const idx=parts[i];
+    if(idx<0||idx>=list.length)return null;
+    node=list[idx];
+    if(node&&node.group)list=node.items;
+  }
+  return node;
+}
+function condMetricChipText(it){
+  return rangeLabel(it.range,it.days)+' · '+metricLabel(it);
+}
+function condItemRow(it,path){
+  it=it||{range:'period',metric:'checkins',op:'>=',value:1};
+  return '<div class="cond-chip-line">'
+    +'<button class="cc-chip cc-metric" title="点击修改指标" onclick="openCondMetricPanel(\''+path+'\',this)">'+esc(condMetricChipText(it))+'</button>'
+    +'<button class="cc-chip cc-op" title="点击修改运算符" onclick="openCondOpPanel(\''+path+'\',this)">'+esc(opLabel(it.op))+'</button>'
+    +'<button class="cc-chip cc-value" title="点击修改数值" onclick="editCondValue(\''+path+'\',this)">'+esc(fmt(it.value))+'</button>'
+    +'<button class="cc-del" title="删除此条件" onclick="removeCondNode(\''+path+'\')">×</button>'
     +'</div>';
 }
-function renderCondItems(items){
-  const box=document.getElementById('activityCondItems');
-  box.innerHTML=(items&&items.length)?items.map(condItemHTML).join(''):'';
+function condGroupInnerHTML(group,path,depth){
+  const items=group.items||[];
+  if(!items.length)return '<div class="cond-empty-sm">组内还没有条件</div>';
+  return renderCondNodes(items,path,depth+1);
 }
-function addCondItem(){
+function condGroupHTML(group,path,depth){
+  const canNest=depth<1;
+  return '<div class="cond-group">'
+    +'<div class="cond-group-head">'
+    +'<span class="cg-label">满足</span>'
+    +'<select class="cg-mode" onchange="changeGroupMode(\''+path+'\',this.value)">'
+    +'<option value="all"'+(group.mode==='any'?'':' selected')+'>全部</option>'
+    +'<option value="any"'+(group.mode==='any'?' selected':'')+'>任意</option>'
+    +'</select>'
+    +'<span class="cg-label2">以下条件</span>'
+    +'<button class="cc-del" title="删除此条件组" onclick="removeCondNode(\''+path+'\')">×</button>'
+    +'</div>'
+    +'<div class="cond-group-body">'
+    +condGroupInnerHTML(group,path,depth)
+    +'<div class="cond-actions">'
+    +'<button class="btn btn-sm" onclick="addCondItem(\''+path+'\')">+ 添加条件</button>'
+    +(canNest?'<button class="btn btn-sm" onclick="addCondGroup(\''+path+'\')">+ 添加条件组</button>':'')
+    +'</div>'
+    +'</div></div>';
+}
+function renderCondNodes(items,parentPath,depth){
+  return (items||[]).map((node,idx)=>{
+    const path=parentPath?parentPath+'/'+idx:String(idx);
+    return (node&&node.group)?condGroupHTML(node,path,depth):condItemRow(node,path);
+  }).join('');
+}
+function renderCondTree(){
   const box=document.getElementById('activityCondItems');
-  const tmp=document.createElement('div');
-  tmp.innerHTML=condItemHTML({metric:'checkins',op:'>=',scope:'period',value:3});
-  box.appendChild(tmp.firstChild);
+  if(!box)return;
+  box.innerHTML=(condDraft.items&&condDraft.items.length)?renderCondNodes(condDraft.items,'',0):'<div class="cond-empty">还没有条件，满足任意情况即触发</div>';
+  updateCondPreview();
   updateActivitySummary();
 }
-function removeCondRow(btn){btn.closest('.cond-row').remove();updateActivitySummary();}
-function condItemTypeChanged(sel){
-  const row=sel.closest('.cond-row');
-  const target=row.querySelector('.ci-target');
-  const m=sel.value;
-  target.style.display=(m==='progress')?'':'none';
+function addCondItem(parentPath){condListAt(parentPath).push({range:'period',metric:'checkins',op:'>=',value:1});renderCondTree();}
+function addCondGroup(parentPath){condListAt(parentPath).push({group:true,mode:'all',items:[{range:'period',metric:'checkins',op:'>=',value:1}]});renderCondTree();}
+function removeCondNode(path){
+  if(!path)return;
+  const parts=path.split('/').map(Number);
+  const idx=parts.pop();
+  const parentPath=parts.join('/');
+  const list=condListAt(parentPath);
+  if(list&&idx>=0&&idx<list.length)list.splice(idx,1);
+  renderCondTree();
 }
+function changeGroupMode(path,mode){
+  const node=condNodeAt(path);
+  if(node&&node.group)node.mode=(mode==='any'?'any':'all');
+  renderCondTree();
+}
+function onCondModeChange(){
+  condDraft.mode=document.getElementById('activityCondMode').value==='any'?'any':'all';
+  updateCondPreview();
+  updateActivitySummary();
+}
+// ===== 点选浮层面板 =====
+function getCondPanelEl(){
+  let el=document.getElementById('condPanel');
+  if(!el){
+    el=document.createElement('div');
+    el.id='condPanel';
+    el.className='cond-panel';
+    document.body.appendChild(el);
+  }
+  return el;
+}
+function positionCondPanel(anchor){
+  const el=getCondPanelEl();
+  el.style.visibility='hidden';
+  el.style.display='block';
+  const r=anchor.getBoundingClientRect();
+  const pw=el.offsetWidth||200;
+  const ph=el.offsetHeight||0;
+  const vw=window.innerWidth,vh=window.innerHeight;
+  const left=Math.max(8,Math.min(r.left,vw-pw-8));
+  let top=r.bottom+6;
+  if(top+ph>vh-8)top=r.top-ph-6;
+  if(top<8)top=8;
+  el.style.left=left+'px';
+  el.style.top=top+'px';
+  el.style.visibility='visible';
+}
+function renderCondPanel(){
+  const el=getCondPanelEl();
+  const p=condPanel;
+  let html='';
+  if(p.kind==='op'){
+    html='<div class="cp-title">运算符</div><div class="cp-opts">';
+    [['>=','≥'],['>','>'],['<=','≤'],['<','<']].forEach(o=>{
+      html+='<button class="cp-opt" onclick="commitCondOp(\''+o[0]+'\')">'+o[1]+'</button>';
+    });
+    html+='</div>';
+  }else if(p.step==='range'){
+    html='<div class="cp-title">时间范围</div><div class="cp-opts">';
+    COND_RANGES.forEach(r=>{
+      html+='<button class="cp-opt" onclick="pickCondRange(\''+r.v+'\')">'+r.n+'</button>';
+    });
+    html+='</div>';
+  }else if(p.step==='days'){
+    html='<div class="cp-title">最近多少天</div><div class="cp-days">'
+      +'<input type="number" id="condPanelDays" value="'+p.days+'" min="1" step="1">'
+      +'<button class="btn btn-sm" onclick="confirmCondDays()">确定</button></div>';
+  }else if(p.step==='metric'){
+    html='<div class="cp-title">指标</div><div class="cp-opts">';
+    COND_METRICS.forEach(m=>{
+      html+='<button class="cp-opt" onclick="pickCondMetric(\''+m.v+'\')">'+m.n+'</button>';
+    });
+    html+='</div>';
+  }else if(p.step==='domain'){
+    html='<div class="cp-title">选择领域</div><div class="cp-opts">';
+    html+='<button class="cp-opt" onclick="commitCondMetric(\'\')">全部领域</button>';
+    state.domains.forEach(d=>{
+      html+='<button class="cp-opt" onclick="commitCondMetric(\''+d.id+'\')">'+esc(d.name)+'</button>';
+    });
+    html+='</div>';
+  }
+  el.innerHTML=html;
+  if(p.kind==='metric'&&p.step==='days'){
+    setTimeout(()=>{const inp=document.getElementById('condPanelDays');if(inp){inp.focus();inp.select();}},0);
+  }
+}
+function openCondMetricPanel(path,anchor){
+  const it=condNodeAt(path)||{range:'period',metric:'checkins',op:'>=',value:1};
+  condPanel={visible:true,kind:'metric',path:path,anchor:anchor,step:'range',range:it.range||'period',days:it.days||7,metric:it.metric||'checkins'};
+  renderCondPanel();
+  positionCondPanel(anchor);
+}
+function openCondOpPanel(path,anchor){
+  condPanel={visible:true,kind:'op',path:path,anchor:anchor,step:'range',range:'period',days:7,metric:'checkins'};
+  renderCondPanel();
+  positionCondPanel(anchor);
+}
+function pickCondRange(range){
+  condPanel.range=range;
+  condPanel.step=(range==='recent')?'days':'metric';
+  renderCondPanel();
+  positionCondPanel(condPanel.anchor);
+}
+function confirmCondDays(){
+  const inp=document.getElementById('condPanelDays');
+  condPanel.days=Math.max(1,Math.round(Number(inp&&inp.value)||7));
+  condPanel.step='metric';
+  renderCondPanel();
+  positionCondPanel(condPanel.anchor);
+}
+function pickCondMetric(metric){
+  condPanel.metric=metric;
+  if(metric==='progress'){
+    condPanel.step='domain';
+    renderCondPanel();
+    positionCondPanel(condPanel.anchor);
+  }else{
+    commitCondMetric(null);
+  }
+}
+function commitCondMetric(target){
+  const it=condNodeAt(condPanel.path);
+  if(it&&!it.group){
+    it.range=condPanel.range;
+    if(condPanel.range==='recent')it.days=condPanel.days;else delete it.days;
+    it.metric=condPanel.metric;
+    if(it.metric==='progress'){
+      if(target)it.target=validateDomain(target);else delete it.target;
+    }else{
+      delete it.target;
+    }
+  }
+  closeCondPanel();
+  renderCondTree();
+}
+function commitCondOp(op){
+  const it=condNodeAt(condPanel.path);
+  if(it&&!it.group)it.op=op;
+  closeCondPanel();
+  renderCondTree();
+}
+function closeCondPanel(){
+  condPanel.visible=false;
+  const el=document.getElementById('condPanel');
+  if(el){el.style.display='none';el.innerHTML='';}
+}
+function editCondValue(path,btn){
+  const it=condNodeAt(path);
+  if(!it||it.group)return;
+  const valChip=btn.closest('.cond-chip-line').querySelector('.cc-value');
+  if(!valChip)return;
+  const input=document.createElement('input');
+  input.type='number';
+  input.className='cc-value-input';
+  input.value=it.value;
+  input.step='0.1';
+  let done=false;
+  const commit=()=>{
+    if(done)return;
+    done=true;
+    const v=Number(input.value);
+    it.value=(v!==undefined&&!isNaN(v))?v:0;
+    renderCondTree();
+  };
+  input.addEventListener('keydown',e=>{
+    if(e.key==='Enter'){e.preventDefault();commit();}
+    else if(e.key==='Escape'){done=true;renderCondTree();}
+  });
+  input.addEventListener('blur',commit);
+  valChip.replaceWith(input);
+  input.focus();
+  input.select();
+}
+document.addEventListener('click',function(e){
+  if(condPanel.visible&&!e.target.closest('#condPanel')&&!e.target.closest('.cc-chip'))closeCondPanel();
+});
 function rewardRowHTML(item){
   item=item||{type:'vitality',amount:10};
   const typeOpts=[['vitality','活力点'],['progress','进度值'],['achievement','成果点'],['card','断更豁免卡']]
@@ -2353,42 +2671,9 @@ function handleActivitySave(){
   if(!name){toast('请输入活动名称','err');return}
   const period=document.getElementById('activityPeriod').value;
   const anchor=parseInt(document.getElementById('activityAnchor').value,10)||1;
-  const mode=document.getElementById('activityCondMode').value==='any'?'any':'all';
-  const condItems=[];
-  document.querySelectorAll('#activityCondItems .cond-row').forEach(row=>{
-    const metric=row.querySelector('.ci-metric').value;
-    const op=row.querySelector('.ci-op').value;
-    const scope=row.querySelector('.ci-scope').value;
-    const value=Number(row.querySelector('.ci-value').value)||0;
-    const it={metric:metric,op:op,scope:scope,value:value};
-    if(metric==='progress'){
-      const tid=row.querySelector('.ci-target').value;
-      if(tid)it.target=validateDomain(tid);
-    }
-    condItems.push(it);
-  });
-  const rewardItems=[];
-  document.querySelectorAll('#activityResultDetails .reward-row').forEach(row=>{
-    const type=row.querySelector('.rr-type').value;
-    const amount=Math.max(0,Number(row.querySelector('.rr-amount').value)||0);
-    if(amount<=0&&type!=='card')return;
-    if(type==='card'){
-      rewardItems.push({type:'card',card:'exemption',amount:Math.round(amount),cap:Math.max(1,Math.round(Number(row.querySelector('.rr-cap').value)||3))});
-    }else if(type==='progress'){
-      const did=row.querySelector('.rr-domain').value;
-      const r={type:'progress',amount:amount};
-      if(did)r.domainId=did;
-      rewardItems.push(r);
-    }else if(type==='vitality'){
-      const tid=row.querySelector('.rr-task').value;
-      const r={type:'vitality',amount:amount};
-      if(tid)r.taskId=tid;
-      rewardItems.push(r);
-    }else if(type==='achievement'){
-      rewardItems.push({type:'achievement',amount:amount});
-    }
-  });
-  const condition={mode:mode,items:condItems};
+  condDraft.mode=document.getElementById('activityCondMode').value==='any'?'any':'all';
+  const condition=condDraft;
+  const rewardItems=readRewardItems();
   const result={items:rewardItems};
   if(!rewardItems.length){toast('请至少添加一个有效的奖励项','err');return}
   if(id){

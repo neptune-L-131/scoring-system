@@ -570,3 +570,69 @@ body{
   .bank-grid{grid-template-columns:1fr}.shop-grid{grid-template-columns:1fr}
   .tab{font-size:13px}.page{padding:14px 12px 60px}
 }
+
+/* ===== 条件芯片编辑器（周期活动前提条件）===== */
+.cond-chip-line{display:flex;align-items:center;gap:6px;margin-bottom:6px;flex-wrap:wrap}
+.cc-chip{
+  display:inline-flex;align-items:center;justify-content:center;
+  background:var(--surface-2);border:1px solid var(--border-2);border-radius:20px;
+  padding:5px 12px;font-size:12px;color:var(--text);cursor:pointer;font-family:inherit;
+  transition:all .15s;user-select:none;
+}
+.cc-chip:hover{border-color:var(--progress);background:var(--tag-p-bg)}
+.cc-chip.cc-metric{font-weight:600}
+.cc-chip.cc-op{min-width:32px;color:var(--progress);font-weight:700}
+.cc-chip.cc-value{min-width:40px;color:var(--text-2)}
+.cc-del{background:none;border:none;color:var(--text-3);cursor:pointer;font-size:15px;padding:0 4px;line-height:1;font-family:inherit;transition:color .15s}
+.cc-del:hover{color:var(--danger)}
+.cc-value-input{
+  width:68px;flex:0 0 auto;background:var(--surface-2);border:1px solid var(--progress);
+  border-radius:8px;color:var(--text);font-size:12px;font-family:inherit;padding:5px 8px;outline:none;
+}
+
+.cond-group{border-left:3px solid var(--progress);margin:8px 0 6px;padding-left:10px}
+.cond-group-head{display:flex;align-items:center;gap:6px;margin-bottom:6px}
+.cond-group-head .cg-label,.cond-group-head .cg-label2{font-size:12px;color:var(--text-3)}
+.cg-mode{
+  background:var(--surface-2);border:1px solid var(--border-2);border-radius:8px;
+  color:var(--progress);font-size:12px;font-weight:600;font-family:inherit;padding:4px 8px;outline:none;
+}
+.cond-group-body{padding-left:8px}
+.cond-empty,.cond-empty-sm{font-size:12px;color:var(--text-3);padding:6px 0}
+.cond-actions{display:flex;gap:6px;flex-wrap:wrap}
+
+.cond-preview{
+  margin-top:12px;padding:10px 12px;background:var(--tag-p-bg);border:1px solid var(--progress);
+  border-radius:var(--radius);font-size:12px;color:var(--text-2);line-height:1.7;
+}
+.cond-preview .cp-badge{
+  display:inline-block;font-size:10px;color:var(--progress);border:1px solid var(--progress);
+  border-radius:20px;padding:0 7px;margin-right:6px;font-weight:600;
+}
+
+/* 点选浮层面板 */
+.cond-panel{
+  position:fixed;z-index:3000;min-width:180px;max-width:280px;
+  background:var(--surface);border:1px solid var(--border-2);border-radius:10px;
+  box-shadow:0 8px 24px rgba(0,0,0,.18);padding:8px;
+}
+.cond-panel .cp-title{font-size:11px;color:var(--text-3);padding:3px 6px 6px}
+.cond-panel .cp-opts{display:flex;flex-wrap:wrap;gap:6px}
+.cond-panel .cp-opt{
+  background:var(--surface-2);border:1px solid var(--border-2);border-radius:8px;
+  padding:6px 10px;font-size:12px;color:var(--text);cursor:pointer;font-family:inherit;
+  transition:all .15s;flex:1 1 auto;
+}
+.cond-panel .cp-opt:hover{border-color:var(--progress);background:var(--tag-p-bg);color:var(--progress)}
+.cond-panel .cp-days{display:flex;gap:6px;align-items:center}
+.cond-panel .cp-days input{
+  width:80px;background:var(--surface-2);border:1px solid var(--border-2);border-radius:8px;
+  color:var(--text);font-size:12px;font-family:inherit;padding:6px 8px;outline:none;
+}
+@media(max-width:560px){
+  .cond-panel{
+    left:0 !important;right:0;top:auto !important;bottom:0;width:100%;
+    max-width:100%;min-width:0;border-radius:14px 14px 0 0;border-bottom:none;
+    padding:14px 12px calc(14px + env(safe-area-inset-bottom));
+  }
+}

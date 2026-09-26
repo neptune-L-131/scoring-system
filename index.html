@@ -322,7 +322,7 @@
           </div>
           <div class="fg" id="activityAnchorFg">
             <label>周起始日</label>
-            <select id="activityAnchor">
+            <select id="activityAnchor" onchange="updateCondPreview()">
               <option value="1">周一</option><option value="2">周二</option><option value="3">周三</option>
               <option value="4">周四</option><option value="5">周五</option><option value="6">周六</option><option value="7">周日</option>
             </select>
@@ -339,16 +339,20 @@
       </div>
       <div class="acc-body">
         <div class="fg">
-          <label>满足方式</label>
-          <select id="activityCondMode" onchange="updateActivitySummary()">
+          <label>满足方式 <span class="h">作用于最外层；条件组内部可单独设定「全部/任意」</span></label>
+          <select id="activityCondMode" onchange="onCondModeChange()">
             <option value="all">全部满足（且）</option>
             <option value="any">任一满足（或）</option>
           </select>
         </div>
         <div class="fg">
-          <label>前提项 <span class="h">每项由「状态A｜主体A｜要求｜时间限定｜状态B」五字段构成；不添加=无条件触发</span></label>
+          <label>前提条件 <span class="h">点击芯片逐项编辑；可用条件组嵌套，最多两层</span></label>
           <div id="activityCondItems"></div>
-          <button class="btn btn-sm" style="margin-top:4px" onclick="addCondItem()">+ 添加前提</button>
+          <div class="cond-actions" style="margin-top:6px">
+            <button class="btn btn-sm" onclick="addCondItem('')">+ 添加条件</button>
+            <button class="btn btn-sm" onclick="addCondGroup('')">+ 添加条件组</button>
+          </div>
+          <div class="cond-preview" id="condPreview"></div>
         </div>
       </div>
     </div>
