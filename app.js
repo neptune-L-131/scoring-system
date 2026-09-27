@@ -7,7 +7,7 @@ let state=load();
 let editCurrency='vitality';
 let editTypes=['vitality'];
 let condDraft={mode:'all',items:[]};
-let condPanel={visible:false,kind:'metric',path:'',step:'range',range:'period',days:7,metric:'checkins'};
+let condPanel={visible:false,kind:'metric',path:'',step:'range',range:'period',days:7,metric:'checkins',targetType:'all',newFilter:'none',target:'',aggregate:'sum'};
 
 // ===== Theme =====
 function initTheme(){
@@ -43,10 +43,16 @@ function normOp(op){return ['>','<','<=','>='].indexOf(op)>=0?op:'>=';}
 // 将旧数据中 target/domainId（仅指领域）迁移为 targetType/target；若已有合法 targetType 则保留
 function applyCondTarget(o,it){
   const tt=it.targetType;
-  if(tt==='new_task'){o.targetType='new_task';return;}
-  if((tt==='task'||tt==='domain')&&it.target){o.targetType=tt;o.target=it.target;return;}
-  if(it.metric==='progress'&&(it.target||it.domainId)){o.targetType='domain';o.target=it.domainId||it.target;return;}
-  o.targetType='all';
+  // 迁移上一版 one-off 主体「本周期新增任务」→ 可组合结构
+  if(tt==='new_task'){o.targetType='all';o.newFilter='new_task';o.aggregate='any';return;}
+  if(tt==='task'&&it.target){o.targetType='task';o.target=it.target;}
+  else if(tt==='domain'&&it.target){o.targetType='domain';o.target=it.target;}
+  else if(tt==='domain'){o.targetType='domain';}
+  else{o.targetType='all';}
+  // 旧版 progress 的 target/domainId 实为领域
+  if(it.metric==='progress'&&(it.target||it.domainId)){o.targetType='domain';o.target=it.domainId||it.target;}
+  o.newFilter=(it.newFilter==='new_task'||it.newFilter==='new_domain')?it.newFilter:'none';
+  o.aggregate=(it.aggregate==='any')?'any':'sum';
 }
 const COND_LEGACY_MAP={
   'progress_total':{metric:'progress',range:'total'},
@@ -414,11 +420,27 @@ function opSatisfied(val,op,v){
   if(op==='<=')return val<=v;
   return val>=v;
 }
-// 单个任务在 [start,end) 窗口内的指标取值（用于「本周期新增任务」的逐任务判定）
-function taskMetricValue(taskId,metric,start,end){
-  const st=rangeStats(start,end,'task',taskId);
+// 单个任务在 [w.start,w.end) 窗口内的指标取值
+function taskMetricValue(metric,taskId,w,range){
+  if(metric==='checkins'&&range==='total'){
+    const t=state.tasks.find(x=>x.id===taskId);
+    return t?(t.checkInCount||0):0;
+  }
+  const st=rangeStats(w.start,w.end,'task',taskId);
   if(metric==='checkins')return st.checkins;
   if(metric==='progress')return st.progressByTask[taskId]||0;
+  if(metric==='vitality')return st.vitality;
+  return 0;
+}
+// 单个领域在 [w.start,w.end) 窗口内的指标取值
+function domainMetricValue(metric,domainId,w,range){
+  if(range==='total'){
+    if(metric==='progress')return domainProgress(domainId);
+    if(metric==='checkins')return state.tasks.filter(t=>getTaskDomainIds(t).indexOf(domainId)>=0).reduce((s,t)=>s+(t.checkInCount||0),0);
+  }
+  const st=rangeStats(w.start,w.end,'domain',domainId);
+  if(metric==='checkins')return st.checkins;
+  if(metric==='progress')return st.progressByDomain[domainId]||0;
   if(metric==='vitality')return st.vitality;
   return 0;
 }
@@ -427,58 +449,73 @@ function condWindowByRange(range,act,ts,days){
   if(range==='recent'){const d=Math.max(1,Math.round(Number(days)||7));return {start:ts-d*864e5,end:ts};}
   return prevPeriodRange(act,ts);
 }
+// 值类指标（打卡/活力/进度）的可组合最小实体集合：主体 × 新增筛选
+function condLeafEntities(it,w){
+  const tt=it.targetType||'all';
+  const target=it.target||'';
+  const nf=it.newFilter||'none';
+  if(nf==='new_domain'){
+    let ds=state.domains.filter(d=>d.createdAt&&d.createdAt>=w.start&&d.createdAt<w.end);
+    if(tt==='domain'&&target)ds=ds.filter(d=>d.id===target);
+    return ds.map(d=>({kind:'domain',id:d.id}));
+  }
+  let tasks=nf==='new_task'
+    ?state.tasks.filter(t=>t.createdAt&&t.createdAt>=w.start&&t.createdAt<w.end)
+    :state.tasks.slice();
+  if(tt==='task'&&target)tasks=tasks.filter(t=>t.id===target);
+  else if(tt==='domain'&&target)tasks=tasks.filter(t=>getTaskDomainIds(t).indexOf(target)>=0);
+  return tasks.map(t=>({kind:'task',id:t.id}));
+}
+function entityMetricValue(metric,entity,w,range){
+  if(entity.kind==='task')return taskMetricValue(metric,entity.id,w,range);
+  if(entity.kind==='domain')return domainMetricValue(metric,entity.id,w,range);
+  return 0;
+}
+// 计数类指标：新增任务/新增领域数量（主体 all/domain）
+function evalCountMetric(it,w){
+  const v=Number(it.value)||0;
+  const isDomain=(it.targetType==='domain');
+  const target=it.target||'';
+  let val;
+  if(it.metric==='new_tasks'){
+    if(isDomain)val=state.tasks.filter(t=>t.createdAt&&t.createdAt>=w.start&&t.createdAt<w.end&&getTaskDomainIds(t).indexOf(target)>=0).length;
+    else val=state.tasks.filter(t=>t.createdAt&&t.createdAt>=w.start&&t.createdAt<w.end).length;
+  }else{
+    if(isDomain)val=state.domains.some(d=>d.id===target&&d.createdAt&&d.createdAt>=w.start&&d.createdAt<w.end)?1:0;
+    else val=state.domains.filter(d=>d.createdAt&&d.createdAt>=w.start&&d.createdAt<w.end).length;
+  }
+  return opSatisfied(val,it.op,v);
+}
 function evalCondItem(it,act,ts){
   const v=Number(it.value)||0;
   const range=validRange(it.range)?it.range:(it.scope==='total'?'total':'period');
-  const tt=(it.targetType==='task'||it.targetType==='domain'||it.targetType==='new_task')?it.targetType:'all';
-  const target=it.target||'';
-  // 「本周期新增任务」动态主体：逐新任务独立判定，任一命中即满足，绝不跨任务相加
-  if(tt==='new_task'){
-    const metric=it.metric;
+  const w=range==='total'?{start:0,end:ts+1}:condWindowByRange(range,act,ts,it.days);
+  // 成果点：全局累计，无主体/新增/聚合概念
+  if(it.metric==='achievement'){
+    const val=range==='total'?(state.scores.achievement||0):rangeStats(w.start,w.end).achievement;
+    return opSatisfied(val,it.op,v);
+  }
+  // 计数类指标：新增任务/新增领域数量
+  if(it.metric==='new_tasks'||it.metric==='new_domains')return evalCountMetric(it,w);
+  // 值类指标：主体 × 新增筛选 × 聚合。全局累计总和用累计字段（vitality 含无任务归属的日志），避免遗漏
+  const isGlobalAll=(it.targetType||'all')==='all'&&(it.newFilter||'none')==='none'&&it.aggregate!=='any';
+  if(isGlobalAll){
+    let val;
     if(range==='total'){
-      return state.tasks.filter(t=>t.createdAt).some(t=>{
-        const mv=metric==='checkins'?(t.checkInCount||0):taskMetricValue(t.id,metric,0,ts+1);
-        return opSatisfied(mv,it.op,v);
-      });
+      if(it.metric==='checkins')val=state.tasks.reduce((s,t)=>s+(t.checkInCount||0),0);
+      else if(it.metric==='progress')val=totalProgress();
+      else val=state.scores.vitality||0;
+    }else{
+      const st=rangeStats(w.start,w.end);
+      val=it.metric==='checkins'?st.checkins:it.metric==='progress'?st.progressTotal:st.vitality;
     }
-    const w=condWindowByRange(range,act,ts,it.days);
-    return state.tasks.filter(t=>t.createdAt&&t.createdAt>=w.start&&t.createdAt<w.end)
-      .some(t=>opSatisfied(taskMetricValue(t.id,metric,w.start,w.end),it.op,v));
+    return opSatisfied(val,it.op,v);
   }
-  let val=null;
-  if(range==='total'){
-    if(it.metric==='checkins'){
-      if(tt==='task')val=(state.tasks.find(t=>t.id===target)||{}).checkInCount||0;
-      else if(tt==='domain')val=state.tasks.filter(t=>getTaskDomainIds(t).indexOf(target)>=0).reduce((s,t)=>s+(t.checkInCount||0),0);
-      else val=state.tasks.reduce((s,t)=>s+(t.checkInCount||0),0);
-    }else if(it.metric==='vitality'){
-      if(tt==='all')val=state.scores.vitality||0;
-      else val=rangeStats(0,ts+1,tt,target).vitality;
-    }else if(it.metric==='achievement'){
-      val=state.scores.achievement||0;
-    }else if(it.metric==='progress'){
-      if(tt==='domain')val=domainProgress(target);
-      else if(tt==='task')val=(rangeStats(0,ts+1,'task',target).progressByTask[target]||0);
-      else val=totalProgress();
-    }else if(it.metric==='new_tasks'){
-      if(tt==='domain')val=state.tasks.filter(t=>t.createdAt&&getTaskDomainIds(t).indexOf(target)>=0).length;
-      else val=state.tasks.filter(t=>t.createdAt).length;
-    }else if(it.metric==='new_domains'){
-      if(tt==='domain')val=state.domains.some(d=>d.id===target&&d.createdAt)?1:0;
-      else val=state.domains.filter(d=>d.createdAt).length;
-    }
-  }else{
-    const w=condWindowByRange(range,act,ts,it.days);
-    const st=rangeStats(w.start,w.end,tt,target);
-    if(it.metric==='checkins')val=st.checkins;
-    else if(it.metric==='vitality')val=st.vitality;
-    else if(it.metric==='achievement')val=st.achievement;
-    else if(it.metric==='progress')val=(tt==='task'?(st.progressByTask[target]||0):(tt==='domain'?(st.progressByDomain[target]||0):st.progressTotal));
-    else if(it.metric==='new_tasks')val=st.newTasks;
-    else if(it.metric==='new_domains')val=st.newDomains;
-  }
-  if(val===null)return true;
-  return opSatisfied(val,it.op,v);
+  const entities=condLeafEntities(it,w);
+  if(!entities.length)return false;
+  const vals=entities.map(e=>entityMetricValue(it.metric,e,w,range));
+  if(it.aggregate==='any')return vals.some(mv=>opSatisfied(mv,it.op,v));
+  return opSatisfied(vals.reduce((s,x)=>s+x,0),it.op,v);
 }
 function applyResult(act,ts){
   const items=(act.result&&act.result.items)||[];
@@ -2301,12 +2338,20 @@ const COND_METRICS=[
   {v:'new_tasks',n:'新增任务'},
   {v:'new_domains',n:'新增领域'}
 ];
-const COND_TARGET_TYPES=[{v:'all',n:'全部'},{v:'domain',n:'按领域'},{v:'task',n:'按任务'},{v:'new_task',n:'本周期新增的任务'}];
-// 指标可用的主体类型：打卡/活力/进度支持全部+领域+任务+「本周期新增任务」；成果点仅全部；新增任务/新增领域支持全部+领域
+const COND_TARGET_TYPES=[{v:'all',n:'全部'},{v:'domain',n:'按领域'},{v:'task',n:'按任务'}];
+const COND_NEW_FILTERS=[{v:'none',n:'当前'},{v:'new_task',n:'本周期新增任务'},{v:'new_domain',n:'本周期新增领域'}];
+const COND_AGGREGATES=[{v:'sum',n:'总计'},{v:'any',n:'任意单个'}];
+// 主体类型：成果点仅全部；计数类(新增任务/新增领域)支持全部+领域；值类(打卡/活力/进度)支持全部+领域+任务
 function condTargetTypesFor(metric){
   if(metric==='achievement')return ['all'];
   if(metric==='new_tasks'||metric==='new_domains')return ['all','domain'];
-  return ['all','domain','task','new_task'];
+  return ['all','domain','task'];
+}
+// 新增筛选选项（仅值类指标；按主体限制可用项）
+function condNewFilterOptions(targetType){
+  if(targetType==='all')return ['none','new_task','new_domain'];
+  if(targetType==='domain')return ['none','new_task'];
+  return ['none'];
 }
 function rangeLabel(range,days){
   if(range==='recent')return '最近'+(days||7)+'天';
@@ -2316,16 +2361,32 @@ function rangeLabel(range,days){
 function metricNameLabel(it){
   return (COND_METRICS.find(m=>m.v===it.metric)||{}).n||it.metric;
 }
-function subjectLabel(it){
-  if(it.targetType==='task'&&it.target)return taskNameLabel(it.target);
-  if(it.targetType==='domain'&&it.target)return domainName(it.target);
+function condEntityWord(it){
+  return it.newFilter==='new_domain'?'领域':'任务';
+}
+// 是否多实体语境（需要展示「总计/任意单个」聚合方式）
+function condIsMulti(it){
+  if(it.newFilter==='new_task'||it.newFilter==='new_domain')return true;
+  if(it.targetType==='all'&&it.aggregate==='any')return true;
+  return false;
+}
+// 主体+新增短语（不含范围与聚合）
+function condScopePhrase(it){
+  const t=it.target||'';
+  if(it.newFilter==='new_task'){
+    if(it.targetType==='domain'&&t)return domainName(t)+'新增任务';
+    return '新增任务';
+  }
+  if(it.newFilter==='new_domain')return '新增领域';
+  if(it.targetType==='domain'&&t)return domainName(t);
+  if(it.targetType==='task'&&t)return taskNameLabel(t);
   return '';
 }
 function metricLabel(it){
   const mn=metricNameLabel(it);
-  if(it.targetType==='new_task')return '新增任务·'+mn;
-  const sub=subjectLabel(it);
-  return sub?sub+mn:mn;
+  let s=condScopePhrase(it);
+  if(condIsMulti(it))s+=(it.aggregate==='any'?'·任一'+condEntityWord(it):'·总计');
+  return (s?s+'·':'')+mn;
 }
 function opLabel(op){return {'<=':'≤','>=':'≥','>':'>','<':'<'}[op]||'≥';}
 function rangeTimeWord(it,act){
@@ -2345,8 +2406,23 @@ function condNodeLabel(node){
   return condItemLabel(node);
 }
 function condNLLeaf(it,act){
-  if(it.targetType==='new_task')return rangeTimeWord(it,act)+'新增任务中，任意单个任务'+metricNameLabel(it)+' '+opLabel(it.op)+' '+fmt(it.value);
-  return rangeTimeWord(it,act)+metricLabel(it)+' '+opLabel(it.op)+' '+fmt(it.value);
+  const rw=rangeTimeWord(it,act);
+  const mn=metricNameLabel(it);
+  const tail=' '+opLabel(it.op)+' '+fmt(it.value);
+  if(it.metric==='achievement')return rw+mn+tail;
+  const scope=condScopePhrase(it);
+  const ew=condEntityWord(it);
+  const anyAgg=it.aggregate==='any';
+  if(it.newFilter==='new_task'||it.newFilter==='new_domain'){
+    if(anyAgg)return rw+scope+'中，任意单个'+ew+mn+tail;
+    return rw+scope+'总计'+mn+tail;
+  }
+  if(it.targetType==='all'){
+    if(anyAgg)return rw+'任意单个'+ew+mn+tail;
+    return rw+mn+tail;
+  }
+  if(anyAgg)return rw+scope+'中，任意单个'+ew+mn+tail;
+  return rw+scope+mn+tail;
 }
 function condNLNode(node,act){
   if(node&&node.group)return '（'+((node.items||[]).map(n=>condNLNode(n,act)).join(node.mode==='any'?' 或 ':' 且 '))+'）';
@@ -2629,16 +2705,29 @@ function renderCondPanel(){
       html+='<button class="cp-opt" onclick="pickCondTargetType(\''+tt+'\')">'+n+'</button>';
     });
     html+='</div>';
+  }else if(p.step==='newFilter'){
+    html='<div class="cp-title">新增筛选</div><div class="cp-opts">';
+    condNewFilterOptions(p.targetType).forEach(nf=>{
+      const n=(COND_NEW_FILTERS.find(x=>x.v===nf)||{}).n||nf;
+      html+='<button class="cp-opt" onclick="pickCondNewFilter(\''+nf+'\')">'+n+'</button>';
+    });
+    html+='</div>';
   }else if(p.step==='domain'){
     html='<div class="cp-title">选择领域</div><div class="cp-opts">';
     state.domains.forEach(d=>{
-      html+='<button class="cp-opt" onclick="commitCondTarget(\'domain\',\''+d.id+'\')">'+esc(d.name)+'</button>';
+      html+='<button class="cp-opt" onclick="pickCondDomain(\''+d.id+'\')">'+esc(d.name)+'</button>';
     });
     html+='</div>';
   }else if(p.step==='task'){
     html='<div class="cp-title">选择任务</div><div class="cp-opts">';
     state.tasks.forEach(t=>{
-      html+='<button class="cp-opt" onclick="commitCondTarget(\'task\',\''+t.id+'\')">'+esc(t.name)+'</button>';
+      html+='<button class="cp-opt" onclick="pickCondTask(\''+t.id+'\')">'+esc(t.name)+'</button>';
+    });
+    html+='</div>';
+  }else if(p.step==='aggregate'){
+    html='<div class="cp-title">聚合方式</div><div class="cp-opts">';
+    COND_AGGREGATES.forEach(a=>{
+      html+='<button class="cp-opt" onclick="pickCondAggregate(\''+a.v+'\')">'+a.n+'</button>';
     });
     html+='</div>';
   }
@@ -2648,13 +2737,13 @@ function renderCondPanel(){
   }
 }
 function openCondMetricPanel(path,anchor){
-  const it=condNodeAt(path)||{range:'period',metric:'checkins',op:'>=',value:1};
-  condPanel={visible:true,kind:'metric',path:path,anchor:anchor,step:'range',range:it.range||'period',days:it.days||7,metric:it.metric||'checkins'};
+  const it=condNodeAt(path)||{range:'period',metric:'checkins',op:'>=',value:1,targetType:'all',newFilter:'none',target:'',aggregate:'sum'};
+  condPanel={visible:true,kind:'metric',path:path,anchor:anchor,step:'range',range:it.range||'period',days:it.days||7,metric:it.metric||'checkins',targetType:it.targetType||'all',newFilter:it.newFilter||'none',target:it.target||'',aggregate:it.aggregate||'sum'};
   renderCondPanel();
   positionCondPanel(anchor);
 }
 function openCondOpPanel(path,anchor){
-  condPanel={visible:true,kind:'op',path:path,anchor:anchor,step:'range',range:'period',days:7,metric:'checkins'};
+  condPanel={visible:true,kind:'op',path:path,anchor:anchor,step:'range',range:'period',days:7,metric:'checkins',targetType:'all',newFilter:'none',target:'',aggregate:'sum'};
   renderCondPanel();
   positionCondPanel(anchor);
 }
@@ -2673,30 +2762,66 @@ function confirmCondDays(){
 }
 function pickCondMetric(metric){
   condPanel.metric=metric;
-  const allowed=condTargetTypesFor(metric);
-  if(allowed.length===1){ // 仅支持全部（如成果点）
-    commitCondTarget('all','');
+  // 成果点仅支持「全部」，直接提交
+  if(metric==='achievement'){commitCondValue('all','','none','sum');return;}
+  condPanel.step='targetType';
+  renderCondPanel();
+  positionCondPanel(condPanel.anchor);
+}
+function pickCondTargetType(tt){
+  condPanel.targetType=tt;
+  // 单任务：主体即锁定唯一实体，无需新增筛选与聚合
+  if(tt==='task'){
+    condPanel.newFilter='none';
+    condPanel.step='task';
+    renderCondPanel();
+    positionCondPanel(condPanel.anchor);
+    return;
+  }
+  // 计数类指标（新增任务/新增领域）：本身已限定「新增」，无需新增筛选/聚合
+  if(condPanel.metric==='new_tasks'||condPanel.metric==='new_domains'){
+    if(tt==='all'){commitCondValue('all','','none','sum');}
+    else{condPanel.step='domain';renderCondPanel();positionCondPanel(condPanel.anchor);}
+    return;
+  }
+  // 值类指标（打卡/活力/进度）：全部→新增筛选；按领域→先选领域再新增筛选
+  condPanel.step=(tt==='all')?'newFilter':'domain';
+  renderCondPanel();
+  positionCondPanel(condPanel.anchor);
+}
+function pickCondNewFilter(nf){
+  condPanel.newFilter=nf;
+  condPanel.step='aggregate';
+  renderCondPanel();
+  positionCondPanel(condPanel.anchor);
+}
+function pickCondDomain(id){
+  condPanel.target=id;
+  // 计数类指标选完领域即完成；值类指标继续选新增筛选
+  if(condPanel.metric==='new_tasks'||condPanel.metric==='new_domains'){
+    commitCondValue('domain',id,'none','sum');
   }else{
-    condPanel.step='targetType';
+    condPanel.step='newFilter';
     renderCondPanel();
     positionCondPanel(condPanel.anchor);
   }
 }
-function pickCondTargetType(tt){
-  if(tt==='all'){commitCondTarget('all','');}
-  else if(tt==='new_task'){commitCondTarget('new_task','');}
-  else if(tt==='domain'){condPanel.step='domain';renderCondPanel();positionCondPanel(condPanel.anchor);}
-  else if(tt==='task'){condPanel.step='task';renderCondPanel();positionCondPanel(condPanel.anchor);}
+function pickCondTask(id){
+  commitCondValue('task',id,'none','sum');
 }
-function commitCondTarget(targetType,target){
+function pickCondAggregate(agg){
+  commitCondValue(condPanel.targetType,condPanel.target,condPanel.newFilter,agg);
+}
+function commitCondValue(targetType,target,newFilter,aggregate){
   const it=condNodeAt(condPanel.path);
   if(it&&!it.group){
     it.range=condPanel.range;
     if(condPanel.range==='recent')it.days=condPanel.days;else delete it.days;
     it.metric=condPanel.metric;
     it.targetType=targetType;
-    if(targetType==='all'||targetType==='new_task')delete it.target;
-    else it.target=target;
+    if(targetType==='all')delete it.target;else it.target=target;
+    it.newFilter=newFilter;
+    it.aggregate=aggregate;
   }
   closeCondPanel();
   renderCondTree();
