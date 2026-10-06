@@ -647,10 +647,13 @@ body{
 .tdot{width:8px;height:8px;border-radius:50%;flex-shrink:0;display:inline-block}
 .tdot.v{background:var(--vitality)}
 .tdot.p{background:var(--progress)}
-.task-more{color:var(--text-3);font-size:13px;flex-shrink:0;opacity:.55;letter-spacing:1px;line-height:1;transition:opacity .2s}
-.task-card.revealed .task-more{opacity:0}
+.task-row-actions{display:flex;align-items:center;gap:6px;flex-shrink:0}
+.task-stage-row{margin-top:8px;display:none}
+.task-card:not(.revealed) .task-stage-row{display:block}
 .task-extra{max-height:0;opacity:0;overflow:hidden;transition:max-height .3s ease,opacity .25s ease}
 .task-card.revealed .task-extra{max-height:560px;opacity:1}
+.task-card.revealed .task-row-actions{display:none}
+.task-card.revealed .task-stage-row{display:none}
 
 /* ===== 任务编辑弹窗：数值滑动条 ===== */
 .slide-row{display:flex;align-items:center;gap:10px;margin-bottom:13px}
@@ -708,19 +711,21 @@ body{
 }
 .stage-cell input:focus{border-color:var(--vitality)}
 
-/* ===== 阶段奖励：卡片进度条 ===== */
-.stage-bar{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
-.stage-tickrow{display:flex;justify-content:space-between;font-size:9px;color:var(--text-3);line-height:1}
-.stage-tickrow span{transition:color .15s}
-.stage-tickrow span.on{color:var(--text);font-weight:700}
-.stage-track{
-  position:relative;height:14px;background:var(--surface-2);border:1px solid var(--border-2);
-  border-radius:8px;cursor:pointer;touch-action:none;overflow:visible;
-}
-.stage-fill{position:absolute;left:0;top:0;bottom:0;background:var(--vitality);border-radius:8px;opacity:.55}
-.stage-grid{position:absolute;inset:0;display:flex;pointer-events:none}
-.stage-grid i{flex:1;border-right:1px solid rgba(128,128,128,.12)}
-.stage-grid i:last-child{border-right:none}
-.stage-tick{position:absolute;top:50%;transform:translate(-50%,-50%);width:7px;height:7px;border-radius:50%;background:var(--surface);border:2px solid var(--text-2);pointer-events:none}
-.stage-thumb{position:absolute;top:50%;transform:translate(-50%,-50%);width:16px;height:16px;border-radius:50%;background:#fff;border:2px solid var(--vitality);box-shadow:0 1px 3px rgba(0,0,0,.2);pointer-events:none}
+/* ===== 阶段奖励：卡片进度条（10 格 + 5 长锚点） ===== */
+.stage-bar{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}
+.stage-track{position:relative;height:22px;cursor:pointer;touch-action:none}
+.stage-track::before{content:'';position:absolute;left:0;right:0;top:50%;height:2px;background:var(--border-2);transform:translateY(-50%);border-radius:1px}
+.stage-tick{position:absolute;top:50%;transform:translate(-50%,-50%);width:1px;height:8px;background:var(--text-3);pointer-events:none}
+.stage-tick.major{height:14px;width:1.5px;background:var(--text-2)}
+.stage-thumb{position:absolute;top:50%;transform:translate(-50%,-50%);width:11px;height:11px;border-radius:50%;background:var(--surface);border:1.5px solid var(--vitality);box-shadow:0 0 0 2px var(--surface);pointer-events:none}
+.stage-labels{position:relative;height:16px;font-size:10px;color:var(--text-3);line-height:1}
+.stage-labels span{position:absolute;top:0;transform:translateX(-50%);white-space:nowrap;transition:color .15s}
+.stage-labels span.on{color:var(--text);font-weight:700}
 .stage-preview{font-size:11px;color:var(--vitality);font-weight:600;min-height:14px}
+.recover-bar{
+  display:flex;align-items:center;justify-content:space-between;gap:10px;
+  background:#f7e6b5;border-bottom:1px solid #d8b860;color:#5a4a12;
+  padding:10px 16px;font-size:13px;
+}
+[data-theme="dark"] .recover-bar{background:#4a3f1e;border-bottom-color:#6b5a2a;color:#e8d89a}
+.recover-bar button{flex-shrink:0}

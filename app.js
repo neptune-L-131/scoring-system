@@ -27,7 +27,9 @@ function saveStagePresets(){try{localStorage.setItem(STAGE_PRESET_KEY,JSON.strin
 function stageRewards(t){const sr=t&&t.stageRewards;return sr&&(Array.isArray(sr.v)||Array.isArray(sr.p))?sr:null;}
 function taskIsStaged(t){return !!stageRewards(t);}
 function stageValues(t,type){const sr=stageRewards(t);if(!sr)return null;const arr=type==='vitality'?sr.v:sr.p;return Array.isArray(arr)&&arr.length===5?arr:null;}
-function stageSel(t){const sr=stageRewards(t);const l=sr&&typeof sr.last==='number'?sr.last:0;return Math.max(0,Math.min(4,Math.round(l)));}
+function stageSel(t){const sr=stageRewards(t);const l=sr&&typeof sr.last==='number'?sr.last:0;return Math.max(0,Math.min(9,Math.round(l)));}
+function stageValueAt(t,type,cell){const v=stageValues(t,type);if(!v)return 0;if(cell>=9)return v[4]+(v[4]-v[3])/2;const i=cell>>1,rem=cell&1;return rem?(v[i]+v[i+1])/2:v[i];}
+function stageCellLabel(cell){if(cell<=8&&cell%2===0)return STAGE_NAMES[cell/2];return STAGE_NAMES[Math.min(4,(cell-1)>>1)]+'+';}
 function round2(v){return Math.round(v*100)/100;}
 // 日志金额：both 型且两分值不同时用 amtV/amtP 分别表达，否则回退到单一 amt
 function logAmt(l,type){
@@ -324,7 +326,7 @@ let _saveChain=Promise.resolve();
 function save(){
   const json=JSON.stringify(state);
   _saveChain=_saveChain.then(function(){return idbPut(KEY,json);})
-    .catch(function(){/* 写失败不阻塞 UI */});
+    .catch(function(e){console.warn('IndexedDB save failed',e);/* 写失败不阻塞 UI */});
 }
 
 // ===== Utils =====
@@ -798,11 +800,11 @@ function checkIn(taskId,stageIdx){
   // 阶段任务按选中档位结算；否则保持单档结算（初始值 + 连胜 - 债务）
   let netV=0,netP=0,stageName=null;
   if(staged){
-    const sel=(typeof stageIdx==='number')?Math.max(0,Math.min(4,Math.round(stageIdx))):stageSel(t);
-    if(t.stageRewards)t.stageRewards.last=sel;
-    netV=hasV?(stageValues(t,'vitality')||[0,0,0,0,0])[sel]:0;
-    netP=hasP?(stageValues(t,'progress')||[0,0,0,0,0])[sel]:0;
-    stageName=STAGE_NAMES[sel];
+    const cell=(typeof stageIdx==='number')?Math.max(0,Math.min(9,Math.round(stageIdx))):stageSel(t);
+    if(t.stageRewards)t.stageRewards.last=cell;
+    netV=hasV?stageValueAt(t,'vitality',cell):0;
+    netP=hasP?stageValueAt(t,'progress',cell):0;
+    stageName=stageCellLabel(cell);
   }else{
     netV=hasV?c.net:0;
     netP=hasP?c.net:0;
@@ -1708,25 +1710,22 @@ function renderWork(){
 }
 
 function stageBarHTML(t){
-  const sel=stageSel(t);
+  const cell=stageSel(t);
   const hasV=taskHasType(t,'vitality');
   const hasP=taskHasType(t,'progress');
-  const v=stageValues(t,'vitality');
-  const p=stageValues(t,'progress');
-  const pct=(sel/4*100);
-  const labels=STAGE_NAMES.map((n,i)=>'<span'+(i===sel?' class="on"':'')+'>'+n+'</span>').join('');
-  let reward='+'+fmt(hasV?v[sel]:p[sel]);
-  reward+=hasV&&hasP?(' 活力 / +'+fmt(p[sel])+' 进度'):(hasV?' 活力':' 进度');
-  const ticks=[0,25,50,75,100].map(x=>'<i class="stage-tick" style="left:'+x+'%"></i>').join('');
+  let reward='+'+fmt(hasV?stageValueAt(t,'vitality',cell):stageValueAt(t,'progress',cell));
+  reward+=hasV&&hasP?(' 活力 / +'+fmt(stageValueAt(t,'progress',cell))+' 进度'):(hasV?' 活力':' 进度');
+  const label=stageCellLabel(cell);
+  let ticks='';
+  for(let i=0;i<10;i++){ticks+='<i class="stage-tick'+(i%2===0?' major':'')+'" style="left:'+(i*10)+'%"></i>';}
+  const anchorLabels=STAGE_NAMES.map((n,k)=>'<span'+(k===(cell>>1)?' class="on"':'')+' style="left:'+(k*20)+'%">'+n+'</span>').join('');
+  let curStreak=t.streak||0;if(curStreak===0&&t.lastCheckIn)curStreak=1;
+  let meta='';if(curStreak>0)meta+='连胜'+curStreak+'天';
+  const pend=t.pendingDebt||0;if(pend>0)meta+=(meta?' · ':'')+'待扣债'+fmt(pend);
   return '<div class="stage-bar" data-tid="'+t.id+'">'
-    +'<div class="stage-tickrow">'+labels+'</div>'
-    +'<div class="stage-track">'
-    +'<div class="stage-fill" style="width:'+pct+'%"></div>'
-    +'<div class="stage-grid">'+'<i></i>'.repeat(10)+'</div>'
-    +ticks
-    +'<div class="stage-thumb" style="left:'+pct+'%"></div>'
-    +'</div>'
-    +'<div class="stage-preview">'+STAGE_NAMES[sel]+' · '+reward+'</div>'
+    +'<div class="stage-track">'+ticks+'<div class="stage-thumb" style="left:'+(cell*10+5)+'%"></div></div>'
+    +'<div class="stage-labels">'+anchorLabels+'</div>'
+    +'<div class="stage-preview">'+label+' · '+reward+(meta?' · '+meta:'')+'</div>'
     +'</div>';
 }
 
@@ -1784,14 +1783,16 @@ function taskCardHTML(t,collId){
     ?'<button class="btn btn-sm btn-exempt" title="剩余豁免卡 '+cards+' 张" onclick="useExemption(\''+t.id+'\')">豁免·'+exemptLabel+'</button>'
     :'';
 
+  const checkinBtn='<button class="btn btn-sm btn-checkin" onclick="checkIn(\''+t.id+'\')" '+(cost>0&&state.scores.vitality<cost?'title="活力点不足，将进入负值（贷款）"':'')+'>打卡</button>';
   return '<div class="card task-card" data-task-id="'+t.id+'" data-coll-id="'+(collId||'')+'">'
     +'<div class="task-row">'
     +'<div class="task-title-wrap">'
     +(hasV?'<span class="tdot v" title="活力点"></span>':'')+(hasP?'<span class="tdot p" title="进度值"></span>':'')
     +'<span class="card-title">'+esc(t.name)+'</span>'
     +'</div>'
-    +'<span class="task-more" aria-hidden="true">···</span>'
+    +'<div class="task-row-actions"><span class="drag-handle" title="拖拽排序">⋮⋮</span>'+checkinBtn+'</div>'
     +'</div>'
+    +(staged?'<div class="task-stage-row">'+stageBarHTML(t)+'</div>':'')
     +'<div class="task-extra">'
     +'<div class="card-top">'
     +'<div>'+typeTag+domTags+streakTag+'</div>'
@@ -1807,28 +1808,29 @@ function taskCardHTML(t,collId){
     +'</div>'
     +'<div class="card-bottom">'
     +(staged?stageBarHTML(t):'<div class="preview">'+prev+'</div>')
-    +'<button class="btn btn-sm btn-checkin" onclick="checkIn(\''+t.id+'\')" '+(cost>0&&state.scores.vitality<cost?'title="活力点不足，将进入负值（贷款）"':'')+'>打卡</button>'
+    +checkinBtn
     +'</div>'
     +'</div>'
     +'</div>';
 }
 
 // ===== 阶段奖励：卡片进度条拖拽 =====
-function updateStageBar(track,tid,sel){
+function updateStageBar(track,tid,cell){
   const t=state.tasks.find(x=>x.id===tid);if(!t)return;
-  const pct=(sel/4*100);
-  const fill=track.querySelector('.stage-fill');if(fill)fill.style.width=pct+'%';
-  const thumb=track.querySelector('.stage-thumb');if(thumb)thumb.style.left=pct+'%';
+  const thumb=track.querySelector('.stage-thumb');if(thumb)thumb.style.left=(cell*10+5)+'%';
   const bar=track.closest('.stage-bar');
   if(bar){
-    const spans=bar.querySelectorAll('.stage-tickrow span');
-    spans.forEach((n,i)=>n.classList.toggle('on',i===sel));
+    const spans=bar.querySelectorAll('.stage-labels span');
+    spans.forEach(function(n,k){n.classList.toggle('on',k===(cell>>1));});
     const preview=bar.querySelector('.stage-preview');
     if(preview){
       const hasV=taskHasType(t,'vitality'),hasP=taskHasType(t,'progress');
-      const v=stageValues(t,'vitality'),p=stageValues(t,'progress');
-      let reward='+'+fmt(hasV?v[sel]:p[sel])+(hasV&&hasP?(' 活力 / +'+fmt(p[sel])+' 进度'):(hasV?' 活力':' 进度'));
-      preview.textContent=STAGE_NAMES[sel]+' · '+reward;
+      let reward='+'+fmt(hasV?stageValueAt(t,'vitality',cell):stageValueAt(t,'progress',cell));
+      reward+=hasV&&hasP?(' 活力 / +'+fmt(stageValueAt(t,'progress',cell))+' 进度'):(hasV?' 活力':' 进度');
+      let cs=t.streak||0;if(cs===0&&t.lastCheckIn)cs=1;
+      let meta='';if(cs>0)meta+='连胜'+cs+'天';
+      const pend2=t.pendingDebt||0;if(pend2>0)meta+=(meta?' · ':'')+'待扣债'+fmt(pend2);
+      preview.textContent=stageCellLabel(cell)+' · '+reward+(meta?' · '+meta:'');
     }
   }
 }
@@ -1837,9 +1839,9 @@ function setStageFromX(track,tid,clientX){
   const rect=track.getBoundingClientRect();
   let p=(clientX-rect.left)/rect.width;
   p=Math.max(0,Math.min(1,p));
-  const sel=Math.round(p*4); // 吸附到最近锚点 0%..100%
-  if(t.stageRewards)t.stageRewards.last=sel;
-  updateStageBar(track,tid,sel);
+  let cell=Math.floor(p*10);if(cell>9)cell=9;if(cell<0)cell=0; // 吸附到 10 个格位 0..9
+  if(t.stageRewards)t.stageRewards.last=cell;
+  updateStageBar(track,tid,cell);
 }
 function initStageBars(){
   document.querySelectorAll('.stage-bar[data-tid]').forEach(function(bar){
@@ -1869,7 +1871,7 @@ function initTaskReveal(){
     const card=e.target.closest?e.target.closest('.task-card'):null;
     if(!card)return;
     // 不拦截交互控件（拖拽把手/按钮等）
-    if(e.target.closest&&e.target.closest('.drag-handle,.card-actions,button,a,input,select,textarea,.task-extra'))return;
+    if(e.target.closest&&e.target.closest('.drag-handle,.card-actions,button,a,input,select,textarea,.task-extra,.stage-bar'))return;
     taskReveal.card=card;
     taskReveal.startX=e.clientX;taskReveal.startY=e.clientY;
     clearTimeout(taskReveal.timer);
@@ -4030,6 +4032,7 @@ function openTaskModal(id,presetCollId){
   editStage={enabled:!!sr,v:Array.isArray(sr&&sr.v)?sr.v.slice():[],p:Array.isArray(sr&&sr.p)?sr.p.slice():[],dirtyV:false,dirtyP:false,last:(sr&&typeof sr.last==='number')?sr.last:0};
   const stageCb=document.getElementById('taskStageEnabled');
   if(stageCb)stageCb.checked=editStage.enabled;
+  if(editStage.enabled){const rf=document.getElementById('recalcFG');if(rf)rf.style.display='none';}
   renderStageRows();
   refreshTaskSliders();
   setTaskAccordion('accTaskType',true);
@@ -4163,7 +4166,7 @@ function stageRowHTML(type,label){
     +'<div class="stage-row-head"><span class="stage-row-title">'+label+'</span>'
     +'<div class="sp-group">'
     +'<div class="sp"><button type="button" class="sp-main" onclick="applyStagePreset(\'arith\',\''+type+'\')">等差</button><button type="button" class="sp-arrow" onclick="toggleStageParam(\'arith\',\''+type+'\')">▾</button></div>'
-    +'<div class="sp"><button type="button" class="sp-main" onclick="applyStagePreset(\'decr\',\''+type+'\')">递减</button><button type="button" class="sp-arrow" onclick="toggleStageParam(\'decr\',\''+type+'\')">▾</button></div>'
+    +'<div class="sp"><button type="button" class="sp-main" onclick="applyStagePreset(\'decr\',\''+type+'\')">缓增</button><button type="button" class="sp-arrow" onclick="toggleStageParam(\'decr\',\''+type+'\')">▾</button></div>'
     +'</div></div>'
     +'<div class="stage-inputs">'+inputs+'</div>'
     +'<div class="sp-panel" id="sp_panel_'+type+'" style="display:none"></div>'
@@ -4209,8 +4212,9 @@ function runStagePreset(kind,type){
 }
 function generateStage(kind,type,params){
   const isV=(type==='vitality');
-  const dirty=isV?editStage.dirtyV:editStage.dirtyP;
-  if(dirty&&!window.confirm('这会覆盖当前的 5 个数值，继续吗？'))return;
+  let hasVals=false;
+  for(let i=0;i<5;i++){const el=document.getElementById('stage_'+type+'_'+i);if(el&&el.value!==''){hasVals=true;break;}}
+  if(hasVals&&!window.confirm('这会覆盖当前的 5 个数值，继续吗？'))return;
   const base=parseFloat(document.getElementById('taskInitial').value)||0;
   const vals=kind==='arith'?genArith(base,params.stepPct):genDecr(base,params.decreasePct);
   if(isV){editStage.v=vals;editStage.dirtyV=false;}else{editStage.p=vals;editStage.dirtyP=false;}
@@ -4406,9 +4410,10 @@ function markBackup(){try{localStorage.setItem(BACKUP_KEY,String(Date.now()));}c
 function maybeBackupReminder(){
   let last=0;
   try{last=Number(localStorage.getItem(BACKUP_KEY))||0;}catch(e){}
+  if(!last)return;
   const days=(Date.now()-last)/864e5;
   if(days>=7){
-    toast('已 '+(last?Math.floor(days):7)+' 天未备份数据，建议「导出」一份备份','warn');
+    toast('已 '+Math.floor(days)+' 天未备份数据，建议「导出」一份备份','warn');
   }
 }
 function exportData(){
@@ -4568,6 +4573,7 @@ async function loadStateFromStorage(){
   if(hasIDB){
     const s=parseState(raw);
     if(loadIssue){
+      if(loadIssue.type==='corrupt'){try{await idbPut(KEY+'_corrupt',raw);}catch(e){}}
       // 数据损坏/被截断：先备份原始内容，避免被下一次保存覆盖而彻底丢失
       try{localStorage.setItem('score_sys_corrupt_backup_'+Date.now(),raw);}catch(e){}
     }
@@ -4578,6 +4584,7 @@ async function loadStateFromStorage(){
   if(legacy){
     const s=parseState(legacy);
     if(loadIssue){
+      if(loadIssue.type==='corrupt'){try{await idbPut(KEY+'_corrupt',legacy);}catch(e){}}
       try{localStorage.setItem('score_sys_corrupt_backup_'+Date.now(),legacy);}catch(e){}
     }else{
       try{await idbPut(KEY,legacy);localStorage.removeItem(KEY);}catch(e){}
@@ -4587,6 +4594,27 @@ async function loadStateFromStorage(){
   return defaults();
 }
 
+async function attemptRecovery(){
+  const bar=document.getElementById('recoverBar');
+  const btn=bar?bar.querySelector('button'):null;
+  if(btn){btn.disabled=true;btn.textContent='恢复中…';}
+  try{
+    let raw=null;
+    try{raw=await idbGet(KEY+'_corrupt');}catch(e){}
+    if(raw===undefined||raw===null||raw===''){toast('未找到可恢复的原始数据','err');return;}
+    let s=null;
+    try{s=JSON.parse(raw);}catch(e){s=salvageJSON(raw);}
+    if(!s||typeof s!=='object'||!s.scores){toast('恢复失败：原始内容无法解析','err');return;}
+    state=parseState(JSON.stringify(s));
+    save();
+    render();
+    toast('已尝试恢复上次数据','ok');
+  }finally{
+    if(bar)bar.style.display='none';
+    if(btn){btn.disabled=false;btn.textContent='尝试恢复';}
+  }
+}
+
 // ===== Init =====
 async function init(){
   state=await loadStateFromStorage();
@@ -4594,6 +4622,7 @@ async function init(){
     toast(loadIssue.type==='salvaged'
       ?'检测到数据不完整，已自动修复并恢复可读部分（原始内容已备份）'
       :'本地数据已损坏，已重置（原始内容已备份）','err');
+    if(loadIssue.type==='corrupt'){const rb=document.getElementById('recoverBar');if(rb)rb.style.display='flex';}
   }
   maybeBackupReminder();
   // 申请持久化存储，降低浏览器自动清理 IndexedDB 的风险
