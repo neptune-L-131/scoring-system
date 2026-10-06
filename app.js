@@ -1620,9 +1620,17 @@ function taskCardHTML(t,collId){
     ?'<button class="btn btn-sm btn-exempt" title="剩余豁免卡 '+cards+' 张" onclick="useExemption(\''+t.id+'\')">豁免·'+exemptLabel+'</button>'
     :'';
 
-  return '<div class="card" data-task-id="'+t.id+'" data-coll-id="'+(collId||'')+'">'
+  return '<div class="card task-card" data-task-id="'+t.id+'" data-coll-id="'+(collId||'')+'">'
+    +'<div class="task-row">'
+    +'<div class="task-title-wrap">'
+    +(hasV?'<span class="tdot v" title="活力点"></span>':'')+(hasP?'<span class="tdot p" title="进度值"></span>':'')
+    +'<span class="card-title">'+esc(t.name)+'</span>'
+    +'</div>'
+    +'<span class="task-more" aria-hidden="true">···</span>'
+    +'</div>'
+    +'<div class="task-extra">'
     +'<div class="card-top">'
-    +'<div>'+typeTag+domTags+streakTag+'<span class="card-title">'+esc(t.name)+'</span></div>'
+    +'<div>'+typeTag+domTags+streakTag+'</div>'
     +'<div class="card-actions"><span class="drag-handle" title="拖拽排序">⋮⋮</span><button onclick="openTaskModal(\''+t.id+'\')">编辑</button><button class="del" onclick="confirmDelTask(\''+t.id+'\')">删除</button></div>'
     +'</div>'
     +'<div class="card-meta">'
@@ -1636,7 +1644,44 @@ function taskCardHTML(t,collId){
     +'<div class="card-bottom">'
     +'<div class="preview">'+prev+'</div>'
     +'<button class="btn btn-sm btn-checkin" onclick="checkIn(\''+t.id+'\')" '+(cost>0&&state.scores.vitality<cost?'title="活力点不足，将进入负值（贷款）"':'')+'>打卡</button>'
-    +'</div></div>';
+    +'</div>'
+    +'</div>'
+    +'</div>';
+}
+
+// ===== 任务卡片：长按 1 秒浮现详情，3 秒后自动淡出 =====
+let taskReveal={card:null,timer:null,startX:0,startY:0};
+function initTaskReveal(){
+  document.addEventListener('pointerdown',function(e){
+    const card=e.target.closest?e.target.closest('.task-card'):null;
+    if(!card)return;
+    // 不拦截交互控件（拖拽把手/按钮等）
+    if(e.target.closest&&e.target.closest('.drag-handle,.card-actions,button,a,input,select,textarea,.task-extra'))return;
+    taskReveal.card=card;
+    taskReveal.startX=e.clientX;taskReveal.startY=e.clientY;
+    clearTimeout(taskReveal.timer);
+    taskReveal.timer=setTimeout(function(){showTaskExtra(card);},1000);
+  });
+  document.addEventListener('pointermove',function(e){
+    if(!taskReveal.card)return;
+    if(Math.abs(e.clientX-taskReveal.startX)>12||Math.abs(e.clientY-taskReveal.startY)>12){
+      clearTimeout(taskReveal.timer);taskReveal.timer=null;taskReveal.card=null;
+    }
+  });
+  ['pointerup','pointercancel'].forEach(function(ev){
+    document.addEventListener(ev,function(){
+      if(taskReveal.card){clearTimeout(taskReveal.timer);taskReveal.timer=null;taskReveal.card=null;}
+    });
+  });
+  // 阻止长按触发系统右键/文本选择菜单
+  document.addEventListener('contextmenu',function(e){
+    if(e.target.closest&&e.target.closest('.task-card'))e.preventDefault();
+  });
+}
+function showTaskExtra(card){
+  card.classList.add('revealed');
+  clearTimeout(card._taskHideTimer);
+  card._taskHideTimer=setTimeout(function(){card.classList.remove('revealed');},3000);
 }
 
 function achCardHTML(a,domId){
@@ -3343,15 +3388,20 @@ function onDragUp(e){
     else if(type==='milestone')saveAchOrderFromDOM(groupId);
     else if(type==='ach-domain')saveAchDomOrderFromDOM();
     if(type==='product'){
+      // 关键：跨分类移动后，被拖拽卡片本身的 data-cat-id 仍是旧分类，
+      // 导致 saveProdOrderFromDOM(新分类) 查询不到它、却已把 state 里的 categoryId 改成新分类，
+      // 最终在重排时被丢弃（尤其从「售罄」区拖出时没有第二次回捞）。此处先同步属性再持久化。
+      if(drag.el&&targetCatId!=='sc_soldout'){
+        drag.el.setAttribute('data-cat-id',targetCatId);
+      }
       // Check if product moved to a different category
       var prod=state.products.find(function(p){return p.id===drag.id;});
       if(prod){
         if(targetCatId==='sc_soldout'){
-          // Dropped in sold-out section — find target sub-group category
-          var soldoutSub=indicator?indicator.closest('.soldout-sub[data-prev-cat-id]'):null;
+          // Dropped in sold-out section — find target sub-group category via the card's new parent
+          var soldoutSub=(drag.el&&drag.el.parentNode)?drag.el.parentNode.closest('.soldout-sub[data-prev-cat-id]'):null;
           if(soldoutSub){
             var targetPrevCat=soldoutSub.dataset.prevCatId;
-            // Update the product's categoryId to match the target sub-group
             if(prod.categoryId!==targetPrevCat){
               prod.categoryId=targetPrevCat;
             }
@@ -3760,14 +3810,93 @@ function openTaskModal(id,presetCollId){
     applyScoreTypePicks();
     document.getElementById('recalcFG').style.display='none';
   }
+  refreshTaskSliders();
+  setTaskAccordion('accTaskType',true);
+  setTaskAccordion('accTaskNum',false);
+  setTaskAccordion('accTaskMeta',false);
+  updateTaskAccSummaries();
   openModal('taskModal');
   setTimeout(()=>document.getElementById('taskName').focus(),50);
+}
+
+// ===== 任务弹窗：数值滑动条 + 分区摘要 =====
+const TASK_SLIDERS={taskInitial:{min:0,max:100},taskInterest:{min:0,max:50},taskDebt:{min:0,max:50},taskCost:{min:0,max:100}};
+function refreshTaskSliders(){
+  document.querySelectorAll('.slide-track').forEach(function(track){
+    const input=document.getElementById(track.dataset.for);
+    if(!input)return;
+    const r=TASK_SLIDERS[track.dataset.for]||{min:0,max:100};
+    const v=Math.max(r.min,Math.min(r.max,Number(input.value)||0));
+    const fill=track.querySelector('.slide-fill');
+    if(fill)fill.style.width=(((v-r.min)/(r.max-r.min))*100)+'%';
+  });
+}
+function bindTaskSliders(){
+  let cur=null;
+  function setFromX(track,clientX){
+    const input=document.getElementById(track.dataset.for);
+    if(!input)return;
+    const rect=track.getBoundingClientRect();
+    const r=TASK_SLIDERS[track.dataset.for]||{min:0,max:100};
+    let ratio=(clientX-rect.left)/rect.width;
+    ratio=Math.max(0,Math.min(1,ratio));
+    let v=r.min+ratio*(r.max-r.min);
+    v=Math.round(v*10)/10;
+    v=Math.max(r.min,Math.min(r.max,v));
+    input.value=v;
+    const fill=track.querySelector('.slide-fill');
+    if(fill)fill.style.width=(ratio*100)+'%';
+  }
+  document.querySelectorAll('.slide-track').forEach(function(track){
+    track.addEventListener('pointerdown',function(e){
+      cur=track;
+      if(track.setPointerCapture){try{track.setPointerCapture(e.pointerId);}catch(err){}}
+      setFromX(track,e.clientX);
+    });
+    track.addEventListener('pointermove',function(e){
+      if(cur===track)setFromX(track,e.clientX);
+    });
+    track.addEventListener('pointerup',function(){cur=null;});
+    track.addEventListener('pointercancel',function(){cur=null;});
+  });
+  document.addEventListener('input',function(e){
+    const id=e.target&&e.target.id;
+    if(id&&TASK_SLIDERS[id]){refreshTaskSliders();updateTaskAccSummaries();}
+  });
+  const collSel=document.getElementById('taskCollection');
+  if(collSel)collSel.addEventListener('change',updateTaskAccSummaries);
+}
+function updateTaskAccSummaries(){
+  const tsEl=document.getElementById('accTaskTypeSum');
+  if(tsEl){
+    const v=editTypes.indexOf('vitality')>=0,p=editTypes.indexOf('progress')>=0;
+    let s=(v&&p)?'活力+进度':(p?'进度值':'活力点');
+    try{
+      if(p){const ds=getCheckedDomainIds();s+=' · '+ds.map(domainName).join('、');}
+    }catch(err){}
+    tsEl.textContent=s;
+  }
+  const numEl=document.getElementById('accTaskNumSum');
+  if(numEl){
+    const g=function(id){const el=document.getElementById(id);return el?el.value:'';};
+    numEl.textContent='初始'+g('taskInitial')+' · 利率'+g('taskInterest')+'% · 债率'+g('taskDebt')+'% · 花'+g('taskCost');
+  }
+  const metaEl=document.getElementById('accTaskMetaSum');
+  if(metaEl){
+    const sel=document.getElementById('taskCollection');
+    metaEl.textContent=(sel&&sel.selectedOptions&&sel.selectedOptions.length)?sel.selectedOptions[0].text:'';
+  }
+}
+function setTaskAccordion(id,open){
+  const el=document.getElementById(id);
+  if(el)el.classList.toggle('open',open);
 }
 
 function applyScoreTypePicks(){
   document.getElementById('tpV').classList.toggle('sel',editTypes.indexOf('vitality')>=0);
   document.getElementById('tpP').classList.toggle('sel',editTypes.indexOf('progress')>=0);
   document.getElementById('domainFG').style.display=editTypes.indexOf('progress')>=0?'block':'none';
+  updateTaskAccSummaries();
 }
 function toggleScoreType(type){
   const i=editTypes.indexOf(type);
@@ -4113,6 +4242,8 @@ function init(){
   processActivities();
   setInterval(schedulerTick,60000);
   initDrag();
+  initTaskReveal();
+  bindTaskSliders();
   initPWA();
   render();
 }

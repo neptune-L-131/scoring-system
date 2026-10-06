@@ -636,3 +636,38 @@ body{
     padding:14px 12px calc(14px + env(safe-area-inset-bottom));
   }
 }
+
+/* ===== 任务卡片：默认仅名称，长按浮现详情 ===== */
+.task-card{
+  user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;cursor:default;
+}
+.task-row{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:22px}
+.task-title-wrap{display:flex;align-items:center;gap:6px;min-width:0;flex:1}
+.task-title-wrap .card-title{overflow-wrap:anywhere}
+.tdot{width:8px;height:8px;border-radius:50%;flex-shrink:0;display:inline-block}
+.tdot.v{background:var(--vitality)}
+.tdot.p{background:var(--progress)}
+.task-more{color:var(--text-3);font-size:13px;flex-shrink:0;opacity:.55;letter-spacing:1px;line-height:1;transition:opacity .2s}
+.task-card.revealed .task-more{opacity:0}
+.task-extra{max-height:0;opacity:0;overflow:hidden;transition:max-height .3s ease,opacity .25s ease}
+.task-card.revealed .task-extra{max-height:560px;opacity:1}
+
+/* ===== 任务编辑弹窗：数值滑动条 ===== */
+.slide-row{display:flex;align-items:center;gap:10px;margin-bottom:13px}
+.slide-row:last-child{margin-bottom:0}
+.slide-label{width:76px;font-size:12px;color:var(--text-2);flex-shrink:0}
+.slide-track{
+  flex:1;height:16px;background:var(--surface-2);border:1px solid var(--border-2);
+  border-radius:9px;overflow:hidden;cursor:pointer;touch-action:none;position:relative;
+}
+.slide-fill{height:100%;background:var(--progress);border-radius:9px;width:0;transition:width .08s linear}
+.slide-row input[type=number]{
+  width:64px;flex:0 0 auto;background:var(--surface-2);border:1px solid var(--border-2);border-radius:8px;
+  color:var(--text);font-size:13px;font-family:inherit;padding:6px 8px;outline:none;
+}
+.slide-row input[type=number]:focus{border-color:var(--text-3)}
+
+/* 任务弹窗手风琴分区着色 */
+#accTaskType .acc-head{border-left-color:var(--progress)}
+#accTaskNum .acc-head{border-left-color:var(--achievement)}
+#accTaskMeta .acc-head{border-left-color:var(--text-3)}
