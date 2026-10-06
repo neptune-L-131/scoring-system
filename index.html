@@ -275,6 +275,21 @@
       </div>
     </div>
 
+    <div class="acc" id="accTaskStage">
+      <div class="acc-head" onclick="toggleAcc('accTaskStage')">
+        <div class="acc-title">阶段奖励</div>
+        <div class="acc-sum" id="accTaskStageSum">未配置</div>
+        <span class="acc-arrow">▾</span>
+      </div>
+      <div class="acc-body">
+        <label class="stage-enable">
+          <input type="checkbox" id="taskStageEnabled" onchange="onStageEnabled()">
+          <span>启用阶段奖励 <span class="h">5 档固定：起步 / 训练 / 进步 / 突破 / 超常</span></span>
+        </label>
+        <div id="taskStageRows"></div>
+      </div>
+    </div>
+
     <div class="modal-foot">
       <button class="btn" onclick="closeModal('taskModal')">取消</button>
       <button class="btn" id="taskSaveBtn">保存</button>

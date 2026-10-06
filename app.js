@@ -3,11 +3,38 @@
 // ===== State =====
 const KEY='score_sys_v3';
 const THEME_KEY='score_sys_theme';
-let state=load();
+let state=defaults();
 let editCurrency='vitality';
 let editTypes=['vitality'];
 let condDraft={mode:'all',items:[]};
 let condPanel={visible:false,kind:'metric',path:'',step:'range',range:'period',days:7,metric:'checkins',targetType:'all',newFilter:'none',target:'',aggregate:'sum'};
+
+// ===== 阶段奖励 =====
+const STAGE_NAMES=['起步','训练','进步','突破','超常'];
+const STAGE_PRESET_KEY='score_sys_stage_presets';
+const BACKUP_KEY='score_sys_last_backup';
+let stagePresets=loadStagePresets();
+let editStage={enabled:false,v:[],p:[],dirtyV:false,dirtyP:false,last:0};
+function loadStagePresets(){
+  const p={stepPct:50,decreasePct:100};
+  try{
+    const raw=localStorage.getItem(STAGE_PRESET_KEY);
+    if(raw){const o=JSON.parse(raw);if(typeof o.stepPct==='number')p.stepPct=o.stepPct;if(typeof o.decreasePct==='number')p.decreasePct=o.decreasePct;}
+  }catch(e){}
+  return p;
+}
+function saveStagePresets(){try{localStorage.setItem(STAGE_PRESET_KEY,JSON.stringify(stagePresets));}catch(e){}}
+function stageRewards(t){const sr=t&&t.stageRewards;return sr&&(Array.isArray(sr.v)||Array.isArray(sr.p))?sr:null;}
+function taskIsStaged(t){return !!stageRewards(t);}
+function stageValues(t,type){const sr=stageRewards(t);if(!sr)return null;const arr=type==='vitality'?sr.v:sr.p;return Array.isArray(arr)&&arr.length===5?arr:null;}
+function stageSel(t){const sr=stageRewards(t);const l=sr&&typeof sr.last==='number'?sr.last:0;return Math.max(0,Math.min(4,Math.round(l)));}
+function round2(v){return Math.round(v*100)/100;}
+// 日志金额：both 型且两分值不同时用 amtV/amtP 分别表达，否则回退到单一 amt
+function logAmt(l,type){
+  if(type==='vitality'&&typeof l.amtV==='number')return l.amtV;
+  if(type==='progress'&&typeof l.amtP==='number')return l.amtP;
+  return l.amt;
+}
 
 // ===== Theme =====
 function initTheme(){
@@ -182,11 +209,39 @@ function defaults(){
     metrics:[]
   };
 }
-function load(){
+let loadIssue=null;
+// 尽力修复被截断/轻微损坏的 JSON（常见于 IndexedDB 写入中断）
+function salvageJSON(raw){
+  if(!raw||typeof raw!=='string')return null;
+  try{return JSON.parse(raw);}catch(e){}
+  try{return JSON.parse(raw.trim());}catch(e){}
+  const s=raw.trim();
+  if(s[0]==='{'){
+    let depth=0,inStr=false,esc=false,end=-1;
+    for(let i=0;i<s.length;i++){
+      const ch=s[i];
+      if(inStr){if(esc)esc=false;else if(ch==='\\')esc=true;else if(ch==='"')inStr=false;continue;}
+      if(ch==='"'){inStr=true;continue;}
+      if(ch==='{')depth++;
+      else if(ch==='}'){depth--;if(depth===0){end=i;break;}}
+    }
+    if(end>0){
+      try{return JSON.parse(s.slice(0,end+1));}catch(e){}
+    }
+  }
+  return null;
+}
+function parseState(raw){
+  if(!raw)return defaults();
+  let p;
   try{
-    const r=localStorage.getItem(KEY);
-    if(!r)return defaults();
-    const p=JSON.parse(r);
+    p=JSON.parse(raw);
+  }catch(e1){
+    p=salvageJSON(raw);
+    if(!p){loadIssue={type:'corrupt'};return defaults();}
+    loadIssue={type:'salvaged'};
+  }
+  try{
     const tasks=(p.tasks||[]).map(t=>{
       // Migrate old single domainId to domainIds array
       if(t.domainIds===undefined){
@@ -220,9 +275,57 @@ function load(){
       cards:Object.assign({exemption:0},p.cards||{}),
       activities:migrateActivities(p)
     };
-  }catch(e){return defaults();}
+  }catch(e){loadIssue={type:'corrupt'};return defaults();}
 }
-function save(){localStorage.setItem(KEY,JSON.stringify(state))}
+
+// ===== IndexedDB 持久化层 =====
+const IDB_NAME='score_sys_db';
+const IDB_VERSION=1;
+const IDB_STORE='kv';
+let _idbPromise=null;
+function openIDB(){
+  if(_idbPromise)return _idbPromise;
+  _idbPromise=new Promise(function(resolve,reject){
+    if(!window.indexedDB){reject(new Error('no-indexeddb'));return;}
+    const req=indexedDB.open(IDB_NAME,IDB_VERSION);
+    req.onupgradeneeded=function(e){
+      const db=e.target.result;
+      if(!db.objectStoreNames.contains(IDB_STORE))db.createObjectStore(IDB_STORE);
+    };
+    req.onsuccess=function(e){resolve(e.target.result);};
+    req.onerror=function(e){reject(e.target.error);};
+  });
+  return _idbPromise;
+}
+// 仅保留主数据键；其余历史 key 见 migrateLegacy()
+function idbGet(key){
+  return openIDB().then(function(db){
+    return new Promise(function(resolve,reject){
+      const tx=db.transaction(IDB_STORE,'readonly');
+      const rq=tx.objectStore(IDB_STORE).get(key);
+      rq.onsuccess=function(){resolve(rq.result);};
+      rq.onerror=function(){reject(rq.error);};
+    });
+  });
+}
+function idbPut(key,val){
+  return openIDB().then(function(db){
+    return new Promise(function(resolve,reject){
+      const tx=db.transaction(IDB_STORE,'readwrite');
+      tx.objectStore(IDB_STORE).put(val,key);
+      tx.oncomplete=function(){resolve();};
+      tx.onerror=function(){reject(tx.error);};
+    });
+  });
+}
+
+// save()：同步序列化当前 state，再串行写入 IndexedDB（异步落盘，调用方无需改动）
+let _saveChain=Promise.resolve();
+function save(){
+  const json=JSON.stringify(state);
+  _saveChain=_saveChain.then(function(){return idbPut(KEY,json);})
+    .catch(function(){/* 写失败不阻塞 UI */});
+}
 
 // ===== Utils =====
 function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2,5)}
@@ -275,12 +378,13 @@ function logHasType(l,st){return l.st==='both'?(st==='vitality'||st==='progress'
 function applyCheckinGain(log,mult){
   const types=log.st==='both'?['vitality','progress']:[log.st];
   types.forEach(st=>{
-    if(st==='vitality')state.scores.vitality=(state.scores.vitality||0)+mult*log.amt;
+    const amt=logAmt(log,st);
+    if(st==='vitality')state.scores.vitality=(state.scores.vitality||0)+mult*amt;
     else if(st==='progress'){
       let dids=(log.dom||'').split(',').filter(Boolean);
       if(dids.length===0&&log.taskId){const t=state.tasks.find(x=>x.id===log.taskId);if(t)dids=getTaskDomainIds(t);}
       if(dids.length===0)dids=['d_default'];
-      const share=log.amt/dids.length;
+      const share=amt/dids.length;
       dids.forEach(did=>{state.scores.progress[did]=(state.scores.progress[did]||0)+mult*share;});
     }
   });
@@ -321,9 +425,9 @@ function weekScore(start,end){
   let vit=0,prog=0,ach=0,checkins=0,invest=0,consume=0;
   state.logs.forEach(l=>{
     if(l.time<start||l.time>=end)return;
-    if(l.st==='both'){vit+=l.amt;prog+=l.amt;}
-    else if(l.st==='vitality')vit+=l.amt;
-    else if(l.st==='progress')prog+=l.amt;
+    if(l.st==='both'){vit+=logAmt(l,'vitality');prog+=logAmt(l,'progress');}
+    else if(l.st==='vitality')vit+=logAmt(l,'vitality');
+    else if(l.st==='progress')prog+=logAmt(l,'progress');
     else if(l.st==='achievement')ach+=l.amt;
     if(l.src==='checkin')checkins++;
     if(l.src==='cost'&&l.amt<0)invest+=(-l.amt);
@@ -391,17 +495,18 @@ function rangeStats(start,end,targetType,target){
   state.logs.forEach(l=>{
     if(l.time<start||l.time>=end)return;
     if(!logMatchesTarget(l,targetType,target))return;
-    if(logHasType(l,'vitality'))vitality+=l.amt;
+    if(logHasType(l,'vitality'))vitality+=logAmt(l,'vitality');
     if(logHasType(l,'progress')){
-      progressTotal+=l.amt;
+      const pAmt=logAmt(l,'progress');
+      progressTotal+=pAmt;
       const dids=logDomainsOf(l);
       if(dids.length){
-        const share=l.amt/dids.length;
+        const share=pAmt/dids.length;
         dids.forEach(d=>{progressByDomain[d]=(progressByDomain[d]||0)+share;});
       }else{
-        progressByDomain['d_default']=(progressByDomain['d_default']||0)+l.amt;
+        progressByDomain['d_default']=(progressByDomain['d_default']||0)+pAmt;
       }
-      if(l.taskId)progressByTask[l.taskId]=(progressByTask[l.taskId]||0)+l.amt;
+      if(l.taskId)progressByTask[l.taskId]=(progressByTask[l.taskId]||0)+pAmt;
     }
     if(l.st==='achievement')achievement+=l.amt;
     if(l.src==='checkin')checkins++;
@@ -675,17 +780,33 @@ function calcSkip(task){
   }
 }
 
-function checkIn(taskId){
+function checkIn(taskId,stageIdx){
   const t=state.tasks.find(x=>x.id===taskId);
   if(!t)return;
   if(t.archived){toast('该任务已归档，请先解锁','err');return}
-  const c=calcCheckIn(t);
   const types=taskScoreTypes(t);
   const hasV=types.indexOf('vitality')>=0;
   const hasP=types.indexOf('progress')>=0;
   const name=hasV&&hasP?'活力点+进度值':(hasP?'进度值':'活力点');
   const st=hasV&&hasP?'both':(hasP?'progress':'vitality');
   const cost=t.vitalityCost||0;
+
+  // streak 由 calcCheckIn 计算（各档位共享同一连击）
+  const c=calcCheckIn(t);
+  const staged=taskIsStaged(t);
+
+  // 阶段任务按选中档位结算；否则保持单档结算（初始值 + 连胜 - 债务）
+  let netV=0,netP=0,stageName=null;
+  if(staged){
+    const sel=(typeof stageIdx==='number')?Math.max(0,Math.min(4,Math.round(stageIdx))):stageSel(t);
+    if(t.stageRewards)t.stageRewards.last=sel;
+    netV=hasV?(stageValues(t,'vitality')||[0,0,0,0,0])[sel]:0;
+    netP=hasP?(stageValues(t,'progress')||[0,0,0,0,0])[sel]:0;
+    stageName=STAGE_NAMES[sel];
+  }else{
+    netV=hasV?c.net:0;
+    netP=hasP?c.net:0;
+  }
 
   // Allow check-in even with insufficient vitality (goes negative, consistent with loan system)
   if(cost>0&&state.scores.vitality<cost){
@@ -708,30 +829,40 @@ function checkIn(taskId){
   }
 
   const dids=getTaskDomainIds(t);
-  if(hasV){
-    state.scores.vitality+=c.net;
-  }
+  if(hasV)state.scores.vitality+=netV;
   if(hasP){
     // Distribute progress equally across all task domains
-    const share=c.net/dids.length;
+    const share=netP/dids.length;
     dids.forEach(did=>{
       state.scores.progress[did]=(state.scores.progress[did]||0)+share;
     });
   }
   t.lastCheckIn=now();
   t.checkInCount=(t.checkInCount||0)+1;
-  t.totalEarned=(t.totalEarned||0)+c.net;
+  t.totalEarned=(t.totalEarned||0)+(hasP?netP:netV);
   t.streak=c.newStreak;
   delete t.lastDebtDate; // reset daily debt tracking after check-in
   t.pendingDebt=0; // clear accumulated debt after check-in
 
   let desc='「'+t.name+'」打卡';
-  if(c.bonus>0)desc+=' (连胜'+c.newStreak+'天 +'+fmt(c.bonus)+')';
-  if(c.debt>0)desc+=' (抵扣待扣债-'+fmt(c.debt)+')';
+  if(staged&&stageName){
+    desc+=' · '+stageName;
+    if(hasV&&hasP)desc+=' (活力+'+fmt(netV)+' / 进度+'+fmt(netP)+')';
+    else desc+=' (+'+fmt(hasP?netP:netV)+')';
+  }else{
+    if(c.bonus>0)desc+=' (连胜'+c.newStreak+'天 +'+fmt(c.bonus)+')';
+    if(c.debt>0)desc+=' (抵扣待扣债-'+fmt(c.debt)+')';
+  }
   if(cost>0)desc+=' (消耗活力-'+fmt(cost)+')';
+
   // Manually insert with known ID for linking, plus undo metadata
-  // Store domainIds in log for proper undo
-  state.logs.unshift({id:checkinLogId,time:now(),st:st,amt:c.net,desc:desc,src:'checkin',dom:getTaskDomainIds(t).join(','),taskId:t.id,prevStreak:prevStreak,prevLastCheckIn:prevLastCheckIn,prevLastDebtDate:prevLastDebtDate,prevPendingDebt:prevPendingDebt});
+  const entry={id:checkinLogId,time:now(),st:st,amt:0,desc:desc,src:'checkin',dom:dids.join(','),taskId:t.id,prevStreak:prevStreak,prevLastCheckIn:prevLastCheckIn,prevLastDebtDate:prevLastDebtDate,prevPendingDebt:prevPendingDebt};
+  if(hasV&&hasP&&netV!==netP){
+    entry.amtV=netV;entry.amtP=netP;entry.amt=netV;
+  }else{
+    entry.amt=hasP?netP:netV;
+  }
+  state.logs.unshift(entry);
   if(state.logs.length>300)state.logs=state.logs.slice(0,300);
 
   save();
@@ -741,8 +872,14 @@ function checkIn(taskId){
   processDailyTaskDebts();
   processLoans();
 
-  const sign=c.net>=0?'+':'';
-  let toastMsg=t.name+' '+sign+fmt(c.net)+' '+name;
+  let toastMsg;
+  if(staged&&stageName){
+    if(hasV&&hasP)toastMsg=t.name+' '+stageName+' +'+fmt(netV)+'活力 / +'+fmt(netP)+'进度';
+    else toastMsg=t.name+' '+stageName+' +'+fmt(hasP?netP:netV)+' '+name;
+  }else{
+    const sign=c.net>=0?'+':'';
+    toastMsg=t.name+' '+sign+fmt(c.net)+' '+name;
+  }
   if(c.newStreak>1)toastMsg+=' (连胜'+c.newStreak+'天)';
   if(c.broken)toastMsg+=' (连胜中断)';
   if(cost>0)toastMsg+=' (-'+fmt(cost)+' 活力)';
@@ -943,15 +1080,18 @@ function saveTaskData(data){
     }
     
     Object.assign(t,data);
+    if(!data.stageRewards)delete t.stageRewards;
     addLog('',0,'修改任务「'+data.name+'」','edit');
   }else{
-    state.tasks.push({
+    const nt={
       id:uid(),name:data.name,description:data.description||'',scoreTypes:data.scoreTypes||['vitality'],
       domainIds:data.domainIds||['d_default'],collectionId:data.collectionId||'c_default',
       initialValue:data.initialValue,interestRate:data.interestRate,debtRate:data.debtRate,
       vitalityCost:data.vitalityCost||0,
       lastCheckIn:null,checkInCount:0,totalEarned:0,streak:0,createdAt:now(),archived:false
-    });
+    };
+    if(data.stageRewards)nt.stageRewards=data.stageRewards;
+    state.tasks.push(nt);
     addLog('',0,'创建任务「'+data.name+'」','create');
   }
   save();
@@ -1567,9 +1707,33 @@ function renderWork(){
   }
 }
 
+function stageBarHTML(t){
+  const sel=stageSel(t);
+  const hasV=taskHasType(t,'vitality');
+  const hasP=taskHasType(t,'progress');
+  const v=stageValues(t,'vitality');
+  const p=stageValues(t,'progress');
+  const pct=(sel/4*100);
+  const labels=STAGE_NAMES.map((n,i)=>'<span'+(i===sel?' class="on"':'')+'>'+n+'</span>').join('');
+  let reward='+'+fmt(hasV?v[sel]:p[sel]);
+  reward+=hasV&&hasP?(' 活力 / +'+fmt(p[sel])+' 进度'):(hasV?' 活力':' 进度');
+  const ticks=[0,25,50,75,100].map(x=>'<i class="stage-tick" style="left:'+x+'%"></i>').join('');
+  return '<div class="stage-bar" data-tid="'+t.id+'">'
+    +'<div class="stage-tickrow">'+labels+'</div>'
+    +'<div class="stage-track">'
+    +'<div class="stage-fill" style="width:'+pct+'%"></div>'
+    +'<div class="stage-grid">'+'<i></i>'.repeat(10)+'</div>'
+    +ticks
+    +'<div class="stage-thumb" style="left:'+pct+'%"></div>'
+    +'</div>'
+    +'<div class="stage-preview">'+STAGE_NAMES[sel]+' · '+reward+'</div>'
+    +'</div>';
+}
+
 function taskCardHTML(t,collId){
   const c=calcCheckIn(t);
   const s=calcSkip(t);
+  const staged=taskIsStaged(t);
   const types=taskScoreTypes(t);
   const hasV=types.indexOf('vitality')>=0;
   const hasP=types.indexOf('progress')>=0;
@@ -1642,11 +1806,60 @@ function taskCardHTML(t,collId){
     +'<span>上次 <b>'+fmtTime(t.lastCheckIn)+'</b></span>'
     +'</div>'
     +'<div class="card-bottom">'
-    +'<div class="preview">'+prev+'</div>'
+    +(staged?stageBarHTML(t):'<div class="preview">'+prev+'</div>')
     +'<button class="btn btn-sm btn-checkin" onclick="checkIn(\''+t.id+'\')" '+(cost>0&&state.scores.vitality<cost?'title="活力点不足，将进入负值（贷款）"':'')+'>打卡</button>'
     +'</div>'
     +'</div>'
     +'</div>';
+}
+
+// ===== 阶段奖励：卡片进度条拖拽 =====
+function updateStageBar(track,tid,sel){
+  const t=state.tasks.find(x=>x.id===tid);if(!t)return;
+  const pct=(sel/4*100);
+  const fill=track.querySelector('.stage-fill');if(fill)fill.style.width=pct+'%';
+  const thumb=track.querySelector('.stage-thumb');if(thumb)thumb.style.left=pct+'%';
+  const bar=track.closest('.stage-bar');
+  if(bar){
+    const spans=bar.querySelectorAll('.stage-tickrow span');
+    spans.forEach((n,i)=>n.classList.toggle('on',i===sel));
+    const preview=bar.querySelector('.stage-preview');
+    if(preview){
+      const hasV=taskHasType(t,'vitality'),hasP=taskHasType(t,'progress');
+      const v=stageValues(t,'vitality'),p=stageValues(t,'progress');
+      let reward='+'+fmt(hasV?v[sel]:p[sel])+(hasV&&hasP?(' 活力 / +'+fmt(p[sel])+' 进度'):(hasV?' 活力':' 进度'));
+      preview.textContent=STAGE_NAMES[sel]+' · '+reward;
+    }
+  }
+}
+function setStageFromX(track,tid,clientX){
+  const t=state.tasks.find(x=>x.id===tid);if(!t||!taskIsStaged(t))return;
+  const rect=track.getBoundingClientRect();
+  let p=(clientX-rect.left)/rect.width;
+  p=Math.max(0,Math.min(1,p));
+  const sel=Math.round(p*4); // 吸附到最近锚点 0%..100%
+  if(t.stageRewards)t.stageRewards.last=sel;
+  updateStageBar(track,tid,sel);
+}
+function initStageBars(){
+  document.querySelectorAll('.stage-bar[data-tid]').forEach(function(bar){
+    const track=bar.querySelector('.stage-track');
+    if(!track||track._stageBound)return;
+    track._stageBound=true;
+    const tid=bar.dataset.tid;
+    let dragging=false;
+    track.addEventListener('pointerdown',function(e){
+      if(!state.tasks.find(x=>x.id===tid))return;
+      if(track.setPointerCapture){try{track.setPointerCapture(e.pointerId);}catch(err){}}
+      dragging=true;
+      setStageFromX(track,tid,e.clientX);
+      e.preventDefault();
+    });
+    track.addEventListener('pointermove',function(e){if(dragging)setStageFromX(track,tid,e.clientX);});
+    function end(){if(dragging){dragging=false;save();}}
+    track.addEventListener('pointerup',end);
+    track.addEventListener('pointercancel',end);
+  });
 }
 
 // ===== 任务卡片：长按 1 秒浮现详情，3 秒后自动淡出 =====
@@ -1829,7 +2042,7 @@ function renderBank(){
 }
 
 function sumLog(st,pos){
-  return state.logs.filter(l=>logHasType(l,st)&&(pos?l.amt>0:l.amt<0)).reduce((s,l)=>s+l.amt,0);
+  return state.logs.filter(l=>logHasType(l,st)&&(pos?logAmt(l,st)>0:logAmt(l,st)<0)).reduce((s,l)=>s+logAmt(l,st),0);
 }
 
 // ===== Chart state & interactivity =====
@@ -1888,7 +2101,7 @@ function drawChart(){
       for(let i=0;i<days;i++){
         let cum=0;
         state.logs.forEach(l=>{
-          if(logHasType(l,type)&&l.time<dayEnd[i])cum+=l.amt;
+          if(logHasType(l,type)&&l.time<dayEnd[i])cum+=logAmt(l,type);
         });
         series[type].push(cum);
       }
@@ -1897,7 +2110,7 @@ function drawChart(){
       for(let i=0;i<days;i++){
         let daily=0;
         state.logs.forEach(l=>{
-          if(logHasType(l,type)&&l.time>=dayStart[i]&&l.time<dayEnd[i])daily+=l.amt;
+          if(logHasType(l,type)&&l.time>=dayStart[i]&&l.time<dayEnd[i])daily+=logAmt(l,type);
         });
         series[type].push(daily);
       }
@@ -1979,7 +2192,7 @@ function drawVitalityFlowChart(){
     let prod=0,inv=0,cons=0;
     state.logs.forEach(l=>{
       if(l.time>=wr.start&&l.time<wr.end){
-        if(l.src==='checkin'&&(l.st==='vitality'||l.st==='both')&&l.amt>0)prod+=l.amt;
+        if(l.src==='checkin'&&(l.st==='vitality'||l.st==='both')&&logAmt(l,'vitality')>0)prod+=logAmt(l,'vitality');
         else if(l.src==='cost'&&l.amt<0)inv+=Math.abs(l.amt);
         else if(l.src==='purchase'&&l.st==='vitality'&&l.amt<0)cons+=Math.abs(l.amt);
       }
@@ -2345,7 +2558,7 @@ function changeSoldoutCat(sel,oldCatId){
 }
 
 // ===== Render All =====
-function render(){renderWork();renderBank();renderShop();renderCycle();updateExemptChip()}
+function render(){renderWork();renderBank();renderShop();renderCycle();updateExemptChip();initStageBars()}
 
 // ===== Cycle Settings (周期活动) =====
 function fmtDate(ts){
@@ -3564,7 +3777,8 @@ function undoLog(logId){
       const t=state.tasks.find(x=>x.id===log.taskId);
       if(t){
         t.checkInCount=Math.max(0,(t.checkInCount||0)-1);
-        t.totalEarned=(t.totalEarned||0)-log.amt;
+        const earnedAmt=(log.st==='both'||log.st==='progress')?logAmt(log,'progress'):logAmt(log,'vitality');
+        t.totalEarned=(t.totalEarned||0)-earnedAmt;
         // Restore previous streak, lastCheckIn, lastDebtDate, and pendingDebt
         t.streak=log.prevStreak||0;
         t.lastCheckIn=log.prevLastCheckIn||null;
@@ -3810,10 +4024,18 @@ function openTaskModal(id,presetCollId){
     applyScoreTypePicks();
     document.getElementById('recalcFG').style.display='none';
   }
+  // 初始化阶段奖励编辑状态
+  const taskForStage=id?state.tasks.find(x=>x.id===id):null;
+  const sr=taskForStage&&taskForStage.stageRewards;
+  editStage={enabled:!!sr,v:Array.isArray(sr&&sr.v)?sr.v.slice():[],p:Array.isArray(sr&&sr.p)?sr.p.slice():[],dirtyV:false,dirtyP:false,last:(sr&&typeof sr.last==='number')?sr.last:0};
+  const stageCb=document.getElementById('taskStageEnabled');
+  if(stageCb)stageCb.checked=editStage.enabled;
+  renderStageRows();
   refreshTaskSliders();
   setTaskAccordion('accTaskType',true);
   setTaskAccordion('accTaskNum',false);
   setTaskAccordion('accTaskMeta',false);
+  setTaskAccordion('accTaskStage',false);
   updateTaskAccSummaries();
   openModal('taskModal');
   setTimeout(()=>document.getElementById('taskName').focus(),50);
@@ -3886,6 +4108,10 @@ function updateTaskAccSummaries(){
     const sel=document.getElementById('taskCollection');
     metaEl.textContent=(sel&&sel.selectedOptions&&sel.selectedOptions.length)?sel.selectedOptions[0].text:'';
   }
+  const stageEl=document.getElementById('accTaskStageSum');
+  if(stageEl){
+    stageEl.textContent=editStage.enabled?'5 档':'未配置';
+  }
 }
 function setTaskAccordion(id,open){
   const el=document.getElementById(id);
@@ -3896,6 +4122,7 @@ function applyScoreTypePicks(){
   document.getElementById('tpV').classList.toggle('sel',editTypes.indexOf('vitality')>=0);
   document.getElementById('tpP').classList.toggle('sel',editTypes.indexOf('progress')>=0);
   document.getElementById('domainFG').style.display=editTypes.indexOf('progress')>=0?'block':'none';
+  renderStageRows();
   updateTaskAccSummaries();
 }
 function toggleScoreType(type){
@@ -3907,6 +4134,107 @@ function toggleScoreType(type){
     editTypes.push(type);
   }
   applyScoreTypePicks();
+}
+
+// ===== 阶段奖励：编辑界面 =====
+function onStageEnabled(){
+  const cb=document.getElementById('taskStageEnabled');
+  editStage.enabled=!!cb.checked;
+  if(editStage.enabled){
+    const base=parseFloat(document.getElementById('taskInitial').value)||0;
+    if(!Array.isArray(editStage.v)||editStage.v.length!==5)editStage.v=[base,base,base,base,base];
+    if(!Array.isArray(editStage.p)||editStage.p.length!==5)editStage.p=[base,base,base,base,base];
+    editStage.dirtyV=false;editStage.dirtyP=false;
+  }
+  renderStageRows();
+  updateTaskAccSummaries();
+}
+function onStageInput(type){
+  if(type==='vitality')editStage.dirtyV=true;else editStage.dirtyP=true;
+  updateTaskAccSummaries();
+}
+function stageRowHTML(type,label){
+  const vals=type==='vitality'?editStage.v:editStage.p;
+  const inputs=STAGE_NAMES.map((n,i)=>
+    '<div class="stage-cell"><span class="stage-cell-name">'+n+'</span>'
+    +'<input type="number" id="stage_'+type+'_'+i+'" value="'+((vals[i]!==undefined&&vals[i]!==null)?vals[i]:'')+'" step="0.1" min="0" oninput="onStageInput(\''+type+'\')"></div>'
+  ).join('');
+  return '<div class="stage-row">'
+    +'<div class="stage-row-head"><span class="stage-row-title">'+label+'</span>'
+    +'<div class="sp-group">'
+    +'<div class="sp"><button type="button" class="sp-main" onclick="applyStagePreset(\'arith\',\''+type+'\')">等差</button><button type="button" class="sp-arrow" onclick="toggleStageParam(\'arith\',\''+type+'\')">▾</button></div>'
+    +'<div class="sp"><button type="button" class="sp-main" onclick="applyStagePreset(\'decr\',\''+type+'\')">递减</button><button type="button" class="sp-arrow" onclick="toggleStageParam(\'decr\',\''+type+'\')">▾</button></div>'
+    +'</div></div>'
+    +'<div class="stage-inputs">'+inputs+'</div>'
+    +'<div class="sp-panel" id="sp_panel_'+type+'" style="display:none"></div>'
+    +'</div>';
+}
+function renderStageRows(){
+  const cont=document.getElementById('taskStageRows');
+  if(!cont)return;
+  if(!editStage.enabled){cont.innerHTML='';return;}
+  const hasV=editTypes.indexOf('vitality')>=0;
+  const hasP=editTypes.indexOf('progress')>=0;
+  let html='';
+  if(hasV)html+=stageRowHTML('vitality','活力点');
+  if(hasP)html+=stageRowHTML('progress','进度值');
+  cont.innerHTML=html;
+}
+function toggleStageParam(kind,type){
+  const panel=document.getElementById('sp_panel_'+type);
+  if(!panel)return;
+  const showing=panel.style.display!=='none'&&panel.dataset.kind===kind;
+  if(kind==='arith'){
+    panel.innerHTML='<div class="sp-param"><label>步长 %</label><input type="number" id="sp_arith_step" value="'+stagePresets.stepPct+'" step="1" min="0"></div><button type="button" class="btn btn-sm" onclick="runStagePreset(\'arith\',\''+type+'\')">生成</button>';
+    panel.dataset.kind='arith';
+  }else{
+    panel.innerHTML='<div class="sp-param"><label>总增幅 %</label><input type="number" id="sp_decr_gain" value="'+stagePresets.decreasePct+'" step="1" min="0"></div><button type="button" class="btn btn-sm" onclick="runStagePreset(\'decr\',\''+type+'\')">生成</button>';
+    panel.dataset.kind='decr';
+  }
+  panel.style.display=showing?'none':'block';
+}
+function applyStagePreset(kind,type){
+  const params=kind==='arith'?{stepPct:stagePresets.stepPct}:{decreasePct:stagePresets.decreasePct};
+  generateStage(kind,type,params);
+}
+function runStagePreset(kind,type){
+  if(kind==='arith'){
+    stagePresets.stepPct=Number(document.getElementById('sp_arith_step').value)||0;
+  }else{
+    stagePresets.decreasePct=Number(document.getElementById('sp_decr_gain').value)||0;
+  }
+  saveStagePresets();
+  const params=kind==='arith'?{stepPct:stagePresets.stepPct}:{decreasePct:stagePresets.decreasePct};
+  generateStage(kind,type,params);
+}
+function generateStage(kind,type,params){
+  const isV=(type==='vitality');
+  const dirty=isV?editStage.dirtyV:editStage.dirtyP;
+  if(dirty&&!window.confirm('这会覆盖当前的 5 个数值，继续吗？'))return;
+  const base=parseFloat(document.getElementById('taskInitial').value)||0;
+  const vals=kind==='arith'?genArith(base,params.stepPct):genDecr(base,params.decreasePct);
+  if(isV){editStage.v=vals;editStage.dirtyV=false;}else{editStage.p=vals;editStage.dirtyP=false;}
+  for(let i=0;i<5;i++){
+    const el=document.getElementById('stage_'+type+'_'+i);
+    if(el)el.value=fmt(vals[i]);
+  }
+  updateTaskAccSummaries();
+}
+function genArith(base,stepPct){
+  const step=Math.max(0,Number(stepPct)||0)/100;
+  return STAGE_NAMES.map((_,n)=>round2(base*(1+step*n)));
+}
+function genDecr(base,gainPct){
+  const total=base*Math.max(0,Number(gainPct)||0)/100;
+  const r=0.5,sum=1+r+r*r+r*r*r;
+  const d1=total/sum;
+  const vals=[round2(base)];
+  for(let k=1;k<5;k++){
+    let inc=0;
+    for(let i=0;i<k;i++)inc+=d1*Math.pow(r,i);
+    vals.push(round2(base+inc));
+  }
+  return vals;
 }
 
 function handleTaskSave(){
@@ -3926,8 +4254,30 @@ function handleTaskSave(){
   if(isNaN(debtRate)||debtRate<0){toast('债率需 ≥ 0','err');return}
   if(isNaN(vitalityCost)||vitalityCost<0){toast('活力点花费需 ≥ 0','err');return}
 
-  const recalc=id?document.getElementById('taskRecalc').checked:false;
-  saveTaskData({id:id||null,name:name,description:description,scoreTypes:editTypes.slice(),domainIds:domainIds,collectionId:collectionId,initialValue:initialValue,interestRate:interestRate,debtRate:debtRate,vitalityCost:vitalityCost,recalc:recalc});
+  // 阶段奖励
+  let stageRewards=null;
+  if(editStage.enabled){
+    const hasV=editTypes.indexOf('vitality')>=0;
+    const hasP=editTypes.indexOf('progress')>=0;
+    const readRow=function(type){
+      const arr=[];
+      for(let i=0;i<5;i++){
+        const el=document.getElementById('stage_'+type+'_'+i);
+        let v=el?parseFloat(el.value):NaN;
+        if(isNaN(v)||v<0)v=0;
+        arr.push(round2(v));
+      }
+      return arr;
+    };
+    stageRewards={last:editStage.last!==undefined?editStage.last:0};
+    if(hasV)stageRewards.v=readRow('vitality');
+    if(hasP)stageRewards.p=readRow('progress');
+  }
+
+  const prevTask=id?state.tasks.find(x=>x.id===id):null;
+  const wasStaged=prevTask&&taskIsStaged(prevTask);
+  const recalc=id?((document.getElementById('taskRecalc').checked)&&!wasStaged&&!editStage.enabled):false;
+  saveTaskData({id:id||null,name:name,description:description,scoreTypes:editTypes.slice(),domainIds:domainIds,collectionId:collectionId,initialValue:initialValue,interestRate:interestRate,debtRate:debtRate,vitalityCost:vitalityCost,stageRewards:stageRewards,recalc:recalc});
   closeModal('taskModal');
   toast(id?(recalc?'任务已更新，历史数据已重算':'任务已更新'):'任务已创建');
   render();
@@ -4052,12 +4402,22 @@ function toast(msg,type){
 }
 
 // ===== Export / Import =====
+function markBackup(){try{localStorage.setItem(BACKUP_KEY,String(Date.now()));}catch(e){}}
+function maybeBackupReminder(){
+  let last=0;
+  try{last=Number(localStorage.getItem(BACKUP_KEY))||0;}catch(e){}
+  const days=(Date.now()-last)/864e5;
+  if(days>=7){
+    toast('已 '+(last?Math.floor(days):7)+' 天未备份数据，建议「导出」一份备份','warn');
+  }
+}
 function exportData(){
   const blob=new Blob([JSON.stringify(state,null,2)],{type:'application/json'});
   const url=URL.createObjectURL(blob);
   const a=document.createElement('a');
   a.href=url;a.download='计分系统_'+new Date().toISOString().slice(0,10)+'.json';
   a.click();URL.revokeObjectURL(url);
+  markBackup();
   toast('数据已导出');
 }
 function importData(ev){
@@ -4199,8 +4559,47 @@ function installApp(){
   });
 }
 
+// 启动装载：优先 IndexedDB；若无则从 localStorage 迁移后清除旧值
+async function loadStateFromStorage(){
+  loadIssue=null;
+  let raw=null;
+  try{raw=await idbGet(KEY);}catch(e){}
+  const hasIDB=(raw!==undefined&&raw!==null&&raw!=='');
+  if(hasIDB){
+    const s=parseState(raw);
+    if(loadIssue){
+      // 数据损坏/被截断：先备份原始内容，避免被下一次保存覆盖而彻底丢失
+      try{localStorage.setItem('score_sys_corrupt_backup_'+Date.now(),raw);}catch(e){}
+    }
+    return s;
+  }
+  let legacy=null;
+  try{legacy=localStorage.getItem(KEY);}catch(e){}
+  if(legacy){
+    const s=parseState(legacy);
+    if(loadIssue){
+      try{localStorage.setItem('score_sys_corrupt_backup_'+Date.now(),legacy);}catch(e){}
+    }else{
+      try{await idbPut(KEY,legacy);localStorage.removeItem(KEY);}catch(e){}
+    }
+    return s;
+  }
+  return defaults();
+}
+
 // ===== Init =====
-function init(){
+async function init(){
+  state=await loadStateFromStorage();
+  if(loadIssue){
+    toast(loadIssue.type==='salvaged'
+      ?'检测到数据不完整，已自动修复并恢复可读部分（原始内容已备份）'
+      :'本地数据已损坏，已重置（原始内容已备份）','err');
+  }
+  maybeBackupReminder();
+  // 申请持久化存储，降低浏览器自动清理 IndexedDB 的风险
+  try{
+    if(navigator.storage&&navigator.storage.persist)navigator.storage.persist().catch(function(){});
+  }catch(e){}
   const n=new Date(),wd=['日','一','二','三','四','五','六'];
   document.getElementById('todayDate').textContent=
     n.getFullYear()+'.'+String(n.getMonth()+1).padStart(2,'0')+'.'+String(n.getDate()).padStart(2,'0')+' 周'+wd[n.getDay()];
