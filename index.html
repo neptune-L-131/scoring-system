@@ -58,6 +58,17 @@
   <!-- Domain pills -->
   <div class="domain-pills" id="domainPills"></div>
 
+  <!-- ==================== 事务（GTD 待办） ==================== -->
+  <div class="sec-head sec-head-major" style="margin-top:24px">
+    <div class="sec-title">事务</div>
+    <div class="sec-meta" id="affairMeta"></div>
+  </div>
+  <div class="affair-quick-add">
+    <input type="text" id="affairInput" placeholder="输入事务名称，回车创建草稿" maxlength="40" autocomplete="off" onkeydown="if(event.key==='Enter'){addAffairFromInput();}">
+    <button class="btn btn-sm" onclick="addAffairFromInput()">添加</button>
+  </div>
+  <div id="affairPanel"></div>
+
   <!-- Collections -->
   <div class="sec-head sec-head-major">
     <div class="sec-title">任务集合</div>
@@ -298,6 +309,64 @@
     <div class="modal-foot">
       <button class="btn" onclick="closeModal('taskModal')">取消</button>
       <button class="btn" id="taskSaveBtn">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Affair (事务) Modal ===== -->
+<div class="modal-bg" id="affairModal">
+  <div class="modal">
+    <h2 id="affairModalTitle">新建事务</h2>
+    <input type="hidden" id="affairId">
+    <div class="fg">
+      <label>事务名称</label>
+      <input type="text" id="affairName" placeholder="例如：报销上月差旅" maxlength="40" autocomplete="off">
+    </div>
+    <div class="fg">
+      <label>关联领域 <span class="h">选择后完成事务给该领域加进度值；不选则加活力点</span></label>
+      <select id="affairDomain"></select>
+    </div>
+    <div class="fg">
+      <label>权重（0-10）</label>
+      <div class="wq-row" id="affairWeightQuicks">
+        <button type="button" class="wq" data-v="3" onclick="setAffairWeight(3)">轻(3)</button>
+        <button type="button" class="wq" data-v="6" onclick="setAffairWeight(6)">中(6)</button>
+        <button type="button" class="wq" data-v="9" onclick="setAffairWeight(9)">重(9)</button>
+      </div>
+      <div class="weight-row">
+        <input type="range" id="affairWeight" min="0" max="10" step="1" value="6" oninput="affairWeightInput()">
+        <input type="number" id="affairWeightNum" value="6" min="0" max="10" step="1" oninput="setAffairWeight(this.value)">
+      </div>
+    </div>
+    <div class="fg">
+      <label>计划时间 <span class="h">可选，用于日程安排</span></label>
+      <input type="datetime-local" id="affairPlannedAt">
+    </div>
+    <div class="fg">
+      <label>步骤列表 <span class="h">可选，逐个完成步骤；全部完成或手动标记完成时结算奖励</span></label>
+      <div id="affairSteps"></div>
+      <button type="button" class="btn btn-sm" style="margin-top:8px" onclick="affairAddStep()">+ 添加步骤</button>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal('affairModal')">取消</button>
+      <button class="btn btn-danger" id="affairDelBtn" style="display:none" onclick="delAffair(document.getElementById('affairId').value)">删除</button>
+      <button class="btn" id="affairSaveBtn">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Affair Plan Modal ===== -->
+<div class="modal-bg" id="affairPlanModal">
+  <div class="modal">
+    <h2>安排时间</h2>
+    <input type="hidden" id="affairPlanId">
+    <div class="fg">
+      <label>计划执行时间</label>
+      <input type="datetime-local" id="affairPlanInput">
+    </div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal('affairPlanModal')">取消</button>
+      <button class="btn" id="affairPlanSaveBtn">保存</button>
     </div>
   </div>
 </div>

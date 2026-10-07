@@ -729,3 +729,72 @@ body{
 }
 [data-theme="dark"] .recover-bar{background:#4a3f1e;border-bottom-color:#6b5a2a;color:#e8d89a}
 .recover-bar button{flex-shrink:0}
+
+/* ===== 事务（GTD 待办） ===== */
+.affair-quick-add{display:flex;gap:8px;margin-bottom:14px}
+.affair-quick-add input{
+  flex:1;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+  color:var(--text);font-size:14px;font-family:inherit;padding:10px 12px;outline:none;min-width:0;
+}
+.affair-quick-add input:focus{border-color:var(--text-3)}
+.affair-zone{margin-bottom:18px}
+.affair-zone-title{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;color:var(--text-2);margin-bottom:8px}
+.affair-zone-count{font-size:11px;color:var(--text-3);font-weight:400}
+.affair-view-toggle{margin-left:auto;border:1px solid var(--border);background:none;color:var(--text-2);border-radius:var(--radius);padding:3px 10px;font-size:11px;cursor:pointer;font-family:inherit}
+.affair-view-toggle:hover{background:var(--surface-2)}
+.affair-empty{padding:12px;font-size:12px;color:var(--text-3)}
+.affair-card{cursor:pointer;transition:border-color .15s}
+.affair-card.stalled{border-color:var(--danger)}
+.affair-card.late .affair-name{color:var(--danger)}
+.affair-card.done{opacity:.6}
+.affair-row{display:flex;align-items:center;justify-content:space-between;gap:10px}
+.affair-name-wrap{display:flex;align-items:center;gap:6px;min-width:0;flex:1;flex-wrap:wrap}
+.affair-name{font-size:14px;font-weight:600;overflow-wrap:anywhere}
+.affair-actions{display:flex;align-items:center;gap:6px;flex-shrink:0}
+.affair-time{font-size:11px;color:var(--text-3);white-space:nowrap}
+.affair-meta{display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:11px;color:var(--text-3);margin-top:6px}
+.affair-progress{color:var(--progress);font-weight:600}
+.affair-card.stalled .affair-progress{color:var(--danger)}
+.affair-day-group{margin-bottom:10px}
+.affair-day-title{font-size:12px;color:var(--text-3);margin-bottom:6px}
+.tag.w{background:var(--tag-a-bg);color:var(--achievement)}
+
+/* 事务：权重滑块 */
+.wq-row{display:flex;gap:6px;margin-bottom:10px}
+.wq{border:1px solid var(--border-2);background:var(--surface);color:var(--text-2);border-radius:7px;padding:5px 14px;font-size:12px;cursor:pointer;font-family:inherit;transition:all .15s}
+.wq:hover{background:var(--surface-2)}
+.wq.on{border-color:var(--achievement);color:var(--achievement);background:var(--tag-a-bg)}
+.weight-row{display:flex;align-items:center;gap:10px}
+.weight-row input[type=range]{flex:1;min-width:0}
+.weight-row input[type=number]{
+  width:64px;flex:0 0 auto;background:var(--surface-2);border:1px solid var(--border-2);border-radius:8px;
+  color:var(--text);font-size:13px;font-family:inherit;padding:6px 8px;outline:none;
+}
+.weight-row input[type=number]:focus{border-color:var(--text-3)}
+
+/* 事务：步骤列表 */
+.affair-step-row{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.affair-step-input{
+  flex:1;background:var(--surface-2);border:1px solid var(--border-2);border-radius:7px;
+  color:var(--text);font-size:13px;font-family:inherit;padding:7px 10px;outline:none;min-width:0;
+}
+.affair-step-input:focus{border-color:var(--text-3)}
+.affair-step-empty{font-size:12px;color:var(--text-3)}
+
+/* 事务：日历视图 */
+.cal-head{display:flex;align-items:center;gap:10px;margin-bottom:8px}
+.cal-title{flex:1;text-align:center;font-size:13px;font-weight:600;color:var(--text)}
+.cal-nav{border:1px solid var(--border);background:var(--surface);color:var(--text-2);border-radius:var(--radius);width:28px;height:26px;cursor:pointer;font-family:inherit}
+.cal-nav:hover{background:var(--surface-2)}
+.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:3px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:6px}
+.cal-dow{text-align:center;font-size:11px;color:var(--text-3);padding:4px 0}
+.cal-cell{position:relative;display:flex;flex-direction:column;align-items:center;padding:7px 0 5px;border-radius:6px;cursor:pointer;min-height:40px;transition:background .12s}
+.cal-cell:hover{background:var(--surface-2)}
+.cal-cell.out .cal-num{color:var(--text-3);opacity:.35}
+.cal-cell.today .cal-num{color:var(--vitality);font-weight:700}
+.cal-cell.sel{background:var(--tag-p-bg);box-shadow:inset 0 0 0 1px var(--progress)}
+.cal-num{font-size:13px;color:var(--text)}
+.cal-dots{display:flex;gap:2px;margin-top:3px;height:5px}
+.cal-dot{width:5px;height:5px;border-radius:50%;background:var(--progress)}
+.cal-day-detail{margin-top:6px}
+.cal-day-head{font-size:13px;font-weight:700;color:var(--text);margin:10px 0 6px}
