@@ -755,6 +755,7 @@ body{
 .affair-meta{display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-size:11px;color:var(--text-3);margin-top:6px}
 .affair-progress{color:var(--progress);font-weight:600}
 .affair-card.stalled .affair-progress{color:var(--danger)}
+.affair-sub{color:var(--text-3);font-size:11px}
 .affair-day-group{margin-bottom:10px}
 .affair-day-title{font-size:12px;color:var(--text-3);margin-bottom:6px}
 .tag.w{background:var(--tag-a-bg);color:var(--achievement)}
@@ -773,12 +774,19 @@ body{
 .weight-row input[type=number]:focus{border-color:var(--text-3)}
 
 /* 事务：步骤列表 */
-.affair-step-row{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.affair-step-row{display:flex;flex-direction:column;gap:5px;margin-bottom:10px}
+.affair-step-line{display:flex;align-items:center;gap:8px}
 .affair-step-input{
   flex:1;background:var(--surface-2);border:1px solid var(--border-2);border-radius:7px;
   color:var(--text);font-size:13px;font-family:inherit;padding:7px 10px;outline:none;min-width:0;
 }
 .affair-step-input:focus{border-color:var(--text-3)}
+.affair-step-time{
+  flex:1;background:var(--surface-2);border:1px solid var(--border-2);border-radius:7px;
+  color:var(--text-2);font-size:12px;font-family:inherit;padding:5px 8px;outline:none;min-width:0;
+}
+.affair-step-time:focus{border-color:var(--text-3)}
+.affair-step-time-badge{font-size:11px;color:var(--progress);white-space:nowrap;flex-shrink:0}
 .affair-step-empty{font-size:12px;color:var(--text-3)}
 
 /* 事务：日历视图 */
