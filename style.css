@@ -144,6 +144,19 @@ body{
 .sec-head-major .sec-title{font-size:16px;font-weight:700;color:var(--text);letter-spacing:-.2px}
 .sec-head-major:first-child{margin-top:6px}
 
+/* Major collapsible sections (事务/任务/档案馆) — 层层嵌套 */
+.major-group{margin-bottom:4px}
+.major-group .major-head{margin-top:22px}
+.major-group:first-child .major-head{margin-top:6px}
+.major-title{cursor:pointer;user-select:none}
+.major-toggle{display:inline-block;font-size:11px;color:var(--text-3);margin-right:4px;transition:transform .2s;vertical-align:middle}
+.major-group.collapsed .major-toggle{transform:rotate(-90deg)}
+.major-body{
+  overflow:hidden;transition:max-height .25s ease,opacity .2s ease;
+  max-height:6000px;opacity:1;padding-left:14px;border-left:2px solid var(--border);
+}
+.major-group.collapsed .major-body{max-height:0;opacity:0;border-left-color:transparent}
+
 /* ===== Collection group ===== */
 .coll-group{margin-bottom:18px}
 .coll-header{
@@ -254,6 +267,9 @@ body{
 .tag.p{background:var(--tag-p-bg);color:var(--progress)}
 .tag.a{background:var(--tag-a-bg);color:var(--achievement)}
 .tag.d{background:var(--surface-2);color:var(--text-3)}
+.tag.scale-daily{background:var(--surface-2);color:var(--text-2)}
+.tag.scale-important{background:var(--tag-p-bg);color:var(--progress)}
+.tag.scale-project{background:var(--tag-a-bg);color:var(--achievement)}
 
 .card-meta{display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--text-3);margin-bottom:10px}
 .card-meta span b{color:var(--text-2);font-weight:600}
@@ -760,18 +776,14 @@ body{
 .affair-day-title{font-size:12px;color:var(--text-3);margin-bottom:6px}
 .tag.w{background:var(--tag-a-bg);color:var(--achievement)}
 
-/* 事务：权重滑块 */
-.wq-row{display:flex;gap:6px;margin-bottom:10px}
-.wq{border:1px solid var(--border-2);background:var(--surface);color:var(--text-2);border-radius:7px;padding:5px 14px;font-size:12px;cursor:pointer;font-family:inherit;transition:all .15s}
-.wq:hover{background:var(--surface-2)}
-.wq.on{border-color:var(--achievement);color:var(--achievement);background:var(--tag-a-bg)}
-.weight-row{display:flex;align-items:center;gap:10px}
-.weight-row input[type=range]{flex:1;min-width:0}
-.weight-row input[type=number]{
-  width:64px;flex:0 0 auto;background:var(--surface-2);border:1px solid var(--border-2);border-radius:8px;
-  color:var(--text);font-size:13px;font-family:inherit;padding:6px 8px;outline:none;
-}
-.weight-row input[type=number]:focus{border-color:var(--text-3)}
+/* 事务：量级选择器 */
+.scale-row{display:flex;gap:6px}
+.scale-btn{border:1px solid var(--border-2);background:var(--surface);color:var(--text-2);border-radius:7px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:inherit;transition:all .15s;flex:1}
+.scale-btn:hover{background:var(--surface-2)}
+.scale-btn.on{border-color:var(--achievement);color:var(--achievement);background:var(--tag-a-bg);font-weight:600}
+.scale-hint{font-size:11px;color:var(--text-3);margin-top:7px;line-height:1.5}
+.fg .ach-check{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-2);margin-bottom:0}
+.fg .ach-check input{width:auto;margin:0;accent-color:var(--achievement)}
 
 /* 事务：步骤列表 */
 .affair-step-row{display:flex;flex-direction:column;gap:5px;margin-bottom:10px}

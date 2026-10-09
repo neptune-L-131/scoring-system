@@ -207,6 +207,7 @@ function defaults(){
     collapsedColls:[],
     collapsedAchDoms:[],
     collapsedShopCats:[],
+    majorCollapsed:[],
     tasks:[],achievements:[],products:[],logs:[],
     affairs:[],
     loans:[],
@@ -274,8 +275,9 @@ function parseState(raw){
       collapsedColls:p.collapsedColls||[],
       collapsedAchDoms:p.collapsedAchDoms||[],
       collapsedShopCats:p.collapsedShopCats||[],
+      majorCollapsed:p.majorCollapsed||[],
       tasks:tasks,achievements:p.achievements||[],
-      affairs:Array.isArray(p.affairs)?p.affairs:[],
+      affairs:Array.isArray(p.affairs)?p.affairs.map(migrateAffair):[],
       products:p.products||[],logs:p.logs||[],
       loans:p.loans||[],
       lastDebtDate:p.lastDebtDate||null,
@@ -1648,6 +1650,7 @@ function renderWork(){
   dp.innerHTML=dpHtml;
 
   renderAffairs();
+  syncMajorCollapse();
 
   // Task groups by collection
   const tg=document.getElementById('taskGroups');
@@ -1733,8 +1736,43 @@ function fmtPlan(ts){const d=new Date(ts);return (d.getMonth()+1)+'/'+d.getDate(
 function fmtDateCal(ts){const d=new Date(ts),wd=['日','一','二','三','四','五','六'];return (d.getMonth()+1)+'月'+d.getDate()+'日 周'+wd[d.getDay()];}
 function toLocalInput(ts){if(!ts)return '';const d=new Date(ts);const p=function(x){return String(x).padStart(2,'0');};return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':'+p(d.getMinutes());}
 function fromLocalInput(v){if(!v)return null;const t=new Date(v).getTime();return isNaN(t)?null:t;}
-function affairWeightTag(a){return '<span class="tag w">权重'+fmt(a.weight)+'</span>';}
-function affairDomainTag(a){return a.domainId?'<span class="tag p">'+esc(domainName(a.domainId))+'</span>':'<span class="tag v">活力点</span>';}
+function migrateAffair(a){
+  if(!a)return a;
+  if(!a.scale){
+    const w=Number(a.weight);
+    if(!isNaN(w)){
+      if(w>=8)a.scale='project';
+      else if(w>=4)a.scale='important';
+      else a.scale='daily';
+    }else{
+      a.scale='daily';
+    }
+  }
+  if(a.linkAch===undefined)a.linkAch=false;
+  return a;
+}
+function affairScaleWeight(scale){
+  if(scale==='important')return 0.5;
+  if(scale==='project')return 1;
+  return 0.1;
+}
+function affairScaleLabel(scale){
+  if(scale==='important')return '重要';
+  if(scale==='project')return '项目';
+  return '日常';
+}
+function affairScaleRank(a){const s=a.scale||'daily';return s==='project'?3:(s==='important'?2:1);}
+function affairScaleTag(a){
+  const s=a.scale||'daily';
+  return '<span class="tag scale-'+s+'">'+affairScaleLabel(s)+'</span>';
+}
+function affairTags(a){
+  let h=affairScaleTag(a);
+  if(a.domainId)h+='<span class="tag p">'+esc(domainName(a.domainId))+'</span>';
+  else h+='<span class="tag v">活力点</span>';
+  if(a.scale==='project'&&a.linkAch)h+='<span class="tag a">成果点+1</span>';
+  return h;
+}
 
 function renderAffairs(){
   const panel=document.getElementById('affairPanel');
@@ -1748,7 +1786,7 @@ function renderAffairs(){
   let html='';
   // 1. 进行中区
   const inProg=affairs.filter(function(a){return !a.doneAt&&affairTotalSteps(a)>0&&affairDoneSteps(a)<affairTotalSteps(a);})
-    .sort(function(a,b){return affairLastAdvance(a)-affairLastAdvance(b);});
+    .sort(function(a,b){return affairScaleRank(b)-affairScaleRank(a)||affairLastAdvance(a)-affairLastAdvance(b);});
   html+='<div class="affair-zone">'
     +'<div class="affair-zone-title">进行中 <span class="affair-zone-count">'+inProg.length+'</span></div>';
   html+=inProg.length?inProg.map(affairInProgressCardHTML).join(''):'<div class="affair-empty">暂无进行中的事务</div>';
@@ -1762,7 +1800,7 @@ function renderAffairs(){
   html+='</div>';
   // 3. 草稿区
   const drafts=affairs.filter(function(a){return !a.doneAt&&!a.plannedAt&&affairTotalSteps(a)===0;})
-    .sort(function(a,b){return (b.createdAt||0)-(a.createdAt||0);});
+    .sort(function(a,b){return affairScaleRank(b)-affairScaleRank(a)||(b.createdAt||0)-(a.createdAt||0);});
   html+='<div class="affair-zone">'
     +'<div class="affair-zone-title">草稿 <span class="affair-zone-count">'+drafts.length+'</span></div>';
   html+=drafts.length?drafts.map(affairDraftCardHTML).join(''):'<div class="affair-empty">没有草稿</div>';
@@ -1778,7 +1816,7 @@ function affairInProgressCardHTML(a){
   const stalled=last>0&&daysSince(last)>3;
   return '<div class="card affair-card'+(stalled?' stalled':'')+'" data-affair-id="'+a.id+'" onclick="openAffairModal(\''+a.id+'\')">'
     +'<div class="affair-row">'
-    +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairDomainTag(a)+affairWeightTag(a)+'</div>'
+    +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+'</div>'
     +'<div class="affair-actions" onclick="event.stopPropagation()">'
     +'<button class="btn btn-sm btn-checkin" onclick="advanceAffairStep(\''+a.id+'\')">继续下一步</button>'
     +'</div>'
@@ -1791,7 +1829,7 @@ function affairScheduleCardHTML(a,opts){
   const late=opts&&opts.late;
   return '<div class="card affair-card'+(late?' late':'')+'" data-affair-id="'+a.id+'" onclick="openAffairModal(\''+a.id+'\')">'
     +'<div class="affair-row">'
-    +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairDomainTag(a)+affairWeightTag(a)+'</div>'
+    +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+'</div>'
     +'<div class="affair-actions" onclick="event.stopPropagation()">'
     +'<span class="affair-time">'+(opts&&opts.time?opts.time:fmtPlan(a.plannedAt))+'</span>'
     +'<button class="btn btn-sm btn-checkin" onclick="completeAffair(\''+a.id+'\')">完成</button>'
@@ -1803,7 +1841,7 @@ function affairScheduleCardHTML(a,opts){
 function affairDraftCardHTML(a){
   return '<div class="card affair-card" data-affair-id="'+a.id+'" onclick="openAffairModal(\''+a.id+'\')">'
     +'<div class="affair-row">'
-    +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairWeightTag(a)+'</div>'
+    +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+'</div>'
     +'<div class="affair-actions" onclick="event.stopPropagation()">'
     +'<button class="btn btn-sm" onclick="openAffairPlanModal(\''+a.id+'\')">计划</button>'
     +'<button class="btn btn-sm" onclick="openAffairModal(\''+a.id+'\')">编辑</button>'
@@ -1815,7 +1853,7 @@ function affairDraftCardHTML(a){
 function affairDoneCardHTML(a){
   return '<div class="card affair-card done" data-affair-id="'+a.id+'" onclick="openAffairModal(\''+a.id+'\')">'
     +'<div class="affair-row">'
-    +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairDomainTag(a)+affairWeightTag(a)+'</div>'
+    +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+'</div>'
     +'<div class="affair-actions" onclick="event.stopPropagation()"><span class="affair-time">✓ '+fmtTime(a.doneAt)+'</span></div>'
     +'</div>'
     +'</div>';
@@ -1945,7 +1983,7 @@ function addAffairFromInput(){
   if(!inp)return;
   const name=inp.value.trim();
   if(!name){toast('请输入事务名称','err');return;}
-  state.affairs.push({id:uid(),name:name,weight:6,domainId:null,plannedAt:null,steps:[],createdAt:now(),startedAt:null,doneAt:null});
+  state.affairs.push({id:uid(),name:name,scale:'daily',linkAch:false,domainId:null,plannedAt:null,steps:[],createdAt:now(),startedAt:null,doneAt:null});
   addLog('',0,'创建事务「'+name+'」','affair-create');
   save();
   inp.value='';
@@ -1964,25 +2002,48 @@ function completeAffair(id){
   render();
 }
 
-function grantAffairReward(a){
-  const amt=round2((a.weight||0)*0.1);
-  if(amt<=0)return;
+function applyAffairValue(a,amt,desc){
+  if(!amt||amt<=0)return;
   if(a.domainId){
     state.scores.progress[a.domainId]=(state.scores.progress[a.domainId]||0)+amt;
-    addLog('progress',amt,'完成事务「'+a.name+'」('+domainName(a.domainId)+')','affair',a.domainId,{affairId:a.id});
+    addLog('progress',amt,desc,'affair',a.domainId,{affairId:a.id});
     checkAchievements(a.domainId);
   }else{
     state.scores.vitality=(state.scores.vitality||0)+amt;
-    addLog('vitality',amt,'完成事务「'+a.name+'」','affair','',{affairId:a.id});
+    addLog('vitality',amt,desc,'affair','',{affairId:a.id});
   }
+  return amt;
+}
+// 完成整个事务：日常/重要给全额；项目有步骤时只补剩余的 40%（60% 已随步骤发放）
+function grantAffairReward(a){
+  const scale=a.scale||'daily';
+  const base=affairScaleWeight(scale);
+  const hasSteps=affairTotalSteps(a)>0;
+  const amt=round2(scale==='project'&&hasSteps?base*0.4:base);
+  applyAffairValue(a,amt,'完成事务「'+a.name+'」');
+  // 项目关联成果点：一次性发放
+  if(scale==='project'&&a.linkAch){
+    state.scores.achievement=(state.scores.achievement||0)+1;
+    addLog('achievement',1,'完成项目「'+a.name+'」','affair','',{affairId:a.id});
+    toast('项目完成 · 成果点 +1','warn');
+  }
+}
+// 项目量级分批到账：每完成一个步骤发 总奖励 × 0.6 / 步骤数
+function grantAffairStepReward(a){
+  if((a.scale||'daily')!=='project')return 0;
+  const n=affairTotalSteps(a);
+  if(n<=0)return 0;
+  const amt=round2(affairScaleWeight('project')*0.6/n);
+  return applyAffairValue(a,amt,'完成项目「'+a.name+'」步骤');
 }
 
 function _completeAffairStep(a,s){
   s.doneAt=now();
   if(!a.startedAt)a.startedAt=now();
+  const stepReward=grantAffairStepReward(a);
   const allDone=affairSteps(a).every(function(x){return x.doneAt;});
   if(allDone){a.doneAt=now();grantAffairReward(a);toast('事务「'+a.name+'」完成');}
-  else{toast('已完成一步「'+(s.text||'')+'」');}
+  else{toast('已完成一步「'+(s.text||'')+'」'+(stepReward>0?(' · +'+fmt(stepReward)):''));}
   save();
   render();
 }
@@ -2047,7 +2108,8 @@ function openAffairModal(id){
     document.getElementById('affairPlannedAt').value=a.plannedAt?toLocalInput(a.plannedAt):'';
     sel.value=a.domainId||'';
     editAffairSteps=JSON.parse(JSON.stringify(a.steps||[]));
-    setAffairWeight(a.weight||0);
+    setAffairScale(a.scale||'daily');
+    document.getElementById('affairLinkAch').checked=!!(a.scale==='project'&&a.linkAch);
     if(delBtn)delBtn.style.display='';
   }else{
     document.getElementById('affairModalTitle').textContent='新建事务';
@@ -2055,7 +2117,8 @@ function openAffairModal(id){
     document.getElementById('affairPlannedAt').value='';
     sel.value='';
     editAffairSteps=[];
-    setAffairWeight(6);
+    setAffairScale('daily');
+    document.getElementById('affairLinkAch').checked=false;
     if(delBtn)delBtn.style.display='none';
   }
   renderAffairSteps();
@@ -2066,21 +2129,21 @@ function openAffairModal(id){
 function handleAffairSave(){
   const id=document.getElementById('affairId').value;
   const name=document.getElementById('affairName').value.trim();
-  const weight=Math.round(Number(document.getElementById('affairWeight').value)||0);
+  const scale=getAffairScale();
+  const linkAch=(scale==='project')&&document.getElementById('affairLinkAch').checked;
   const domainId=document.getElementById('affairDomain').value||null;
   const plannedAt=fromLocalInput(document.getElementById('affairPlannedAt').value);
   const steps=readAffairSteps();
   if(!name){toast('请输入事务名称','err');return;}
-  if(weight<0||weight>10){toast('权重需在 0-10 之间','err');return;}
   if(id){
     const a=state.affairs.find(function(x){return x.id===id;});
     if(!a)return;
-    a.name=name;a.weight=weight;a.domainId=domainId;
+    a.name=name;a.scale=scale;a.linkAch=linkAch;a.domainId=domainId;
     if(!a.doneAt)a.plannedAt=plannedAt;
     a.steps=steps;
     addLog('',0,'修改事务「'+name+'」','affair-edit');
   }else{
-    state.affairs.push({id:uid(),name:name,weight:weight,domainId:domainId,plannedAt:plannedAt,steps:steps,createdAt:now(),startedAt:null,doneAt:null});
+    state.affairs.push({id:uid(),name:name,scale:scale,linkAch:linkAch,domainId:domainId,plannedAt:plannedAt,steps:steps,createdAt:now(),startedAt:null,doneAt:null});
     addLog('',0,'创建事务「'+name+'」','affair-create');
   }
   save();
@@ -2136,13 +2199,22 @@ function readAffairSteps(){
   return editAffairSteps.filter(function(s){return s&&s.text&&s.text.trim();})
     .map(function(s){return {text:s.text.trim(),doneAt:s.doneAt||null,plannedAt:s.plannedAt||null};});
 }
-function setAffairWeight(v){
-  v=Math.max(0,Math.min(10,Math.round(Number(v)||0)));
-  const s=document.getElementById('affairWeight');if(s)s.value=v;
-  const n=document.getElementById('affairWeightNum');if(n)n.value=v;
-  document.querySelectorAll('#affairWeightQuicks .wq').forEach(function(b){b.classList.toggle('on',Number(b.dataset.v)===v);});
+function affairScaleHint(scale){
+  if(scale==='project')return '进度值按步骤分批到账：每步发 0.6÷步数，全部完成再补 0.4；可关联成果点';
+  if(scale==='important')return '完成时 +0.5 进度值/活力点';
+  return '完成时 +0.1 进度值/活力点';
 }
-function affairWeightInput(){setAffairWeight(document.getElementById('affairWeight').value);}
+function setAffairScale(scale){
+  document.querySelectorAll('#affairScaleRow .scale-btn').forEach(function(b){b.classList.toggle('on',b.dataset.scale===scale);});
+  const achRow=document.getElementById('affairAchRow');
+  if(achRow)achRow.style.display=(scale==='project')?'':'none';
+  const hint=document.getElementById('affairScaleHint');
+  if(hint)hint.textContent=affairScaleHint(scale);
+}
+function getAffairScale(){
+  const on=document.querySelector('#affairScaleRow .scale-btn.on');
+  return on?on.dataset.scale:'daily';
+}
 function toggleAffairView(){affairView=(affairView==='cal'?'list':'cal');affairCalSelected=null;render();}
 function toggleAffairDone(){affairDoneOpen=!affairDoneOpen;render();}
 function affairSelectDay(ts){affairCalSelected=ts;render();}
@@ -3808,6 +3880,23 @@ function toggleInline(id){
   }
 }
 
+// ===== Major section collapse (事务/任务/档案馆) =====
+function toggleMajor(key){
+  const arr=state.majorCollapsed||[];
+  const i=arr.indexOf(key);
+  if(i>=0)arr.splice(i,1);else arr.push(key);
+  state.majorCollapsed=arr;
+  save();
+  const el=document.getElementById('major_'+key);
+  if(el)el.classList.toggle('collapsed',arr.indexOf(key)>=0);
+}
+function syncMajorCollapse(){
+  ['affair','task','archive'].forEach(function(k){
+    const el=document.getElementById('major_'+k);
+    if(el)el.classList.toggle('collapsed',(state.majorCollapsed||[]).indexOf(k)>=0);
+  });
+}
+
 // ===== Collapse toggle =====
 function toggleCollapse(type,id){
   var arr;
@@ -4895,7 +4984,9 @@ function importData(ev){
         collapsedColls:d.collapsedColls||[],
         collapsedAchDoms:d.collapsedAchDoms||[],
         collapsedShopCats:d.collapsedShopCats||[],
+        majorCollapsed:d.majorCollapsed||[],
         tasks:tasks,achievements:d.achievements||[],
+        affairs:Array.isArray(d.affairs)?d.affairs.map(migrateAffair):[],
         products:d.products||[],logs:d.logs||[],
         loans:d.loans||[],
         lastDebtDate:d.lastDebtDate||null,

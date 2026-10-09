@@ -59,34 +59,47 @@
   <div class="domain-pills" id="domainPills"></div>
 
   <!-- ==================== 事务（GTD 待办） ==================== -->
-  <div class="sec-head sec-head-major" style="margin-top:24px">
-    <div class="sec-title">事务</div>
-    <div class="sec-meta" id="affairMeta"></div>
-  </div>
-  <div class="affair-quick-add">
-    <input type="text" id="affairInput" placeholder="输入事务名称，回车创建草稿" maxlength="40" autocomplete="off" onkeydown="if(event.key==='Enter'){addAffairFromInput();}">
-    <button class="btn btn-sm" onclick="addAffairFromInput()">添加</button>
-  </div>
-  <div id="affairPanel"></div>
-
-  <!-- Collections -->
-  <div class="sec-head sec-head-major">
-    <div class="sec-title">任务集合</div>
-    <div style="display:flex;gap:6px">
-      <button class="btn btn-sm" onclick="openTaskModal()">+ 新建任务</button>
-      <button class="btn btn-sm" onclick="toggleInline('collAdd')">+ 新集合</button>
+  <div class="major-group" id="major_affair">
+    <div class="sec-head sec-head-major major-head">
+      <div class="sec-title major-title" onclick="toggleMajor('affair')"><span class="major-toggle">▼</span>事务</div>
+      <div class="sec-meta" id="affairMeta"></div>
+    </div>
+    <div class="major-body">
+      <div class="affair-quick-add">
+        <input type="text" id="affairInput" placeholder="输入事务名称，回车创建草稿" maxlength="40" autocomplete="off" onkeydown="if(event.key==='Enter'){addAffairFromInput();}">
+        <button class="btn btn-sm" onclick="addAffairFromInput()">添加</button>
+      </div>
+      <div id="affairPanel"></div>
     </div>
   </div>
-  <div class="inline-add" id="collAdd" style="display:none">
-    <input type="text" id="collAddName" placeholder="输入集合名称" maxlength="20" autocomplete="off">
-    <button class="btn btn-sm" onclick="addCollection()">添加</button>
-  </div>
-  <div id="taskGroups"></div>
 
-  <div class="sec-head sec-head-major" style="margin-top:24px">
-    <div class="sec-title">档案馆 <span class="sec-meta" id="archiveMeta"></span></div>
+  <!-- 任务 -->
+  <div class="major-group" id="major_task">
+    <div class="sec-head sec-head-major major-head">
+      <div class="sec-title major-title" onclick="toggleMajor('task')"><span class="major-toggle">▼</span>任务</div>
+      <div style="display:flex;gap:6px">
+        <button class="btn btn-sm" onclick="openTaskModal()">+ 新建任务</button>
+        <button class="btn btn-sm" onclick="toggleInline('collAdd')">+ 新集合</button>
+      </div>
+    </div>
+    <div class="major-body">
+      <div class="inline-add" id="collAdd" style="display:none">
+        <input type="text" id="collAddName" placeholder="输入集合名称" maxlength="20" autocomplete="off">
+        <button class="btn btn-sm" onclick="addCollection()">添加</button>
+      </div>
+      <div id="taskGroups"></div>
+    </div>
   </div>
-  <div id="archiveGroups"></div>
+
+  <!-- 档案馆 -->
+  <div class="major-group" id="major_archive">
+    <div class="sec-head sec-head-major major-head">
+      <div class="sec-title major-title" onclick="toggleMajor('archive')"><span class="major-toggle">▼</span>档案馆 <span class="sec-meta" id="archiveMeta"></span></div>
+    </div>
+    <div class="major-body">
+      <div id="archiveGroups"></div>
+    </div>
+  </div>
 </div>
 
 <!-- ==================== 银行 ==================== -->
@@ -327,16 +340,17 @@
       <select id="affairDomain"></select>
     </div>
     <div class="fg">
-      <label>权重（0-10）</label>
-      <div class="wq-row" id="affairWeightQuicks">
-        <button type="button" class="wq" data-v="3" onclick="setAffairWeight(3)">轻(3)</button>
-        <button type="button" class="wq" data-v="6" onclick="setAffairWeight(6)">中(6)</button>
-        <button type="button" class="wq" data-v="9" onclick="setAffairWeight(9)">重(9)</button>
+      <label>量级</label>
+      <div class="scale-row" id="affairScaleRow">
+        <button type="button" class="scale-btn" data-scale="daily" onclick="setAffairScale('daily')">日常 · 0.1</button>
+        <button type="button" class="scale-btn" data-scale="important" onclick="setAffairScale('important')">重要 · 0.5</button>
+        <button type="button" class="scale-btn" data-scale="project" onclick="setAffairScale('project')">项目 · 1</button>
       </div>
-      <div class="weight-row">
-        <input type="range" id="affairWeight" min="0" max="10" step="1" value="6" oninput="affairWeightInput()">
-        <input type="number" id="affairWeightNum" value="6" min="0" max="10" step="1" oninput="setAffairWeight(this.value)">
-      </div>
+      <div class="scale-hint" id="affairScaleHint"></div>
+    </div>
+    <div class="fg" id="affairAchRow" style="display:none">
+      <label>成果点 <span class="h">项目完成后一次性发放</span></label>
+      <label class="ach-check"><input type="checkbox" id="affairLinkAch"> 完成后发放 +1 成果点</label>
     </div>
     <div class="fg">
       <label>计划时间 <span class="h">可选，用于日程安排</span></label>
