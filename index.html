@@ -340,17 +340,27 @@
       <select id="affairDomain"></select>
     </div>
     <div class="fg">
-      <label>量级</label>
-      <div class="scale-row" id="affairScaleRow">
-        <button type="button" class="scale-btn" data-scale="daily" onclick="setAffairScale('daily')">日常 · 0.1</button>
-        <button type="button" class="scale-btn" data-scale="important" onclick="setAffairScale('important')">重要 · 0.5</button>
-        <button type="button" class="scale-btn" data-scale="project" onclick="setAffairScale('project')">项目 · 1</button>
-      </div>
-      <div class="scale-hint" id="affairScaleHint"></div>
+      <label>总奖励 <span class="h">完成后累计可获得的进度值/活力点总额</span></label>
+      <input type="number" id="affairReward" step="0.1" min="0" placeholder="例如 1" oninput="affairCurveRefresh()">
     </div>
-    <div class="fg" id="affairAchRow" style="display:none">
-      <label>成果点 <span class="h">项目完成后一次性发放</span></label>
-      <label class="ach-check"><input type="checkbox" id="affairLinkAch"> 完成后发放 +1 成果点</label>
+    <div class="fg">
+      <label>奖励曲线 <span class="h">控制奖励随进度格位的发放节奏（格 9 = 100%）</span></label>
+      <div class="curve-row" id="affairCurveRow">
+        <button type="button" class="curve-btn" data-curve="even" onclick="setAffairCurve('even')">平均</button>
+        <button type="button" class="curve-btn" data-curve="lateHeavy" onclick="setAffairCurve('lateHeavy')">后重</button>
+        <button type="button" class="curve-btn" data-curve="earlyHeavy" onclick="setAffairCurve('earlyHeavy')">前重</button>
+        <button type="button" class="curve-btn" data-curve="allAtEnd" onclick="setAffairCurve('allAtEnd')">全押后</button>
+        <button type="button" class="curve-btn" data-curve="custom" onclick="setAffairCurve('custom')">自定义</button>
+      </div>
+      <div class="curve-custom" id="affairCurveCustom" style="display:none"></div>
+      <div class="curve-preview" id="affairCurvePreview"></div>
+    </div>
+    <div class="fg">
+      <label>成果点 <span class="h">完成时额外一次性发放</span></label>
+      <label class="ach-check"><input type="checkbox" id="affairAchEnabled" onchange="toggleAffairAch()"> 启用成果点奖励</label>
+      <div id="affairAchAmountRow" style="display:none;margin-top:6px">
+        <input type="number" id="affairAchAmount" step="1" min="0" value="1" placeholder="成果点数量">
+      </div>
     </div>
     <div class="fg">
       <label>计划时间 <span class="h">可选，用于日程安排</span></label>

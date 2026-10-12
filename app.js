@@ -1736,42 +1736,49 @@ function fmtPlan(ts){const d=new Date(ts);return (d.getMonth()+1)+'/'+d.getDate(
 function fmtDateCal(ts){const d=new Date(ts),wd=['日','一','二','三','四','五','六'];return (d.getMonth()+1)+'月'+d.getDate()+'日 周'+wd[d.getDay()];}
 function toLocalInput(ts){if(!ts)return '';const d=new Date(ts);const p=function(x){return String(x).padStart(2,'0');};return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':'+p(d.getMinutes());}
 function fromLocalInput(v){if(!v)return null;const t=new Date(v).getTime();return isNaN(t)?null:t;}
+// ===== 事务奖励曲线（10 格累计比例，格 9 恒为 100）=====
+const AFFAIR_CURVES={
+  even:[10,20,30,40,50,60,70,80,90,100],
+  lateHeavy:[2,5,10,17,26,37,50,65,82,100],
+  earlyHeavy:[20,36,50,62,72,80,86,91,95,100],
+  allAtEnd:[0,0,0,0,0,0,0,0,0,100]
+};
+const AFFAIR_CURVE_NAMES={even:'平均',lateHeavy:'后重',earlyHeavy:'前重',allAtEnd:'全押后',custom:'自定义'};
+let editAffairCurve={type:'even',values:AFFAIR_CURVES.even.slice()};
+function affairCurve(a){return (a.curve&&Array.isArray(a.curve.values)&&a.curve.values.length===10)?a.curve.values:AFFAIR_CURVES.even;}
+function affairCurveType(a){return (a.curve&&a.curve.type)||'even';}
+function affairTargetAt(a,cell){
+  const vals=affairCurve(a);
+  const v=vals[cell];
+  return round2(((v===undefined?100:v)/100)*(a.totalReward||0));
+}
+function affairIsDone(a){return !!(a.doneAt)||((a.currentCell||0)>=9);}
+function affairTags(a){
+  if(a.domainId)return '<span class="tag p">'+esc(domainName(a.domainId))+'</span>';
+  return '<span class="tag v">活力点</span>';
+}
 function migrateAffair(a){
   if(!a)return a;
-  if(!a.scale){
+  if(a.totalReward===undefined){
     const w=Number(a.weight);
-    if(!isNaN(w)){
-      if(w>=8)a.scale='project';
-      else if(w>=4)a.scale='important';
-      else a.scale='daily';
-    }else{
-      a.scale='daily';
-    }
+    let scale=a.scale;
+    if(!scale)scale=(!isNaN(w))?(w>=8?'project':(w>=4?'important':'daily')):'daily';
+    a.totalReward=(scale==='project')?1:(scale==='important'?0.5:0.1);
+    a.currentCell=a.doneAt?9:0;
+    a.alreadyGiven=a.doneAt?a.totalReward:0;
+    a.ach={enabled:!!a.linkAch,amount:a.linkAch?1:0};
   }
-  if(a.linkAch===undefined)a.linkAch=false;
+  delete a.scale;delete a.linkAch;delete a.weight;
+  if(typeof a.totalReward!=='number'||isNaN(a.totalReward))a.totalReward=0.1;
+  if(typeof a.currentCell!=='number'||isNaN(a.currentCell))a.currentCell=0;
+  a.currentCell=Math.max(0,Math.min(9,Math.round(a.currentCell)));
+  if(typeof a.alreadyGiven!=='number'||isNaN(a.alreadyGiven))a.alreadyGiven=0;
+  if(!a.curve||!Array.isArray(a.curve.values)||a.curve.values.length!==10){
+    a.curve={type:'even',values:AFFAIR_CURVES.even.slice()};
+  }
+  if(!a.curve.type)a.curve.type='custom';
+  if(!a.ach||typeof a.ach!=='object')a.ach={enabled:false,amount:0};
   return a;
-}
-function affairScaleWeight(scale){
-  if(scale==='important')return 0.5;
-  if(scale==='project')return 1;
-  return 0.1;
-}
-function affairScaleLabel(scale){
-  if(scale==='important')return '重要';
-  if(scale==='project')return '项目';
-  return '日常';
-}
-function affairScaleRank(a){const s=a.scale||'daily';return s==='project'?3:(s==='important'?2:1);}
-function affairScaleTag(a){
-  const s=a.scale||'daily';
-  return '<span class="tag scale-'+s+'">'+affairScaleLabel(s)+'</span>';
-}
-function affairTags(a){
-  let h=affairScaleTag(a);
-  if(a.domainId)h+='<span class="tag p">'+esc(domainName(a.domainId))+'</span>';
-  else h+='<span class="tag v">活力点</span>';
-  if(a.scale==='project'&&a.linkAch)h+='<span class="tag a">成果点+1</span>';
-  return h;
 }
 
 function renderAffairs(){
@@ -1784,9 +1791,9 @@ function renderAffairs(){
     meta.textContent=affairs.length?('共'+affairs.length+' · 未完成'+open):'';
   }
   let html='';
-  // 1. 进行中区
-  const inProg=affairs.filter(function(a){return !a.doneAt&&affairTotalSteps(a)>0&&affairDoneSteps(a)<affairTotalSteps(a);})
-    .sort(function(a,b){return affairScaleRank(b)-affairScaleRank(a)||affairLastAdvance(a)-affairLastAdvance(b);});
+  // 1. 进行中区（有步骤未全完成，或已开始推进的无步骤事务）
+  const inProg=affairs.filter(function(a){return !a.doneAt&&(affairTotalSteps(a)>0||(a.currentCell||0)>0);})
+    .sort(function(a,b){return (b.totalReward||0)-(a.totalReward||0)||affairLastAdvance(a)-affairLastAdvance(b);});
   html+='<div class="affair-zone">'
     +'<div class="affair-zone-title">进行中 <span class="affair-zone-count">'+inProg.length+'</span></div>';
   html+=inProg.length?inProg.map(affairInProgressCardHTML).join(''):'<div class="affair-empty">暂无进行中的事务</div>';
@@ -1798,9 +1805,9 @@ function renderAffairs(){
     +'</div>';
   html+=(affairView==='cal')?renderAffairCalendar():renderAffairSchedule();
   html+='</div>';
-  // 3. 草稿区
-  const drafts=affairs.filter(function(a){return !a.doneAt&&!a.plannedAt&&affairTotalSteps(a)===0;})
-    .sort(function(a,b){return affairScaleRank(b)-affairScaleRank(a)||(b.createdAt||0)-(a.createdAt||0);});
+  // 3. 草稿区（无步骤、未安排、尚未推进）
+  const drafts=affairs.filter(function(a){return !a.doneAt&&!a.plannedAt&&affairTotalSteps(a)===0&&(a.currentCell||0)===0;})
+    .sort(function(a,b){return (b.createdAt||0)-(a.createdAt||0);});
   html+='<div class="affair-zone">'
     +'<div class="affair-zone-title">草稿 <span class="affair-zone-count">'+drafts.length+'</span></div>';
   html+=drafts.length?drafts.map(affairDraftCardHTML).join(''):'<div class="affair-empty">没有草稿</div>';
@@ -1808,20 +1815,45 @@ function renderAffairs(){
   panel.innerHTML=html;
 }
 
+function affairStatusLine(a){
+  const total=a.totalReward||0;
+  if(affairIsDone(a)){
+    let s='已完成 · +'+fmt(total);
+    if(a.ach&&a.ach.enabled&&a.ach.amount)s+=' · +'+fmt(a.ach.amount)+' 成果';
+    return s;
+  }
+  let s='当前格 +'+fmt(a.alreadyGiven||0);
+  const t=affairTotalSteps(a);
+  if(t>0)s+=' · 已完成 '+affairDoneSteps(a)+'/'+t+' 步';
+  if(a.ach&&a.ach.enabled&&a.ach.amount)s+=' · (+'+fmt(a.ach.amount)+' 成果)';
+  return s;
+}
+function affairAxisHTML(a){
+  const cell=a.currentCell||0;
+  const draggable=(affairTotalSteps(a)===0&&!a.doneAt);
+  let ticks='';
+  for(let i=0;i<10;i++){ticks+='<i class="stage-tick'+(i%2===0?' major':'')+'" style="left:'+(i*10)+'%"></i>';}
+  return '<div class="affair-axis'+(draggable?' draggable':'')+'" data-affair-id="'+a.id+'"'+(draggable?'':' style="pointer-events:none"')+'>'
+    +'<div class="stage-track">'+ticks+'<div class="stage-thumb" style="left:'+(cell*10+5)+'%"></div></div>'
+    +'</div>';
+}
+function affairUndoBtn(a){
+  if(!affairCanUndo(a))return '';
+  return '<button class="btn btn-sm" onclick="affairUndoAction(\''+a.id+'\')">撤销</button>';
+}
+
 function affairInProgressCardHTML(a){
-  const done=affairDoneSteps(a),total=affairTotalSteps(a),last=affairLastAdvance(a);
-  let metaText;
-  if(done===0)metaText='尚未开始 · 共'+total+'步';
-  else{const d=Math.floor(daysSince(last));metaText='上次推进 '+(d<=0?'今天':(d===1?'昨天':d+'天前'))+' · 共'+total+'步';}
-  const stalled=last>0&&daysSince(last)>3;
-  return '<div class="card affair-card'+(stalled?' stalled':'')+'" data-affair-id="'+a.id+'" onclick="openAffairModal(\''+a.id+'\')">'
+  const stall=a.startedAt&&daysSince(a.startedAt)>3;
+  return '<div class="card affair-card'+(stall?' stalled':'')+'" data-affair-id="'+a.id+'" onclick="openAffairModal(\''+a.id+'\')">'
     +'<div class="affair-row">'
     +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+'</div>'
     +'<div class="affair-actions" onclick="event.stopPropagation()">'
-    +'<button class="btn btn-sm btn-checkin" onclick="advanceAffairStep(\''+a.id+'\')">继续下一步</button>'
+    +affairUndoBtn(a)
+    +'<button class="btn btn-sm btn-checkin" onclick="advanceAffairStep(\''+a.id+'\')">完成下一步</button>'
     +'</div>'
     +'</div>'
-    +'<div class="affair-meta"><span class="affair-progress">进度 '+done+'/'+total+' 步</span><span style="color:'+(stalled?'var(--danger)':'inherit')+'">'+metaText+'</span></div>'
+    +affairAxisHTML(a)
+    +'<div class="affair-meta">'+affairStatusLine(a)+'</div>'
     +'</div>';
 }
 
@@ -1847,6 +1879,8 @@ function affairDraftCardHTML(a){
     +'<button class="btn btn-sm" onclick="openAffairModal(\''+a.id+'\')">编辑</button>'
     +'</div>'
     +'</div>'
+    +affairAxisHTML(a)
+    +'<div class="affair-meta">'+affairStatusLine(a)+'</div>'
     +'</div>';
 }
 
@@ -1854,8 +1888,13 @@ function affairDoneCardHTML(a){
   return '<div class="card affair-card done" data-affair-id="'+a.id+'" onclick="openAffairModal(\''+a.id+'\')">'
     +'<div class="affair-row">'
     +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+'</div>'
-    +'<div class="affair-actions" onclick="event.stopPropagation()"><span class="affair-time">✓ '+fmtTime(a.doneAt)+'</span></div>'
+    +'<div class="affair-actions" onclick="event.stopPropagation()">'
+    +affairUndoBtn(a)
+    +'<span class="affair-time">✓ '+fmtTime(a.doneAt)+'</span>'
     +'</div>'
+    +'</div>'
+    +affairAxisHTML(a)
+    +'<div class="affair-meta">'+affairStatusLine(a)+'</div>'
     +'</div>';
 }
 
@@ -1983,7 +2022,7 @@ function addAffairFromInput(){
   if(!inp)return;
   const name=inp.value.trim();
   if(!name){toast('请输入事务名称','err');return;}
-  state.affairs.push({id:uid(),name:name,scale:'daily',linkAch:false,domainId:null,plannedAt:null,steps:[],createdAt:now(),startedAt:null,doneAt:null});
+  state.affairs.push({id:uid(),name:name,totalReward:0.1,curve:{type:'even',values:AFFAIR_CURVES.even.slice()},currentCell:0,alreadyGiven:0,domainId:null,plannedAt:null,steps:[],ach:{enabled:false,amount:0},createdAt:now(),startedAt:null,doneAt:null});
   addLog('',0,'创建事务「'+name+'」','affair-create');
   save();
   inp.value='';
@@ -1991,17 +2030,7 @@ function addAffairFromInput(){
   render();
 }
 
-function completeAffair(id){
-  const a=state.affairs.find(function(x){return x.id===id;});
-  if(!a)return;
-  if(a.doneAt){toast('该事务已完成','warn');return;}
-  a.doneAt=now();
-  grantAffairReward(a);
-  save();
-  toast('事务「'+a.name+'」已完成');
-  render();
-}
-
+// ===== 事务结算（历史最高水位）=====
 function applyAffairValue(a,amt,desc){
   if(!amt||amt<=0)return;
   if(a.domainId){
@@ -2014,52 +2043,84 @@ function applyAffairValue(a,amt,desc){
   }
   return amt;
 }
-// 完成整个事务：日常/重要给全额；项目有步骤时只补剩余的 40%（60% 已随步骤发放）
-function grantAffairReward(a){
-  const scale=a.scale||'daily';
-  const base=affairScaleWeight(scale);
-  const hasSteps=affairTotalSteps(a)>0;
-  const amt=round2(scale==='project'&&hasSteps?base*0.4:base);
-  applyAffairValue(a,amt,'完成事务「'+a.name+'」');
-  // 项目关联成果点：一次性发放
-  if(scale==='project'&&a.linkAch){
-    state.scores.achievement=(state.scores.achievement||0)+1;
-    addLog('achievement',1,'完成项目「'+a.name+'」','affair','',{affairId:a.id});
-    toast('项目完成 · 成果点 +1','warn');
+function reverseAffairValue(a,amt,desc){
+  if(!amt||amt<=0)return;
+  if(a.domainId){
+    state.scores.progress[a.domainId]=(state.scores.progress[a.domainId]||0)-amt;
+    addLog('progress',-amt,desc,'affair',a.domainId,{affairId:a.id});
+  }else{
+    state.scores.vitality=(state.scores.vitality||0)-amt;
+    addLog('vitality',-amt,desc,'affair','',{affairId:a.id});
   }
 }
-// 项目量级分批到账：每完成一个步骤发 总奖励 × 0.6 / 步骤数
-function grantAffairStepReward(a){
-  if((a.scale||'daily')!=='project')return 0;
-  const n=affairTotalSteps(a);
-  if(n<=0)return 0;
-  const amt=round2(affairScaleWeight('project')*0.6/n);
-  return applyAffairValue(a,amt,'完成项目「'+a.name+'」步骤');
+// 推进 currentCell 并按水位结算；到达格 9 视为完成 + 发放成果点
+function affairApplyProgress(a,cell){
+  cell=Math.max(0,Math.min(9,Math.round(cell)));
+  a.currentCell=cell;
+  if(cell>0&&!a.startedAt)a.startedAt=now();
+  const target=affairTargetAt(a,cell);
+  const diff=round2(target-(a.alreadyGiven||0));
+  if(diff>0){
+    applyAffairValue(a,diff,'事务「'+a.name+'」进度结算');
+    a.alreadyGiven=round2(target);
+  }
+  if(cell>=9&&!a.doneAt){
+    a.doneAt=now();
+    if(a.ach&&a.ach.enabled&&a.ach.amount>0){
+      state.scores.achievement=(state.scores.achievement||0)+a.ach.amount;
+      addLog('achievement',a.ach.amount,'完成事务「'+a.name+'」','affair','',{affairId:a.id});
+      toast('事务「'+a.name+'」完成 · 成果点 +'+fmt(a.ach.amount),'warn');
+    }else{
+      toast('事务「'+a.name+'」已完成');
+    }
+  }
+}
+
+// ===== 撤销 =====
+let affairUndo={};
+function affairCanUndo(a){const s=affairUndo[a.id];return !!(s&&s.length);}
+function affairPushUndo(a){
+  if(!affairUndo[a.id])affairUndo[a.id]=[];
+  affairUndo[a.id].push({cell:a.currentCell||0,given:a.alreadyGiven||0,doneAt:a.doneAt||null,startedAt:a.startedAt||null});
+}
+function affairUndoAction(id){
+  const a=state.affairs.find(function(x){return x.id===id;});
+  if(!a)return;
+  const snap=(affairUndo[a.id]||[]).pop();
+  if(!snap){toast('没有可撤销的操作','warn');return;}
+  const revoked=round2((a.alreadyGiven||0)-(snap.given||0));
+  if(revoked>0)reverseAffairValue(a,revoked,'撤销事务「'+a.name+'」推进');
+  if(!!a.doneAt&&!snap.doneAt&&a.ach&&a.ach.enabled&&a.ach.amount>0){
+    state.scores.achievement=(state.scores.achievement||0)-a.ach.amount;
+    addLog('achievement',-a.ach.amount,'撤销事务「'+a.name+'」成果点','affair','',{affairId:a.id});
+  }
+  a.currentCell=snap.cell;a.alreadyGiven=snap.given;a.doneAt=snap.doneAt;a.startedAt=snap.startedAt;
+  save();render();
+  toast('已撤销「'+a.name+'」');
 }
 
 function _completeAffairStep(a,s){
+  affairPushUndo(a);
   s.doneAt=now();
-  if(!a.startedAt)a.startedAt=now();
-  const stepReward=grantAffairStepReward(a);
-  const allDone=affairSteps(a).every(function(x){return x.doneAt;});
-  if(allDone){a.doneAt=now();grantAffairReward(a);toast('事务「'+a.name+'」完成');}
-  else{toast('已完成一步「'+(s.text||'')+'」'+(stepReward>0?(' · +'+fmt(stepReward)):''));}
-  save();
-  render();
+  const steps=affairSteps(a);
+  const allDone=steps.every(function(x){return x.doneAt;});
+  affairApplyProgress(a,allDone?9:Math.min(9,(a.currentCell||0)+1));
+  save();render();
 }
 function advanceAffairStep(id){
   const a=state.affairs.find(function(x){return x.id===id;});
+  if(!a||a.doneAt)return;
+  const next=affairSteps(a).find(function(s){return !s.doneAt;});
+  if(!next){affairPushUndo(a);affairApplyProgress(a,9);save();render();return;}
+  _completeAffairStep(a,next);
+}
+function completeAffair(id){
+  const a=state.affairs.find(function(x){return x.id===id;});
   if(!a)return;
   if(a.doneAt){toast('该事务已完成','warn');return;}
-  const steps=affairSteps(a);
-  const next=steps.find(function(s){return !s.doneAt;});
-  if(!next){
-    a.doneAt=now();
-    grantAffairReward(a);
-    save();toast('事务「'+a.name+'」已完成');render();
-    return;
-  }
-  _completeAffairStep(a,next);
+  affairPushUndo(a);
+  affairApplyProgress(a,9);
+  save();render();
 }
 function completeAffairStep(id,idx){
   const a=state.affairs.find(function(x){return x.id===id;});
@@ -2070,6 +2131,41 @@ function completeAffairStep(id,idx){
   if(!s){toast('步骤不存在','warn');return;}
   if(s.doneAt){toast('该步骤已完成','warn');return;}
   _completeAffairStep(a,s);
+}
+
+// ===== 无步骤事务：进度轴拖拽推进 =====
+function initAffairAxes(){
+  document.querySelectorAll('.affair-axis.draggable').forEach(function(axis){
+    const track=axis.querySelector('.stage-track');
+    if(!track||track._affairBound)return;
+    track._affairBound=true;
+    const id=axis.dataset.affairId;
+    let dragging=false,pushed=false;
+    function setCellFromX(clientX){
+      const a=state.affairs.find(function(x){return x.id===id;});
+      if(!a||a.doneAt)return;
+      const rect=track.getBoundingClientRect();
+      let p=(clientX-rect.left)/rect.width;
+      p=Math.max(0,Math.min(1,p));
+      let cell=Math.floor(p*10);if(cell>9)cell=9;if(cell<0)cell=0;
+      if(cell<=a.currentCell)return;
+      if(!pushed){affairPushUndo(a);pushed=true;}
+      affairApplyProgress(a,cell);
+      const thumb=track.querySelector('.stage-thumb');if(thumb)thumb.style.left=(cell*10+5)+'%';
+    }
+    track.addEventListener('pointerdown',function(e){
+      const a=state.affairs.find(function(x){return x.id===id;});
+      if(!a||a.doneAt)return;
+      if(track.setPointerCapture){try{track.setPointerCapture(e.pointerId);}catch(err){}}
+      dragging=true;pushed=false;
+      setCellFromX(e.clientX);
+      e.preventDefault();
+    });
+    track.addEventListener('pointermove',function(e){if(dragging)setCellFromX(e.clientX);});
+    function end(){if(dragging){dragging=false;save();render();}}
+    track.addEventListener('pointerup',end);
+    track.addEventListener('pointercancel',end);
+  });
 }
 
 function openAffairPlanModal(id){
@@ -2105,20 +2201,28 @@ function openAffairModal(id){
     if(!a)return;
     document.getElementById('affairModalTitle').textContent='编辑事务';
     document.getElementById('affairName').value=a.name;
+    document.getElementById('affairReward').value=(a.totalReward===undefined?'':a.totalReward);
     document.getElementById('affairPlannedAt').value=a.plannedAt?toLocalInput(a.plannedAt):'';
     sel.value=a.domainId||'';
     editAffairSteps=JSON.parse(JSON.stringify(a.steps||[]));
-    setAffairScale(a.scale||'daily');
-    document.getElementById('affairLinkAch').checked=!!(a.scale==='project'&&a.linkAch);
+    editAffairCurve={type:affairCurveType(a),values:affairCurve(a).slice()};
+    setAffairCurve(editAffairCurve.type);
+    document.getElementById('affairAchEnabled').checked=!!(a.ach&&a.ach.enabled);
+    document.getElementById('affairAchAmount').value=(a.ach&&a.ach.amount)?a.ach.amount:1;
+    toggleAffairAch();
     if(delBtn)delBtn.style.display='';
   }else{
     document.getElementById('affairModalTitle').textContent='新建事务';
     document.getElementById('affairName').value='';
+    document.getElementById('affairReward').value='';
     document.getElementById('affairPlannedAt').value='';
     sel.value='';
     editAffairSteps=[];
-    setAffairScale('daily');
-    document.getElementById('affairLinkAch').checked=false;
+    editAffairCurve={type:'even',values:AFFAIR_CURVES.even.slice()};
+    setAffairCurve('even');
+    document.getElementById('affairAchEnabled').checked=false;
+    document.getElementById('affairAchAmount').value=1;
+    toggleAffairAch();
     if(delBtn)delBtn.style.display='none';
   }
   renderAffairSteps();
@@ -2129,21 +2233,25 @@ function openAffairModal(id){
 function handleAffairSave(){
   const id=document.getElementById('affairId').value;
   const name=document.getElementById('affairName').value.trim();
-  const scale=getAffairScale();
-  const linkAch=(scale==='project')&&document.getElementById('affairLinkAch').checked;
+  let totalReward=Number(document.getElementById('affairReward').value);
+  if(isNaN(totalReward)||totalReward<0)totalReward=0;
+  const curve=getAffairCurve();
+  const achEnabled=document.getElementById('affairAchEnabled').checked;
+  const achAmount=Math.max(0,Number(document.getElementById('affairAchAmount').value)||0);
   const domainId=document.getElementById('affairDomain').value||null;
   const plannedAt=fromLocalInput(document.getElementById('affairPlannedAt').value);
   const steps=readAffairSteps();
   if(!name){toast('请输入事务名称','err');return;}
+  const ach={enabled:achEnabled,amount:achEnabled?achAmount:0};
   if(id){
     const a=state.affairs.find(function(x){return x.id===id;});
     if(!a)return;
-    a.name=name;a.scale=scale;a.linkAch=linkAch;a.domainId=domainId;
+    a.name=name;a.totalReward=totalReward;a.curve=curve;a.ach=ach;a.domainId=domainId;
     if(!a.doneAt)a.plannedAt=plannedAt;
     a.steps=steps;
     addLog('',0,'修改事务「'+name+'」','affair-edit');
   }else{
-    state.affairs.push({id:uid(),name:name,scale:scale,linkAch:linkAch,domainId:domainId,plannedAt:plannedAt,steps:steps,createdAt:now(),startedAt:null,doneAt:null});
+    state.affairs.push({id:uid(),name:name,totalReward:totalReward,curve:curve,currentCell:0,alreadyGiven:0,domainId:domainId,plannedAt:plannedAt,steps:steps,ach:ach,createdAt:now(),startedAt:null,doneAt:null});
     addLog('',0,'创建事务「'+name+'」','affair-create');
   }
   save();
@@ -2199,21 +2307,48 @@ function readAffairSteps(){
   return editAffairSteps.filter(function(s){return s&&s.text&&s.text.trim();})
     .map(function(s){return {text:s.text.trim(),doneAt:s.doneAt||null,plannedAt:s.plannedAt||null};});
 }
-function affairScaleHint(scale){
-  if(scale==='project')return '进度值按步骤分批到账：每步发 0.6÷步数，全部完成再补 0.4；可关联成果点';
-  if(scale==='important')return '完成时 +0.5 进度值/活力点';
-  return '完成时 +0.1 进度值/活力点';
+function affairCurvePreview(){
+  const total=Number(document.getElementById('affairReward').value)||0;
+  const vals=editAffairCurve.values;
+  let pts='';
+  for(let i=0;i<10;i++){pts+='<b>'+(i+1)+'</b><i>'+fmt(round2(vals[i]/100*total))+'</i>';}
+  return pts;
 }
-function setAffairScale(scale){
-  document.querySelectorAll('#affairScaleRow .scale-btn').forEach(function(b){b.classList.toggle('on',b.dataset.scale===scale);});
-  const achRow=document.getElementById('affairAchRow');
-  if(achRow)achRow.style.display=(scale==='project')?'':'none';
-  const hint=document.getElementById('affairScaleHint');
-  if(hint)hint.textContent=affairScaleHint(scale);
+function affairCurveRefresh(){
+  const p=document.getElementById('affairCurvePreview');
+  if(p)p.innerHTML=affairCurvePreview();
 }
-function getAffairScale(){
-  const on=document.querySelector('#affairScaleRow .scale-btn.on');
-  return on?on.dataset.scale:'daily';
+function setAffairCurve(type){
+  editAffairCurve.type=type;
+  document.querySelectorAll('#affairCurveRow .curve-btn').forEach(function(b){b.classList.toggle('on',b.dataset.curve===type);});
+  if(type!=='custom'&&AFFAIR_CURVES[type])editAffairCurve.values=AFFAIR_CURVES[type].slice();
+  const custom=document.getElementById('affairCurveCustom');
+  if(custom){custom.style.display=(type==='custom')?'':'none';if(type==='custom')renderAffairCurveCustom();}
+  const prev=document.getElementById('affairCurvePreview');
+  if(prev)prev.innerHTML=affairCurvePreview();
+}
+function renderAffairCurveCustom(){
+  const cont=document.getElementById('affairCurveCustom');
+  if(!cont)return;
+  cont.innerHTML=editAffairCurve.values.map(function(v,i){
+    return '<label class="curve-cell"><span>'+(i+1)+'</span><input type="number" min="0" max="100" step="1" value="'+v+'" data-i="'+i+'" oninput="affairCurveInput('+i+',this.value)"></label>';
+  }).join('');
+}
+function affairCurveInput(i,v){
+  const n=Number(v);if(!isNaN(n))editAffairCurve.values[i]=Math.max(0,Math.min(100,n));
+  const prev=document.getElementById('affairCurvePreview');
+  if(prev)prev.innerHTML=affairCurvePreview();
+}
+function getAffairCurve(){
+  const type=editAffairCurve.type;
+  const values=editAffairCurve.values.slice();
+  values[9]=100;
+  return {type:type,values:values};
+}
+function toggleAffairAch(){
+  const on=document.getElementById('affairAchEnabled').checked;
+  const row=document.getElementById('affairAchAmountRow');
+  if(row)row.style.display=on?'':'none';
 }
 function toggleAffairView(){affairView=(affairView==='cal'?'list':'cal');affairCalSelected=null;render();}
 function toggleAffairDone(){affairDoneOpen=!affairDoneOpen;render();}
@@ -3078,7 +3213,7 @@ function changeSoldoutCat(sel,oldCatId){
 }
 
 // ===== Render All =====
-function render(){renderWork();renderBank();renderShop();renderCycle();updateExemptChip();initStageBars()}
+function render(){renderWork();renderBank();renderShop();renderCycle();updateExemptChip();initStageBars();initAffairAxes()}
 
 // ===== Cycle Settings (周期活动) =====
 function fmtDate(ts){

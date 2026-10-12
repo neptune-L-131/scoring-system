@@ -267,9 +267,6 @@ body{
 .tag.p{background:var(--tag-p-bg);color:var(--progress)}
 .tag.a{background:var(--tag-a-bg);color:var(--achievement)}
 .tag.d{background:var(--surface-2);color:var(--text-3)}
-.tag.scale-daily{background:var(--surface-2);color:var(--text-2)}
-.tag.scale-important{background:var(--tag-p-bg);color:var(--progress)}
-.tag.scale-project{background:var(--tag-a-bg);color:var(--achievement)}
 
 .card-meta{display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:var(--text-3);margin-bottom:10px}
 .card-meta span b{color:var(--text-2);font-weight:600}
@@ -776,14 +773,27 @@ body{
 .affair-day-title{font-size:12px;color:var(--text-3);margin-bottom:6px}
 .tag.w{background:var(--tag-a-bg);color:var(--achievement)}
 
-/* 事务：量级选择器 */
-.scale-row{display:flex;gap:6px}
-.scale-btn{border:1px solid var(--border-2);background:var(--surface);color:var(--text-2);border-radius:7px;padding:6px 12px;font-size:12px;cursor:pointer;font-family:inherit;transition:all .15s;flex:1}
-.scale-btn:hover{background:var(--surface-2)}
-.scale-btn.on{border-color:var(--achievement);color:var(--achievement);background:var(--tag-a-bg);font-weight:600}
-.scale-hint{font-size:11px;color:var(--text-3);margin-top:7px;line-height:1.5}
+/* 事务：奖励曲线选择器 */
+.curve-row{display:flex;gap:6px;flex-wrap:wrap}
+.curve-btn{border:1px solid var(--border-2);background:var(--surface);color:var(--text-2);border-radius:7px;padding:6px 10px;font-size:12px;cursor:pointer;font-family:inherit;transition:all .15s;flex:1;min-width:52px}
+.curve-btn:hover{background:var(--surface-2)}
+.curve-btn.on{border-color:var(--achievement);color:var(--achievement);background:var(--tag-a-bg);font-weight:600}
+.curve-custom{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}
+.curve-cell{display:flex;flex-direction:column;gap:2px;font-size:10px;color:var(--text-3)}
+.curve-cell span{text-align:center}
+.curve-cell input{width:40px;background:var(--surface-2);border:1px solid var(--border-2);border-radius:6px;color:var(--text);font-size:12px;font-family:inherit;padding:4px 6px;outline:none;text-align:center}
+.curve-cell input:focus{border-color:var(--text-3)}
+.curve-preview{display:flex;flex-wrap:wrap;gap:3px 10px;margin-top:8px;font-size:11px;line-height:1.6}
+.curve-preview b{color:var(--text-3);font-weight:500}
+.curve-preview i{color:var(--progress);font-style:normal;font-weight:600}
+/* 事务：卡片进度轴 */
+.affair-axis{margin-top:8px}
+.affair-axis .stage-track{cursor:default;height:20px}
+.affair-axis.draggable .stage-track{cursor:pointer}
 .fg .ach-check{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-2);margin-bottom:0}
 .fg .ach-check input{width:auto;margin:0;accent-color:var(--achievement)}
+#affairAchAmountRow input{width:100%;background:var(--surface-2);border:1px solid var(--border-2);border-radius:7px;color:var(--text);font-size:13px;font-family:inherit;padding:7px 10px;outline:none}
+#affairAchAmountRow input:focus{border-color:var(--text-3)}
 
 /* 事务：步骤列表 */
 .affair-step-row{display:flex;flex-direction:column;gap:5px;margin-bottom:10px}
