@@ -332,6 +332,10 @@
     <h2 id="affairModalTitle">新建事务</h2>
     <input type="hidden" id="affairId">
     <div class="fg">
+      <label>套用预设 <span class="h">选择后自动填充总奖励、曲线与成果点，仍可手动微调</span></label>
+      <select id="affairPresetSel" onchange="applyAffairPreset()"></select>
+    </div>
+    <div class="fg">
       <label>事务名称</label>
       <input type="text" id="affairName" placeholder="例如：报销上月差旅" maxlength="40" autocomplete="off">
     </div>
@@ -375,6 +379,46 @@
       <button class="btn" onclick="closeModal('affairModal')">取消</button>
       <button class="btn btn-danger" id="affairDelBtn" style="display:none" onclick="delAffair(document.getElementById('affairId').value)">删除</button>
       <button class="btn" id="affairSaveBtn">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Affair Preset Modal ===== -->
+<div class="modal-bg" id="presetModal">
+  <div class="modal">
+    <h2 id="presetModalTitle">新建预设</h2>
+    <input type="hidden" id="presetId">
+    <div class="fg">
+      <label>预设名称</label>
+      <input type="text" id="presetName" placeholder="例如：轻量日常" maxlength="40" autocomplete="off">
+    </div>
+    <div class="fg">
+      <label>总奖励 <span class="h">套用后的事务累计可获得总额</span></label>
+      <input type="number" id="presetReward" step="0.1" min="0" placeholder="例如 1" oninput="presetCurveRefresh()">
+    </div>
+    <div class="fg">
+      <label>奖励曲线 <span class="h">控制奖励随进度格位的发放节奏（格 9 = 100%）</span></label>
+      <div class="curve-row" id="presetCurveRow">
+        <button type="button" class="curve-btn" data-curve="even" onclick="setPresetCurve('even')">平均</button>
+        <button type="button" class="curve-btn" data-curve="lateHeavy" onclick="setPresetCurve('lateHeavy')">后重</button>
+        <button type="button" class="curve-btn" data-curve="earlyHeavy" onclick="setPresetCurve('earlyHeavy')">前重</button>
+        <button type="button" class="curve-btn" data-curve="allAtEnd" onclick="setPresetCurve('allAtEnd')">全押后</button>
+        <button type="button" class="curve-btn" data-curve="custom" onclick="setPresetCurve('custom')">自定义</button>
+      </div>
+      <div class="curve-custom" id="presetCurveCustom" style="display:none"></div>
+      <div class="curve-preview" id="presetCurvePreview"></div>
+    </div>
+    <div class="fg">
+      <label>成果点 <span class="h">完成时额外一次性发放</span></label>
+      <label class="ach-check"><input type="checkbox" id="presetAchEnabled" onchange="togglePresetAch()"> 启用成果点奖励</label>
+      <div id="presetAchAmountRow" style="display:none;margin-top:6px">
+        <input type="number" id="presetAchAmount" step="1" min="0" value="1" placeholder="成果点数量">
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal('presetModal')">取消</button>
+      <button class="btn btn-danger" id="presetDelBtn" style="display:none" onclick="delPreset(document.getElementById('presetId').value)">删除</button>
+      <button class="btn" id="presetSaveBtn">保存</button>
     </div>
   </div>
 </div>

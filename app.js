@@ -210,6 +210,9 @@ function defaults(){
     majorCollapsed:[],
     tasks:[],achievements:[],products:[],logs:[],
     affairs:[],
+    affairPresets:[],
+    affairCollapsed:[],
+    affairUndo:{},
     loans:[],
     cards:{exemption:0},
     activities:defaultActivities(),
@@ -278,6 +281,9 @@ function parseState(raw){
       majorCollapsed:p.majorCollapsed||[],
       tasks:tasks,achievements:p.achievements||[],
       affairs:Array.isArray(p.affairs)?p.affairs.map(migrateAffair):[],
+      affairPresets:Array.isArray(p.affairPresets)?p.affairPresets:[],
+      affairCollapsed:p.affairCollapsed||[],
+      affairUndo:p.affairUndo||{},
       products:p.products||[],logs:p.logs||[],
       loans:p.loans||[],
       lastDebtDate:p.lastDebtDate||null,
@@ -1759,15 +1765,18 @@ function affairTags(a){
 }
 function migrateAffair(a){
   if(!a)return a;
+  // 各字段独立迁移，互不依赖：避免 totalReward 已存在时跳过 linkAch→ach 迁移
   if(a.totalReward===undefined){
     const w=Number(a.weight);
     let scale=a.scale;
     if(!scale)scale=(!isNaN(w))?(w>=8?'project':(w>=4?'important':'daily')):'daily';
     a.totalReward=(scale==='project')?1:(scale==='important'?0.5:0.1);
-    a.currentCell=a.doneAt?9:0;
-    a.alreadyGiven=a.doneAt?a.totalReward:0;
+  }
+  if(a.linkAch!==undefined&&a.ach===undefined){
     a.ach={enabled:!!a.linkAch,amount:a.linkAch?1:0};
   }
+  if(a.currentCell===undefined&&a.doneAt)a.currentCell=9;
+  if(a.alreadyGiven===undefined&&a.doneAt&&a.totalReward!==undefined)a.alreadyGiven=a.totalReward;
   delete a.scale;delete a.linkAch;delete a.weight;
   if(typeof a.totalReward!=='number'||isNaN(a.totalReward))a.totalReward=0.1;
   if(typeof a.currentCell!=='number'||isNaN(a.currentCell))a.currentCell=0;
@@ -1778,7 +1787,138 @@ function migrateAffair(a){
   }
   if(!a.curve.type)a.curve.type='custom';
   if(!a.ach||typeof a.ach!=='object')a.ach={enabled:false,amount:0};
+  if(a.ach.enabled===undefined)a.ach.enabled=false;
+  if(typeof a.ach.amount!=='number'||isNaN(a.ach.amount))a.ach.amount=0;
   return a;
+}
+
+// ===== 事务预设 =====
+let editPresetCurve={type:'even',values:AFFAIR_CURVES.even.slice()};
+function renderAffairPresetsHTML(){
+  const presets=state.affairPresets||[];
+  let h='<div class="affair-presets">'
+    +'<div class="affair-presets-head"><span class="affair-presets-title">预设</span>'
+    +'<button class="btn btn-sm" onclick="openPresetModal()">＋ 新建预设</button></div>';
+  if(presets.length){
+    h+='<div class="affair-preset-chips">'+presets.map(function(p){
+      return '<span class="affair-preset-chip" onclick="openPresetModal(\''+p.id+'\')">'+esc(p.name)+'<b>+'+fmt(p.totalReward)+'</b></span>';
+    }).join('')+'</div>';
+  }else{
+    h+='<div class="affair-presets-empty">没有预设。新建后，可在新建事务时一键套用总奖励与曲线。</div>';
+  }
+  h+='</div>';
+  return h;
+}
+function applyAffairPreset(){
+  const sel=document.getElementById('affairPresetSel');
+  const p=state.affairPresets.find(function(x){return x.id===sel.value;});
+  if(!p)return;
+  document.getElementById('affairReward').value=p.totalReward;
+  editAffairCurve={type:p.curve.type,values:(p.curve.values||AFFAIR_CURVES.even).slice()};
+  setAffairCurve(editAffairCurve.type);
+  document.getElementById('affairAchEnabled').checked=!!(p.ach&&p.ach.enabled);
+  document.getElementById('affairAchAmount').value=(p.ach&&p.ach.amount)?p.ach.amount:1;
+  toggleAffairAch();
+}
+function openPresetModal(id){
+  document.getElementById('presetId').value=id||'';
+  const del=document.getElementById('presetDelBtn');
+  if(id){
+    const p=state.affairPresets.find(function(x){return x.id===id;});
+    if(!p)return;
+    document.getElementById('presetModalTitle').textContent='编辑预设';
+    document.getElementById('presetName').value=p.name;
+    document.getElementById('presetReward').value=p.totalReward;
+    editPresetCurve={type:p.curve.type,values:(p.curve.values||AFFAIR_CURVES.even).slice()};
+    setPresetCurve(editPresetCurve.type);
+    document.getElementById('presetAchEnabled').checked=!!(p.ach&&p.ach.enabled);
+    document.getElementById('presetAchAmount').value=(p.ach&&p.ach.amount)?p.ach.amount:1;
+    togglePresetAch();
+    if(del)del.style.display='';
+  }else{
+    document.getElementById('presetModalTitle').textContent='新建预设';
+    document.getElementById('presetName').value='';
+    document.getElementById('presetReward').value='';
+    editPresetCurve={type:'even',values:AFFAIR_CURVES.even.slice()};
+    setPresetCurve('even');
+    document.getElementById('presetAchEnabled').checked=false;
+    document.getElementById('presetAchAmount').value=1;
+    togglePresetAch();
+    if(del)del.style.display='none';
+  }
+  openModal('presetModal');
+  setTimeout(function(){document.getElementById('presetName').focus();},50);
+}
+function presetCurvePreview(){
+  const total=Number(document.getElementById('presetReward').value)||0;
+  const vals=editPresetCurve.values;
+  let pts='';
+  for(let i=0;i<10;i++){pts+='<b>'+(i+1)+'</b><i>'+fmt(round2(vals[i]/100*total))+'</i>';}
+  return pts;
+}
+function presetCurveRefresh(){const p=document.getElementById('presetCurvePreview');if(p)p.innerHTML=presetCurvePreview();}
+function setPresetCurve(type){
+  editPresetCurve.type=type;
+  document.querySelectorAll('#presetCurveRow .curve-btn').forEach(function(b){b.classList.toggle('on',b.dataset.curve===type);});
+  if(type!=='custom'&&AFFAIR_CURVES[type])editPresetCurve.values=AFFAIR_CURVES[type].slice();
+  const custom=document.getElementById('presetCurveCustom');
+  if(custom){custom.style.display=(type==='custom')?'':'none';if(type==='custom')renderPresetCurveCustom();}
+  const prev=document.getElementById('presetCurvePreview');
+  if(prev)prev.innerHTML=presetCurvePreview();
+}
+function renderPresetCurveCustom(){
+  const cont=document.getElementById('presetCurveCustom');
+  if(!cont)return;
+  cont.innerHTML=editPresetCurve.values.map(function(v,i){
+    return '<label class="curve-cell"><span>'+(i+1)+'</span><input type="number" min="0" max="100" step="1" value="'+v+'" data-i="'+i+'" oninput="presetCurveInput('+i+',this.value)"></label>';
+  }).join('');
+}
+function presetCurveInput(i,v){
+  const n=Number(v);if(!isNaN(n))editPresetCurve.values[i]=Math.max(0,Math.min(100,n));
+  const prev=document.getElementById('presetCurvePreview');
+  if(prev)prev.innerHTML=presetCurvePreview();
+}
+function getPresetCurve(){
+  const values=editPresetCurve.values.slice();
+  values[9]=100;
+  return {type:editPresetCurve.type,values:values};
+}
+function togglePresetAch(){
+  const on=document.getElementById('presetAchEnabled').checked;
+  const row=document.getElementById('presetAchAmountRow');
+  if(row)row.style.display=on?'':'none';
+}
+function savePreset(){
+  const id=document.getElementById('presetId').value;
+  const name=document.getElementById('presetName').value.trim();
+  if(!name){toast('请输入预设名称','err');return;}
+  let totalReward=Number(document.getElementById('presetReward').value);
+  if(isNaN(totalReward)||totalReward<0)totalReward=0;
+  const curve=getPresetCurve();
+  const achEnabled=document.getElementById('presetAchEnabled').checked;
+  const achAmount=Math.max(0,Number(document.getElementById('presetAchAmount').value)||0);
+  const ach={enabled:achEnabled,amount:achEnabled?achAmount:0};
+  if(id){
+    const p=state.affairPresets.find(function(x){return x.id===id;});
+    if(!p)return;
+    p.name=name;p.totalReward=totalReward;p.curve=curve;p.ach=ach;
+  }else{
+    state.affairPresets.push({id:uid(),name:name,totalReward:totalReward,curve:curve,ach:ach});
+  }
+  save();
+  closeModal('presetModal');
+  toast(id?'预设已更新':'预设已创建');
+  render();
+}
+function delPreset(id){
+  const p=state.affairPresets.find(function(x){return x.id===id;});
+  if(!p)return;
+  if(!confirm('删除预设「'+p.name+'」？'))return;
+  state.affairPresets=state.affairPresets.filter(function(x){return x.id!==id;});
+  save();
+  closeModal('presetModal');
+  toast('预设已删除');
+  render();
 }
 
 function renderAffairs(){
@@ -1790,28 +1930,27 @@ function renderAffairs(){
     const open=affairs.filter(function(a){return !a.doneAt;}).length;
     meta.textContent=affairs.length?('共'+affairs.length+' · 未完成'+open):'';
   }
-  let html='';
+  let html=renderAffairPresetsHTML();
   // 1. 进行中区（有步骤未全完成，或已开始推进的无步骤事务）
   const inProg=affairs.filter(function(a){return !a.doneAt&&(affairTotalSteps(a)>0||(a.currentCell||0)>0);})
     .sort(function(a,b){return (b.totalReward||0)-(a.totalReward||0)||affairLastAdvance(a)-affairLastAdvance(b);});
-  html+='<div class="affair-zone">'
-    +'<div class="affair-zone-title">进行中 <span class="affair-zone-count">'+inProg.length+'</span></div>';
+  html+=affairZoneStart('inprog','进行中',inProg.length,'');
   html+=inProg.length?inProg.map(affairInProgressCardHTML).join(''):'<div class="affair-empty">暂无进行中的事务</div>';
-  html+='</div>';
-  // 2. 日程区
-  html+='<div class="affair-zone">'
-    +'<div class="affair-zone-title">日程 '
-    +'<button class="affair-view-toggle" onclick="toggleAffairView()">'+(affairView==='cal'?'列表':'日历')+'</button>'
-    +'</div>';
+  html+=AFFAIR_ZONE_END;
+  // 2. 日程区（列表/日历视图切换只影响本区呈现）
+  const schedCount=affairUnits().length;
+  html+=affairZoneStart('schedule','日程',schedCount,'<button class="affair-view-toggle" onclick="event.stopPropagation();toggleAffairView()">'+(affairView==='cal'?'列表':'日历')+'</button>');
   html+=(affairView==='cal')?renderAffairCalendar():renderAffairSchedule();
-  html+='</div>';
+  html+=AFFAIR_ZONE_END;
   // 3. 草稿区（无步骤、未安排、尚未推进）
   const drafts=affairs.filter(function(a){return !a.doneAt&&!a.plannedAt&&affairTotalSteps(a)===0&&(a.currentCell||0)===0;})
     .sort(function(a,b){return (b.createdAt||0)-(a.createdAt||0);});
-  html+='<div class="affair-zone">'
-    +'<div class="affair-zone-title">草稿 <span class="affair-zone-count">'+drafts.length+'</span></div>';
+  html+=affairZoneStart('draft','草稿',drafts.length,'');
   html+=drafts.length?drafts.map(affairDraftCardHTML).join(''):'<div class="affair-empty">没有草稿</div>';
-  html+='</div>';
+  html+=AFFAIR_ZONE_END;
+  // 4. 已完成（折叠组，默认收起，置于最底部）
+  const done=affairs.filter(function(a){return affairIsDone(a);});
+  html+=doneZoneHTML(done);
   panel.innerHTML=html;
 }
 
@@ -1837,10 +1976,69 @@ function affairAxisHTML(a){
     +'<div class="stage-track">'+ticks+'<div class="stage-thumb" style="left:'+(cell*10+5)+'%"></div></div>'
     +'</div>';
 }
-function affairUndoBtn(a){
-  if(!affairCanUndo(a))return '';
-  return '<button class="btn btn-sm" onclick="affairUndoAction(\''+a.id+'\')">撤销</button>';
+function affairZoneStart(key,title,count,extra){
+  const collapsed=(state.affairCollapsed||[]).indexOf(key)>=0;
+  return '<div class="affair-zone'+(collapsed?' collapsed':'')+'" id="affair-zone-'+key+'">'
+    +'<div class="affair-zone-title" onclick="toggleAffairZone(\''+key+'\')">'
+    +'<span class="coll-toggle">▼</span>'+title+' <span class="affair-zone-count">'+count+'</span>'
+    +(extra||'')
+    +'</div>'
+    +'<div class="affair-zone-body">';
 }
+const AFFAIR_ZONE_END='</div></div>';
+function doneZoneHTML(done){
+  const collapsed=!affairDoneOpen;
+  return '<div class="affair-zone'+(collapsed?' collapsed':'')+'" id="affair-zone-done">'
+    +'<div class="affair-zone-title" onclick="toggleAffairDone()">'
+    +'<span class="coll-toggle">▼</span>已完成 <span class="affair-zone-count">'+done.length+'</span></div>'
+    +'<div class="affair-zone-body">'+(done.length?done.map(affairDoneCardHTML).join(''):'<div class="affair-empty">无</div>')+'</div>'
+    +'</div>';
+}
+function toggleAffairZone(key){
+  const arr=state.affairCollapsed||[];
+  const i=arr.indexOf(key);
+  if(i>=0)arr.splice(i,1);else arr.push(key);
+  state.affairCollapsed=arr;
+  save();
+  const el=document.getElementById('affair-zone-'+key);
+  if(el)el.classList.toggle('collapsed',arr.indexOf(key)>=0);
+}
+function affairMoreBtn(a){
+  return '<button class="btn btn-sm affair-more" onclick="toggleAffairMenu(event,\''+a.id+'\')">⋯</button>';
+}
+let affairMenuTarget=null;
+function toggleAffairMenu(e,id){
+  e.stopPropagation();
+  if(affairMenuTarget===id){closeAffairMenu();return;}
+  affairMenuTarget=id;
+  const a=state.affairs.find(function(x){return x.id===id;});
+  if(!a)return;
+  let menu=document.getElementById('affairMenu');
+  if(!menu){menu=document.createElement('div');menu.id='affairMenu';menu.className='affair-menu';document.body.appendChild(menu);}
+  const canUndo=affairCanUndo(a);
+  menu.innerHTML=
+    '<button onclick="openAffairModal(\''+id+'\');closeAffairMenu()">编辑</button>'
+    +(canUndo
+      ?'<button onclick="affairUndoAction(\''+id+'\');closeAffairMenu()">撤销上一步</button>'
+      :'<button disabled>撤销上一步</button>')
+    +'<button class="danger" onclick="delAffair(\''+id+'\');closeAffairMenu()">删除</button>';
+  const r=e.currentTarget.getBoundingClientRect();
+  menu.style.display='block';
+  menu.style.left=Math.max(8,Math.min(r.right-110,window.innerWidth-118))+'px';
+  menu.style.top=(r.bottom+4)+'px';
+}
+function closeAffairMenu(){
+  affairMenuTarget=null;
+  const m=document.getElementById('affairMenu');
+  if(m)m.style.display='none';
+}
+document.addEventListener('click',function(e){
+  if(!affairMenuTarget)return;
+  const menu=document.getElementById('affairMenu');
+  const path=(e.composedPath&&e.composedPath())||[];
+  if(path.indexOf(menu)>=0)return;
+  closeAffairMenu();
+});
 
 function affairInProgressCardHTML(a){
   const stall=a.startedAt&&daysSince(a.startedAt)>3;
@@ -1848,7 +2046,7 @@ function affairInProgressCardHTML(a){
     +'<div class="affair-row">'
     +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+'</div>'
     +'<div class="affair-actions" onclick="event.stopPropagation()">'
-    +affairUndoBtn(a)
+    +affairMoreBtn(a)
     +'<button class="btn btn-sm btn-checkin" onclick="advanceAffairStep(\''+a.id+'\')">完成下一步</button>'
     +'</div>'
     +'</div>'
@@ -1863,6 +2061,7 @@ function affairScheduleCardHTML(a,opts){
     +'<div class="affair-row">'
     +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+'</div>'
     +'<div class="affair-actions" onclick="event.stopPropagation()">'
+    +affairMoreBtn(a)
     +'<span class="affair-time">'+(opts&&opts.time?opts.time:fmtPlan(a.plannedAt))+'</span>'
     +'<button class="btn btn-sm btn-checkin" onclick="completeAffair(\''+a.id+'\')">完成</button>'
     +'</div>'
@@ -1876,7 +2075,7 @@ function affairDraftCardHTML(a){
     +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+'</div>'
     +'<div class="affair-actions" onclick="event.stopPropagation()">'
     +'<button class="btn btn-sm" onclick="openAffairPlanModal(\''+a.id+'\')">计划</button>'
-    +'<button class="btn btn-sm" onclick="openAffairModal(\''+a.id+'\')">编辑</button>'
+    +affairMoreBtn(a)
     +'</div>'
     +'</div>'
     +affairAxisHTML(a)
@@ -1889,7 +2088,7 @@ function affairDoneCardHTML(a){
     +'<div class="affair-row">'
     +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+'</div>'
     +'<div class="affair-actions" onclick="event.stopPropagation()">'
-    +affairUndoBtn(a)
+    +affairMoreBtn(a)
     +'<span class="affair-time">✓ '+fmtTime(a.doneAt)+'</span>'
     +'</div>'
     +'</div>'
@@ -1957,12 +2156,6 @@ function renderAffairSchedule(){
     }
     html+='</div>';
   });
-  // 已完成（折叠，默认隐藏）
-  const done=(state.affairs||[]).filter(function(a){return a.doneAt;});
-  html+='<div class="coll-group'+(affairDoneOpen?'':' collapsed')+'">'
-    +'<div class="coll-header" onclick="toggleAffairDone()"><div class="coll-name"><span class="coll-toggle">▼</span>已完成 <span class="coll-count">'+done.length+'个</span></div></div>';
-  html+='<div class="coll-body">'+done.map(affairDoneCardHTML).join('')+'</div>';
-  html+='</div>';
   return html;
 }
 
@@ -2076,17 +2269,20 @@ function affairApplyProgress(a,cell){
   }
 }
 
-// ===== 撤销 =====
-let affairUndo={};
-function affairCanUndo(a){const s=affairUndo[a.id];return !!(s&&s.length);}
+// ===== 撤销（快照持久化到 state，限量保留）=====
+const AFFAIR_UNDO_LIMIT=5;
+function affairCanUndo(a){const s=(state.affairUndo&&state.affairUndo[a.id]);return !!(s&&s.length);}
 function affairPushUndo(a){
-  if(!affairUndo[a.id])affairUndo[a.id]=[];
-  affairUndo[a.id].push({cell:a.currentCell||0,given:a.alreadyGiven||0,doneAt:a.doneAt||null,startedAt:a.startedAt||null});
+  if(!state.affairUndo)state.affairUndo={};
+  const stack=state.affairUndo[a.id]||(state.affairUndo[a.id]=[]);
+  stack.push({cell:a.currentCell||0,given:a.alreadyGiven||0,doneAt:a.doneAt||null,startedAt:a.startedAt||null});
+  if(stack.length>AFFAIR_UNDO_LIMIT)stack.shift();
 }
 function affairUndoAction(id){
   const a=state.affairs.find(function(x){return x.id===id;});
   if(!a)return;
-  const snap=(affairUndo[a.id]||[]).pop();
+  const stack=(state.affairUndo&&state.affairUndo[a.id])||[];
+  const snap=stack.pop();
   if(!snap){toast('没有可撤销的操作','warn');return;}
   const revoked=round2((a.alreadyGiven||0)-(snap.given||0));
   if(revoked>0)reverseAffairValue(a,revoked,'撤销事务「'+a.name+'」推进');
@@ -2104,7 +2300,7 @@ function _completeAffairStep(a,s){
   s.doneAt=now();
   const steps=affairSteps(a);
   const allDone=steps.every(function(x){return x.doneAt;});
-  affairApplyProgress(a,allDone?9:Math.min(9,(a.currentCell||0)+1));
+  affairApplyProgress(a,allDone?9:Math.min(8,(a.currentCell||0)+1));
   save();render();
 }
 function advanceAffairStep(id){
@@ -2195,6 +2391,11 @@ function openAffairModal(id){
   let dHtml='<option value="">不关联（记活力点）</option>';
   dHtml+=state.domains.map(function(d){return '<option value="'+d.id+'">'+esc(d.name)+'</option>';}).join('');
   sel.innerHTML=dHtml;
+  const psSel=document.getElementById('affairPresetSel');
+  if(psSel){
+    psSel.innerHTML='<option value="">不套用</option>'+state.affairPresets.map(function(p){return '<option value="'+p.id+'">'+esc(p.name)+'</option>';}).join('');
+    psSel.value='';
+  }
   const delBtn=document.getElementById('affairDelBtn');
   if(id){
     const a=state.affairs.find(function(x){return x.id===id;});
@@ -5122,6 +5323,9 @@ function importData(ev){
         majorCollapsed:d.majorCollapsed||[],
         tasks:tasks,achievements:d.achievements||[],
         affairs:Array.isArray(d.affairs)?d.affairs.map(migrateAffair):[],
+        affairPresets:Array.isArray(d.affairPresets)?d.affairPresets:[],
+        affairCollapsed:d.affairCollapsed||[],
+        affairUndo:d.affairUndo||{},
         products:d.products||[],logs:d.logs||[],
         loans:d.loans||[],
         lastDebtDate:d.lastDebtDate||null,
@@ -5324,8 +5528,9 @@ async function init(){
   document.getElementById('activitySaveBtn').addEventListener('click',handleActivitySave);
   document.getElementById('affairSaveBtn').addEventListener('click',handleAffairSave);
   document.getElementById('affairPlanSaveBtn').addEventListener('click',saveAffairPlan);
+  document.getElementById('presetSaveBtn').addEventListener('click',savePreset);
 
-  ['taskModal','achModal','prodModal','metricModal','activityModal','affairModal','affairPlanModal'].forEach(mid=>{
+  ['taskModal','achModal','prodModal','metricModal','activityModal','affairModal','affairPlanModal','presetModal'].forEach(mid=>{
     document.getElementById(mid).addEventListener('keydown',e=>{
       if(e.key==='Enter'&&e.target.tagName==='INPUT'){
         e.preventDefault();
