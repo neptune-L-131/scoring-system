@@ -1407,6 +1407,7 @@ function buyProduct(id){
   const loanAmt=willLoan?(p.price-balance):0;
   const loanId=uid();
 
+  if(willLoan)state.scores[p.currency]+=loanAmt;
   state.scores[p.currency]-=p.price;
   if(p.stock>0)p.stock--;
   p.sold=(p.sold||0)+1;
@@ -1541,17 +1542,8 @@ function processLoans(){
     if(days>0){
       state.loans.forEach(loan=>{
         if(loan.debtRate<=0)return;
-        var totalInterest=0;
         for(let i=0;i<days;i++){
-          var interest=loan.amount*(loan.debtRate/100);
-          loan.amount+=interest;
-          totalInterest+=interest;
-        }
-        if(totalInterest>0){
-          state.scores[loan.currency]-=totalInterest;
-          addLog(loan.currency,-totalInterest,
-            '贷款「'+loan.productName+'」'+days+'天利息 ('+fmt(loan.debtRate)+'%/天)',
-            'loan-interest','',{loanId:loan.id});
+          loan.amount+=loan.amount*(loan.debtRate/100);
         }
       });
       state.lastDebtDate=today.getTime();
@@ -1574,6 +1566,31 @@ function processLoans(){
     state.loans=remaining;
   }
   save();
+}
+
+// ===== 手动修正余额（用于修复历史版本重复扣减造成的余额偏差） =====
+function manualAdjustBalance(){
+  const cur=window.prompt('选择货币：输入 1 = 活力点，2 = 成果点');
+  if(cur===null)return;
+  const c=String(cur).trim();
+  let key='';
+  if(c==='1'||c==='活力'||c==='活力点')key='vitality';
+  else if(c==='2'||c==='成果'||c==='成果点')key='achievement';
+  else{toast('无效的货币选择','err');return}
+  const label=key==='vitality'?'活力点':'成果点';
+  const before=state.scores[key]||0;
+  const raw=window.prompt('「'+label+'」当前余额：'+fmt(before)+'\n请输入调整值（可为负数，如 -2 表示减少 2）');
+  if(raw===null)return;
+  if(!String(raw).trim()){toast('请输入调整值','err');return}
+  const amt=Number(raw);
+  if(!isFinite(amt)){toast('请输入有效数字','err');return}
+  if(amt===0){toast('调整值为 0，未做修改','err');return}
+  const after=Math.round((before+amt)*10000)/10000;
+  state.scores[key]=after;
+  addLog(key,amt,'手动修正'+label+'余额 '+fmt(before)+' → '+fmt(after),'manual-adjust','',{before:before,after:after});
+  save();
+  toast(label+'已修正：'+fmt(before)+' → '+fmt(after));
+  render();
 }
 
 // ===== Tab =====
@@ -2913,7 +2930,7 @@ function renderBank(){
   if(!state.logs.length){
     ll.innerHTML='<div class="empty" style="padding:24px"><p style="margin:0">暂无记录</p></div>';
   }else{
-    const undoableSrc=['checkin','cost','purchase','achievement','loan-interest','loan-repay','delete-coll','delete-task','delete-ach','delete-domain','delete-prod','delete-shopcat','exempt','unlock','archive'];
+    const undoableSrc=['checkin','cost','purchase','achievement','loan-interest','loan-repay','manual-adjust','delete-coll','delete-task','delete-ach','delete-domain','delete-prod','delete-shopcat','exempt','unlock','archive'];
     ll.innerHTML=state.logs.slice(0,100).map(l=>{
       const isBoth=l.st==='both';
       const cls=l.amt>0?'pos'+(isBoth||l.st==='progress'?' p':l.st==='achievement'?' a':''):l.amt<0?'neg':'zero';
@@ -4764,6 +4781,11 @@ function undoLog(logId){
     }
     state.logs=state.logs.filter(l=>l.id!==logId);
     toast('已撤销还款，贷款已恢复');
+  }else if(log.src==='manual-adjust'){
+    // 撤销手动修正：反向应用调整值
+    state.scores[log.st]=(state.scores[log.st]||0)-log.amt;
+    state.logs=state.logs.filter(l=>l.id!==logId);
+    toast('已撤销余额修正');
   }else if(log.src==='delete-coll'){
     // Restore deleted collection
     if(log.collCopy){
