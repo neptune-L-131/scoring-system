@@ -726,7 +726,7 @@ body{
 
 /* ===== 阶段奖励：卡片进度条（10 格 + 5 长锚点） ===== */
 .stage-bar{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}
-.stage-track{position:relative;height:22px;cursor:pointer;touch-action:none}
+.stage-track{position:relative;height:22px;cursor:pointer;touch-action:pan-y}
 .stage-track::before{content:'';position:absolute;left:0;right:0;top:50%;height:2px;background:var(--border-2);transform:translateY(-50%);border-radius:1px}
 .stage-tick{position:absolute;top:50%;transform:translate(-50%,-50%);width:1px;height:8px;background:var(--text-3);pointer-events:none}
 .stage-tick.major{height:14px;width:1.5px;background:var(--text-2)}

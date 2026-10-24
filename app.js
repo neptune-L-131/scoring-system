@@ -2331,12 +2331,14 @@ function completeAffairStep(id,idx){
 
 // ===== 无步骤事务：进度轴拖拽推进 =====
 function initAffairAxes(){
+  const THRESH=8;
   document.querySelectorAll('.affair-axis.draggable').forEach(function(axis){
     const track=axis.querySelector('.stage-track');
     if(!track||track._affairBound)return;
     track._affairBound=true;
     const id=axis.dataset.affairId;
-    let dragging=false,pushed=false;
+    let startX=0,startY=0,startCell=0,pid=0;
+    let dragging=false,decided=false,abandoned=false,pushed=false;
     function setCellFromX(clientX){
       const a=state.affairs.find(function(x){return x.id===id;});
       if(!a||a.doneAt)return;
@@ -2344,7 +2346,7 @@ function initAffairAxes(){
       let p=(clientX-rect.left)/rect.width;
       p=Math.max(0,Math.min(1,p));
       let cell=Math.floor(p*10);if(cell>9)cell=9;if(cell<0)cell=0;
-      if(cell<=a.currentCell)return;
+      if(cell<=startCell)return;
       if(!pushed){affairPushUndo(a);pushed=true;}
       affairApplyProgress(a,cell);
       const thumb=track.querySelector('.stage-thumb');if(thumb)thumb.style.left=(cell*10+5)+'%';
@@ -2352,13 +2354,28 @@ function initAffairAxes(){
     track.addEventListener('pointerdown',function(e){
       const a=state.affairs.find(function(x){return x.id===id;});
       if(!a||a.doneAt)return;
-      if(track.setPointerCapture){try{track.setPointerCapture(e.pointerId);}catch(err){}}
-      dragging=true;pushed=false;
-      setCellFromX(e.clientX);
-      e.preventDefault();
+      startX=e.clientX;startY=e.clientY;pid=e.pointerId;
+      startCell=a.currentCell||0;
+      dragging=false;decided=false;abandoned=false;pushed=false;
     });
-    track.addEventListener('pointermove',function(e){if(dragging)setCellFromX(e.clientX);});
-    function end(){if(dragging){dragging=false;save();render();}}
+    track.addEventListener('pointermove',function(e){
+      if(e.pointerId!==pid||decided)return;
+      const dx=e.clientX-startX,dy=e.clientY-startY;
+      if(Math.abs(dx)<THRESH&&Math.abs(dy)<THRESH)return;
+      if(Math.abs(dx)>Math.abs(dy)){
+        decided=true;dragging=true;
+        if(track.setPointerCapture){try{track.setPointerCapture(pid);}catch(err){}}
+        e.preventDefault();
+        setCellFromX(e.clientX);
+      }else{
+        decided=true;abandoned=true;
+      }
+    });
+    function end(e){
+      if(e&&e.pointerId!==pid)return;
+      if(pushed){save();render();}
+      dragging=false;decided=false;abandoned=false;pushed=false;
+    }
     track.addEventListener('pointerup',end);
     track.addEventListener('pointercancel',end);
   });
@@ -2698,23 +2715,42 @@ function setStageFromX(track,tid,clientX){
   updateStageBar(track,tid,cell);
 }
 function initStageBars(){
+  const THRESH=8;
   document.querySelectorAll('.stage-bar[data-tid]').forEach(function(bar){
     const track=bar.querySelector('.stage-track');
     if(!track||track._stageBound)return;
     track._stageBound=true;
     const tid=bar.dataset.tid;
-    let dragging=false;
+    let startX=0,startY=0,pid=0;
+    let dragging=false,decided=false,abandoned=false,dirty=false;
     track.addEventListener('pointerdown',function(e){
       if(!state.tasks.find(x=>x.id===tid))return;
-      if(track.setPointerCapture){try{track.setPointerCapture(e.pointerId);}catch(err){}}
-      dragging=true;
-      setStageFromX(track,tid,e.clientX);
-      e.preventDefault();
+      startX=e.clientX;startY=e.clientY;pid=e.pointerId;
+      dragging=false;decided=false;abandoned=false;dirty=false;
     });
-    track.addEventListener('pointermove',function(e){if(dragging)setStageFromX(track,tid,e.clientX);});
-    function end(){if(dragging){dragging=false;save();}}
-    track.addEventListener('pointerup',end);
-    track.addEventListener('pointercancel',end);
+    track.addEventListener('pointermove',function(e){
+      if(e.pointerId!==pid||decided)return;
+      const dx=e.clientX-startX,dy=e.clientY-startY;
+      if(Math.abs(dx)<THRESH&&Math.abs(dy)<THRESH)return;
+      if(Math.abs(dx)>Math.abs(dy)){
+        decided=true;dragging=true;
+        if(track.setPointerCapture){try{track.setPointerCapture(pid);}catch(err){}}
+        e.preventDefault();
+        setStageFromX(track,tid,e.clientX);
+        dirty=true;
+      }else{
+        decided=true;abandoned=true;
+      }
+    });
+    track.addEventListener('pointerup',function(e){
+      if(e.pointerId!==pid)return;
+      if(dirty)save();
+      dragging=false;decided=false;abandoned=false;dirty=false;
+    });
+    track.addEventListener('pointercancel',function(e){
+      if(e.pointerId!==pid)return;
+      dragging=false;decided=false;abandoned=false;dirty=false;
+    });
   });
 }
 
