@@ -35,6 +35,13 @@ function stageValues(t,type){const sr=stageRewards(t);if(!sr)return null;const a
 function stageSel(t){const sr=stageRewards(t);const l=sr&&typeof sr.last==='number'?sr.last:0;return Math.max(0,Math.min(9,Math.round(l)));}
 function stageValueAt(t,type,cell){const v=stageValues(t,type);if(!v)return 0;if(cell>=9)return v[4]+(v[4]-v[3])/2;const i=cell>>1,rem=cell&1;return rem?(v[i]+v[i+1])/2:v[i];}
 function stageCellLabel(cell){if(cell<=8&&cell%2===0)return STAGE_NAMES[cell/2];return STAGE_NAMES[Math.min(4,(cell-1)>>1)]+'+';}
+// 阶段任务结算：档位值 + 连胜利息(初始值×利率×(连胜-1)) - 待扣债；待扣债 > 初始值时本次收益为 0
+function stageNetAt(t,type,cell,c){
+  const base=stageValueAt(t,type,cell);
+  const info=c||calcCheckIn(t);
+  if((info.debt||0)>(t.initialValue||0))return 0;
+  return Math.max(0,base+(info.bonus||0)-(info.debt||0));
+}
 function round2(v){return Math.round(v*100)/100;}
 // 日志金额：both 型且两分值不同时用 amtV/amtP 分别表达，否则回退到单一 amt
 function logAmt(l,type){
@@ -330,6 +337,17 @@ function idbPut(key,val){
     return new Promise(function(resolve,reject){
       const tx=db.transaction(IDB_STORE,'readwrite');
       tx.objectStore(IDB_STORE).put(val,key);
+      tx.oncomplete=function(){resolve();};
+      tx.onerror=function(){reject(tx.error);};
+    });
+  });
+}
+
+function idbDelete(key){
+  return openIDB().then(function(db){
+    return new Promise(function(resolve,reject){
+      const tx=db.transaction(IDB_STORE,'readwrite');
+      tx.objectStore(IDB_STORE).delete(key);
       tx.oncomplete=function(){resolve();};
       tx.onerror=function(){reject(tx.error);};
     });
@@ -813,12 +831,15 @@ function checkIn(taskId,stageIdx){
   const staged=taskIsStaged(t);
 
   // 阶段任务按选中档位结算；否则保持单档结算（初始值 + 连胜 - 债务）
+  // 记录打卡前的档位，便于撤销时恢复
+  const prevStageLast=(staged&&t.stageRewards&&typeof t.stageRewards.last==='number')?t.stageRewards.last:null;
+
   let netV=0,netP=0,stageName=null;
   if(staged){
     const cell=(typeof stageIdx==='number')?Math.max(0,Math.min(9,Math.round(stageIdx))):stageSel(t);
     if(t.stageRewards)t.stageRewards.last=cell;
-    netV=hasV?stageValueAt(t,'vitality',cell):0;
-    netP=hasP?stageValueAt(t,'progress',cell):0;
+    netV=hasV?stageNetAt(t,'vitality',cell,c):0;
+    netP=hasP?stageNetAt(t,'progress',cell,c):0;
     stageName=stageCellLabel(cell);
   }else{
     netV=hasV?c.net:0;
@@ -873,7 +894,7 @@ function checkIn(taskId,stageIdx){
   if(cost>0)desc+=' (消耗活力-'+fmt(cost)+')';
 
   // Manually insert with known ID for linking, plus undo metadata
-  const entry={id:checkinLogId,time:now(),st:st,amt:0,desc:desc,src:'checkin',dom:dids.join(','),taskId:t.id,prevStreak:prevStreak,prevLastCheckIn:prevLastCheckIn,prevLastDebtDate:prevLastDebtDate,prevPendingDebt:prevPendingDebt};
+  const entry={id:checkinLogId,time:now(),st:st,amt:0,desc:desc,src:'checkin',dom:dids.join(','),taskId:t.id,prevStreak:prevStreak,prevLastCheckIn:prevLastCheckIn,prevLastDebtDate:prevLastDebtDate,prevPendingDebt:prevPendingDebt,prevStageLast:prevStageLast};
   if(hasV&&hasP&&netV!==netP){
     entry.amtV=netV;entry.amtP=netP;entry.amt=netV;
   }else{
@@ -1058,6 +1079,7 @@ function renameDomain(id){
 }
 
 // ===== Task CRUD =====
+let pendingTaskSave=null;
 function saveTaskData(data){
   const recalc=data.recalc;
   delete data.recalc; // don't store on task object
@@ -1065,40 +1087,30 @@ function saveTaskData(data){
   if(data.id){
     const t=state.tasks.find(x=>x.id===data.id);
     if(!t)return;
-    
-    // If recalc requested, undo old scores before applying new params
-    if(recalc){
-      recalcTaskHistory(t, data);
-    }else{
-      // Migrate accumulated progress when a progress-type task changes domains
-      if(taskHasType(t,'progress')&&(data.scoreTypes||[]).indexOf('progress')>=0){
-        const oldDids=getTaskDomainIds(t);
-        const newDids=data.domainIds||['d_default'];
-        const oldSet=new Set(oldDids);
-        const newSet=new Set(newDids);
-        // Only migrate if domain set actually changed
-        const changed=oldDids.length!==newDids.length||oldDids.some(d=>!newSet.has(d));
-        if(changed){
-          const earned=t.totalEarned||0;
-          if(earned!==0){
-            // Undo from old domains (split equally as it was applied)
-            const oldShare=earned/oldDids.length;
-            oldDids.forEach(did=>{
-              state.scores.progress[did]=(state.scores.progress[did]||0)-oldShare;
-            });
-            // Add to new domains (split equally)
-            const newShare=earned/newDids.length;
-            newDids.forEach(did=>{
-              state.scores.progress[did]=(state.scores.progress[did]||0)+newShare;
-            });
-          }
-        }
+
+    // 领域变更：让用户选择历史累计分数与流水的处理方式
+    const oldDids=getTaskDomainIds(t);
+    const newDids=data.domainIds||['d_default'];
+    const oldSet=new Set(oldDids);
+    const newSet=new Set(newDids);
+    const domainChanged=oldDids.some(d=>!newSet.has(d))||newDids.some(d=>!oldSet.has(d));
+    if(!recalc&&domainChanged){
+      pendingTaskSave={taskId:t.id,data:data,oldDids:oldDids,newDids:newDids};
+      const msg=document.getElementById('domainChangeMsg');
+      if(msg){
+        msg.textContent='任务「'+data.name+'」的领域由「'+oldDids.map(domainName).join('、')+'」变更为「'+newDids.map(domainName).join('、')+'」。请选择历史累计分数与流水的处理方式：';
       }
+      openModal('domainChangeModal');
+      return false;
     }
-    
-    Object.assign(t,data);
-    if(!data.stageRewards)delete t.stageRewards;
-    addLog('',0,'修改任务「'+data.name+'」','edit');
+
+    finalizeTaskSave(t,data,{
+      recalc:recalc,
+      domainMode:(recalc&&domainChanged)?'recalc':null,
+      oldDids:oldDids,
+      newDids:newDids
+    });
+    return true;
   }else{
     const nt={
       id:uid(),name:data.name,description:data.description||'',scoreTypes:data.scoreTypes||['vitality'],
@@ -1110,7 +1122,60 @@ function saveTaskData(data){
     if(data.stageRewards)nt.stageRewards=data.stageRewards;
     state.tasks.push(nt);
     addLog('',0,'创建任务「'+data.name+'」','create');
+    save();
+    return true;
   }
+}
+
+// 领域变更弹窗的两个选项
+function resolveDomainChange(mode){
+  const p=pendingTaskSave;
+  pendingTaskSave=null;
+  closeModal('domainChangeModal');
+  if(!p)return;
+  const t=state.tasks.find(x=>x.id===p.taskId);
+  if(!t)return;
+  finalizeTaskSave(t,p.data,{recalc:false,domainMode:mode,oldDids:p.oldDids,newDids:p.newDids});
+  closeModal('taskModal');
+  toast('任务已更新（'+(mode==='migrate'?'连同历史迁移':'仅影响未来')+'）');
+  render();
+}
+function cancelDomainChange(){
+  pendingTaskSave=null;
+  closeModal('domainChangeModal');
+}
+
+function finalizeTaskSave(t,data,opts){
+  if(opts.recalc){
+    recalcTaskHistory(t,data);
+  }else if(opts.domainMode==='migrate'){
+    // 1) 该任务的全部打卡流水改到新领域
+    state.logs.forEach(l=>{
+      if(l.src==='checkin'&&l.taskId===t.id)l.dom=opts.newDids.join(',');
+    });
+    // 2) 累计进度值从旧领域搬到新领域（按原分摊方式等分）
+    if(taskHasType(t,'progress')&&(data.scoreTypes||[]).indexOf('progress')>=0){
+      const earned=t.totalEarned||0;
+      if(earned!==0&&opts.oldDids.length&&opts.newDids.length){
+        const oldShare=earned/opts.oldDids.length;
+        opts.oldDids.forEach(did=>{
+          state.scores.progress[did]=(state.scores.progress[did]||0)-oldShare;
+        });
+        const newShare=earned/opts.newDids.length;
+        opts.newDids.forEach(did=>{
+          state.scores.progress[did]=(state.scores.progress[did]||0)+newShare;
+        });
+      }
+    }
+  }
+
+  Object.assign(t,data);
+  if(!data.stageRewards)delete t.stageRewards;
+  if(opts.domainMode){
+    const modeLabel=opts.domainMode==='migrate'?'连同历史迁移':(opts.domainMode==='future'?'仅影响未来':'重算历史');
+    addLog('',0,'任务「'+data.name+'」领域变更：'+modeLabel,'task-domain','',{taskId:t.id,oldDomains:opts.oldDids,newDomains:opts.newDids,mode:opts.domainMode});
+  }
+  addLog('',0,'修改任务「'+data.name+'」','edit');
   save();
 }
 
@@ -1186,7 +1251,8 @@ function recalcTaskHistory(t, newData){
       state.scores.vitality-=newCost;
     }
     
-    // Update log entry
+    // Update log entry（清除旧的双分值字段，避免统计仍读到旧值）
+    delete log.amtV;delete log.amtP;
     log.amt=net;
     log.st=(newScoreTypes.indexOf('vitality')>=0&&newScoreTypes.indexOf('progress')>=0)?'both':(newScoreTypes.indexOf('progress')>=0?'progress':'vitality');
     log.dom=newScoreTypes.indexOf('progress')>=0?newDids.join(','):'';
@@ -1425,7 +1491,7 @@ function buyProduct(id){
       date:now()
     });
   }
-  addLog(p.currency,-p.price,desc,'purchase','',{prodId:p.id,loanId:willLoan?loanId:''});
+  addLog(p.currency,-p.price,desc,'purchase','',{prodId:p.id,loanId:willLoan?loanId:'',loanAmt:willLoan?loanAmt:0});
   save();
   processDailyTaskDebts();
   processLoans();
@@ -1591,6 +1657,69 @@ function manualAdjustBalance(){
   save();
   toast(label+'已修正：'+fmt(before)+' → '+fmt(after));
   render();
+}
+
+// ===== 清除数据 =====
+// 只清除数据成果，保留任务/事务/商品/周期/领域/集合等全部设定
+function clearDataResults(){
+  state.scores={vitality:0,progress:{},achievement:0};
+  state.loans=[];
+  state.logs=[];
+  state.cards={exemption:0};
+  state.lastDebtDate=null;
+  state.affairUndo={};
+
+  state.tasks.forEach(t=>{
+    t.checkInCount=0;
+    t.streak=0;
+    t.lastCheckIn=null;
+    t.totalEarned=0;
+    t.pendingDebt=0;
+    t.archived=false;
+    delete t.archivedAt;
+    delete t.lastDebtDate;
+    // 保留阶段奖励数值（v/p），只把当前档位归零
+    if(t.stageRewards&&typeof t.stageRewards.last==='number')t.stageRewards.last=0;
+  });
+
+  state.affairs.forEach(a=>{
+    a.currentCell=0;
+    a.alreadyGiven=0;
+    a.doneAt=null;
+    a.startedAt=null;
+    if(Array.isArray(a.steps))a.steps.forEach(s=>{s.doneAt=null;});
+  });
+
+  state.achievements.forEach(a=>{a.unlocked=false;a.unlockedAt=null;});
+
+  state.products.forEach(p=>{
+    const sold=p.sold||0;
+    p.stock=(p.stock===-1||p.stock===undefined||p.stock===null)?-1:(p.stock||0)+sold;
+    p.sold=0;
+  });
+
+  state.activities.forEach(act=>{act.lastRun=null;});
+
+  closeModal('clearDataModal');
+  save();
+  render();
+  toast('已清除数据成果，所有设定已保留');
+}
+
+// 彻底重置，效果等同于从未使用过本应用（主题设置保留）
+function clearEverything(){
+  state=defaults();
+  affairView='list';
+  affairCalCursor=null;
+  affairCalSelected=null;
+  affairDoneOpen=false;
+  loadIssue=null;
+  save();
+  idbDelete(KEY+'_corrupt').catch(function(){});
+  const rb=document.getElementById('recoverBar');if(rb)rb.style.display='none';
+  closeModal('clearDataModal');
+  render();
+  toast('已清除全部设置与数据');
 }
 
 // ===== Tab =====
@@ -2601,14 +2730,17 @@ function stageBarHTML(t){
   const cell=stageSel(t);
   const hasV=taskHasType(t,'vitality');
   const hasP=taskHasType(t,'progress');
-  let reward='+'+fmt(hasV?stageValueAt(t,'vitality',cell):stageValueAt(t,'progress',cell));
-  reward+=hasV&&hasP?(' 活力 / +'+fmt(stageValueAt(t,'progress',cell))+' 进度'):(hasV?' 活力':' 进度');
+  // 阶段预览显示实际结算值：档位值 + 连胜利息 - 待扣债
+  const c=calcCheckIn(t);
+  let reward='+'+fmt(hasV?stageNetAt(t,'vitality',cell,c):stageNetAt(t,'progress',cell,c));
+  reward+=hasV&&hasP?(' 活力 / +'+fmt(stageNetAt(t,'progress',cell,c))+' 进度'):(hasV?' 活力':' 进度');
   const label=stageCellLabel(cell);
   let ticks='';
   for(let i=0;i<10;i++){ticks+='<i class="stage-tick'+(i%2===0?' major':'')+'" style="left:'+(i*10)+'%"></i>';}
   const anchorLabels=STAGE_NAMES.map((n,k)=>'<span'+(k===(cell>>1)?' class="on"':'')+' style="left:'+(k*20)+'%">'+n+'</span>').join('');
   let curStreak=t.streak||0;if(curStreak===0&&t.lastCheckIn)curStreak=1;
-  let meta='';if(curStreak>0)meta+='连胜'+curStreak+'天';
+  let meta='';if(c.bonus>0)meta+='利息+'+fmt(c.bonus);
+  if(curStreak>0)meta+=(meta?' · ':'')+'连胜'+curStreak+'天';
   const pend=t.pendingDebt||0;if(pend>0)meta+=(meta?' · ':'')+'待扣债'+fmt(pend);
   return '<div class="stage-bar" data-tid="'+t.id+'">'
     +'<div class="stage-track">'+ticks+'<div class="stage-thumb" style="left:'+(cell*10+5)+'%"></div></div>'
@@ -2713,10 +2845,12 @@ function updateStageBar(track,tid,cell){
     const preview=bar.querySelector('.stage-preview');
     if(preview){
       const hasV=taskHasType(t,'vitality'),hasP=taskHasType(t,'progress');
-      let reward='+'+fmt(hasV?stageValueAt(t,'vitality',cell):stageValueAt(t,'progress',cell));
-      reward+=hasV&&hasP?(' 活力 / +'+fmt(stageValueAt(t,'progress',cell))+' 进度'):(hasV?' 活力':' 进度');
+      const cc=calcCheckIn(t);
+      let reward='+'+fmt(hasV?stageNetAt(t,'vitality',cell,cc):stageNetAt(t,'progress',cell,cc));
+      reward+=hasV&&hasP?(' 活力 / +'+fmt(stageNetAt(t,'progress',cell,cc))+' 进度'):(hasV?' 活力':' 进度');
       let cs=t.streak||0;if(cs===0&&t.lastCheckIn)cs=1;
-      let meta='';if(cs>0)meta+='连胜'+cs+'天';
+      let meta='';if(cc.bonus>0)meta+='利息+'+fmt(cc.bonus);
+      if(cs>0)meta+=(meta?' · ':'')+'连胜'+cs+'天';
       const pend2=t.pendingDebt||0;if(pend2>0)meta+=(meta?' · ':'')+'待扣债'+fmt(pend2);
       preview.textContent=stageCellLabel(cell)+' · '+reward+(meta?' · '+meta:'');
     }
@@ -4714,6 +4848,10 @@ function undoLog(logId){
           delete t.lastDebtDate;
         }
         t.pendingDebt=log.prevPendingDebt||0;
+        // 恢复打卡前的阶段档位
+        if(log.prevStageLast!==null&&log.prevStageLast!==undefined&&t.stageRewards){
+          t.stageRewards.last=log.prevStageLast;
+        }
       }
     }
     // Also reverse any linked cost log (restore vitality)
@@ -4735,8 +4873,9 @@ function undoLog(logId){
     state.logs=state.logs.filter(l=>l.id!==logId);
     toast('已撤销');
   }else if(log.src==='purchase'){
-    // Refund and restore stock
-    state.scores[log.st]=(state.scores[log.st]||0)+Math.abs(log.amt);
+    // Refund and restore stock. 贷款购买时只退自付部分，避免把贷款额一起退回。
+    const paidPart=Math.abs(log.amt)-(typeof log.loanAmt==='number'?log.loanAmt:0);
+    state.scores[log.st]=(state.scores[log.st]||0)+paidPart;
     if(log.prodId){
       const p=state.products.find(x=>x.id===log.prodId);
       if(p){
@@ -5210,7 +5349,8 @@ function handleTaskSave(){
   const prevTask=id?state.tasks.find(x=>x.id===id):null;
   const wasStaged=prevTask&&taskIsStaged(prevTask);
   const recalc=id?((document.getElementById('taskRecalc').checked)&&!wasStaged&&!editStage.enabled):false;
-  saveTaskData({id:id||null,name:name,description:description,scoreTypes:editTypes.slice(),domainIds:domainIds,collectionId:collectionId,initialValue:initialValue,interestRate:interestRate,debtRate:debtRate,vitalityCost:vitalityCost,stageRewards:stageRewards,recalc:recalc});
+  const saved=saveTaskData({id:id||null,name:name,description:description,scoreTypes:editTypes.slice(),domainIds:domainIds,collectionId:collectionId,initialValue:initialValue,interestRate:interestRate,debtRate:debtRate,vitalityCost:vitalityCost,stageRewards:stageRewards,recalc:recalc});
+  if(!saved)return;
   closeModal('taskModal');
   toast(id?(recalc?'任务已更新，历史数据已重算':'任务已更新'):'任务已创建');
   render();

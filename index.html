@@ -174,7 +174,7 @@
   </div>
   <div class="chart-tooltip" id="chartTooltip" style="display:none"></div>
 
-  <div class="sec-head"><div class="sec-title">流水记录</div><div style="display:flex;gap:6px;align-items:center"><button class="btn btn-sm" onclick="manualAdjustBalance()">手动修正余额</button><div class="sec-meta" id="logMeta"></div></div></div>
+  <div class="sec-head"><div class="sec-title">流水记录</div><div style="display:flex;gap:6px;align-items:center"><button class="btn btn-sm" onclick="manualAdjustBalance()">手动修正余额</button><button class="btn btn-sm btn-danger" onclick="openModal('clearDataModal')">清除</button><div class="sec-meta" id="logMeta"></div></div></div>
   <div class="log-list" id="logList"></div>
 </div>
 
@@ -582,6 +582,32 @@
       <button class="btn" onclick="doDeleteActivity(false)">删除并保留历史获得</button>
       <button class="btn btn-danger" onclick="doDeleteActivity(true)">删除并撤销历史获得</button>
       <button class="btn" onclick="closeModal('activityDeleteModal')">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Domain Change Modal ===== -->
+<div class="modal-bg" id="domainChangeModal">
+  <div class="modal">
+    <h2>任务领域已变更</h2>
+    <p style="font-size:13px;color:var(--text-2);line-height:1.7;margin-bottom:18px" id="domainChangeMsg"></p>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <button class="btn" onclick="resolveDomainChange('future')">只影响未来（历史分数留在原领域）</button>
+      <button class="btn" onclick="resolveDomainChange('migrate')">连同历史一起迁移</button>
+      <button class="btn" onclick="cancelDomainChange()">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Clear Data Modal ===== -->
+<div class="modal-bg" id="clearDataModal">
+  <div class="modal">
+    <h2>清除数据</h2>
+    <p style="font-size:13px;color:var(--text-2);line-height:1.7;margin-bottom:18px">请选择清除范围。此操作不可撤销，建议先导出备份。</p>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <button class="btn" onclick="clearDataResults()">清除数据成果（保留所有设定）</button>
+      <button class="btn btn-danger" onclick="clearEverything()">清除一切设置与数据</button>
+      <button class="btn" onclick="closeModal('clearDataModal')">取消</button>
     </div>
   </div>
 </div>
