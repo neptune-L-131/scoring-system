@@ -58,15 +58,36 @@
   <!-- Domain pills -->
   <div class="domain-pills" id="domainPills"></div>
 
-  <!-- ==================== 事务（GTD 待办） ==================== -->
-  <div class="major-group" id="major_affair">
+  <!-- ==================== 杂事（极简清单） ==================== -->
+  <div class="major-group" id="major_chore">
     <div class="sec-head sec-head-major major-head">
-      <div class="sec-title major-title" onclick="toggleMajor('affair')"><span class="major-toggle">▼</span>事务</div>
-      <div class="sec-meta" id="affairMeta"></div>
+      <div class="sec-title major-title" onclick="toggleMajor('chore')"><span class="major-toggle">▼</span>杂事</div>
+      <div style="display:flex;gap:6px;align-items:center">
+        <div class="sec-meta" id="choreMeta"></div>
+        <button class="btn btn-sm" onclick="openChoreConfigModal()">⚙ 经济设置</button>
+      </div>
     </div>
     <div class="major-body">
       <div class="affair-quick-add">
-        <input type="text" id="affairInput" placeholder="输入事务名称，回车创建草稿" maxlength="40" autocomplete="off" onkeydown="if(event.key==='Enter'){addAffairFromInput();}">
+        <input type="text" id="choreInput" placeholder="写下杂事，回车即添加" maxlength="60" autocomplete="off" onkeydown="if(event.key==='Enter'){addChoreFromInput();}">
+        <button class="btn btn-sm" onclick="addChoreFromInput()">添加</button>
+      </div>
+      <div id="chorePanel"></div>
+    </div>
+  </div>
+
+  <!-- ==================== 项目（完整项目结构） ==================== -->
+  <div class="major-group" id="major_affair">
+    <div class="sec-head sec-head-major major-head">
+      <div class="sec-title major-title" onclick="toggleMajor('affair')"><span class="major-toggle">▼</span>项目</div>
+      <div style="display:flex;gap:6px;align-items:center">
+        <div class="sec-meta" id="affairMeta"></div>
+        <button class="btn btn-sm" onclick="openAffairModal()">+ 新建项目</button>
+      </div>
+    </div>
+    <div class="major-body">
+      <div class="affair-quick-add">
+        <input type="text" id="affairInput" placeholder="输入项目名称，回车创建草稿" maxlength="40" autocomplete="off" onkeydown="if(event.key==='Enter'){addAffairFromInput();}">
         <button class="btn btn-sm" onclick="addAffairFromInput()">添加</button>
       </div>
       <div id="affairPanel"></div>
@@ -329,18 +350,18 @@
 <!-- ===== Affair (事务) Modal ===== -->
 <div class="modal-bg" id="affairModal">
   <div class="modal">
-    <h2 id="affairModalTitle">新建事务</h2>
+    <h2 id="affairModalTitle">新建项目</h2>
     <input type="hidden" id="affairId">
     <div class="fg">
       <label>套用预设 <span class="h">选择后自动填充总奖励、曲线与成果点，仍可手动微调</span></label>
       <select id="affairPresetSel" onchange="applyAffairPreset()"></select>
     </div>
     <div class="fg">
-      <label>事务名称</label>
+      <label>项目名称</label>
       <input type="text" id="affairName" placeholder="例如：报销上月差旅" maxlength="40" autocomplete="off">
     </div>
     <div class="fg">
-      <label>关联领域 <span class="h">选择后完成事务给该领域加进度值；不选则加活力点</span></label>
+      <label>关联领域 <span class="h">选择后完成项目给该领域加进度值；不选则加活力点</span></label>
       <select id="affairDomain"></select>
     </div>
     <div class="fg">
@@ -393,7 +414,7 @@
       <input type="text" id="presetName" placeholder="例如：轻量日常" maxlength="40" autocomplete="off">
     </div>
     <div class="fg">
-      <label>总奖励 <span class="h">套用后的事务累计可获得总额</span></label>
+      <label>总奖励 <span class="h">套用后的项目累计可获得总额</span></label>
       <input type="number" id="presetReward" step="0.1" min="0" placeholder="例如 1" oninput="presetCurveRefresh()">
     </div>
     <div class="fg">
@@ -435,6 +456,70 @@
     <div class="modal-foot">
       <button class="btn" onclick="closeModal('affairPlanModal')">取消</button>
       <button class="btn" id="affairPlanSaveBtn">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Chore Modal（杂事编辑） ===== -->
+<div class="modal-bg" id="choreModal">
+  <div class="modal">
+    <h2 id="choreModalTitle">编辑杂事</h2>
+    <input type="hidden" id="choreId">
+    <div class="fg">
+      <label>名称</label>
+      <input type="text" id="choreName" maxlength="60" autocomplete="off">
+    </div>
+    <div class="fg">
+      <label>日期 <span class="h">可选；设置后保鲜期从该日期起算</span></label>
+      <input type="date" id="choreDate">
+    </div>
+    <div class="fg">
+      <label>保鲜期覆盖 <span class="h">留空则使用全局默认（当前 <span id="choreFreshDefaultHint">7</span> 天）</span></label>
+      <input type="number" id="choreFreshDays" min="0" step="1" placeholder="留空 = 跟随全局设置">
+    </div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal('choreModal')">取消</button>
+      <button class="btn btn-danger" id="choreDelBtn" style="display:none" onclick="delChore()">删除</button>
+      <button class="btn" id="choreSaveBtn">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Chore Config Modal（杂事经济设置） ===== -->
+<div class="modal-bg" id="choreConfigModal">
+  <div class="modal">
+    <h2>杂事经济设置</h2>
+    <p style="font-size:13px;color:var(--text-2);line-height:1.7;margin-bottom:16px">统一配置，保存后作为所有杂事的默认。单件杂事可在编辑弹窗中覆盖保鲜期。</p>
+    <div class="fg">
+      <label>保鲜期（天） <span class="h">超过后开始累积腐化债</span></label>
+      <input type="number" id="choreCfgFresh" min="0" step="1" oninput="choreCfgInputPreview()">
+    </div>
+    <div class="fg">
+      <label>批量结算 <span class="h">单件完成不发放活力点</span></label>
+      <div class="cfg-inline">
+        <span>每</span><input type="number" id="choreCfgN" min="1" step="1" oninput="choreCfgInputPreview()"><span>件 → +</span><input type="number" id="choreCfgY" min="0" step="1" oninput="choreCfgInputPreview()"><span>活力点</span>
+      </div>
+    </div>
+    <div class="fg">
+      <label>腐化档位 <span class="h">按超期件数匹配档位，每件每天按对应系数累积，静默从活力点扣除</span></label>
+      <div class="cfg-tier-row">
+        <span>1 – <input type="number" id="choreCfgT1Max" min="1" step="1" oninput="choreCfgInputPreview()"> 件</span>
+        <span>每件每天 <input type="number" id="choreCfgT1Rate" min="0" step="0.1" oninput="choreCfgInputPreview()"></span>
+      </div>
+      <div class="cfg-tier-row">
+        <span>至 <input type="number" id="choreCfgT2Max" min="1" step="1" oninput="choreCfgInputPreview()"> 件</span>
+        <span>每件每天 <input type="number" id="choreCfgT2Rate" min="0" step="0.1" oninput="choreCfgInputPreview()"></span>
+      </div>
+      <div class="cfg-tier-row">
+        <span>超过上一档</span>
+        <span>每件每天 <input type="number" id="choreCfgT3Rate" min="0" step="0.1" oninput="choreCfgInputPreview()"></span>
+      </div>
+      <div class="curve-preview" id="choreCfgPreview"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal('choreConfigModal')">取消</button>
+      <button class="btn" onclick="resetChoreConfig()">恢复默认</button>
+      <button class="btn" id="choreCfgSaveBtn">保存</button>
     </div>
   </div>
 </div>

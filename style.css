@@ -835,6 +835,40 @@ body{
 .affair-menu button:disabled{color:var(--text-3);cursor:default;background:none}
 .affair-menu button.danger{color:var(--danger)}
 
+/* ===== 杂事（极简清单） ===== */
+.chore-econ-bar{
+  display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;
+  font-size:11px;color:var(--text-3);
+  background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+  padding:7px 10px;margin-bottom:10px;
+}
+.chore-econ-bar b{color:var(--vitality);font-weight:600}
+.chore-card{display:flex;align-items:flex-start;gap:10px;padding:11px 12px;cursor:pointer}
+.chore-card.overdue{border-color:var(--danger)}
+.chore-card.done{opacity:.55}
+.chore-check{display:flex;align-items:center;justify-content:center;flex-shrink:0;padding:1px 0;cursor:pointer}
+.chore-check input{width:19px;height:19px;margin:0;accent-color:var(--vitality);cursor:pointer}
+.chore-main{flex:1;min-width:0}
+.chore-name{font-size:14px;font-weight:500;color:var(--text);overflow-wrap:anywhere;line-height:1.35}
+.chore-card.done .chore-name{color:var(--text-3);text-decoration:line-through}
+.chore-meta{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:3px}
+.chore-date{font-size:11px;color:var(--text-3)}
+.chore-overdue{font-size:11px;color:var(--danger);font-weight:600}
+#choreDate{
+  width:100%;font-family:inherit;font-size:14px;border:1px solid var(--border-2);border-radius:var(--radius);
+  padding:8px 11px;color:var(--text);background:var(--surface);
+}
+#choreDate:focus{outline:none;border-color:var(--text-3)}
+/* 杂事经济设置 */
+.fg .cfg-inline input,.fg .cfg-tier-row input{
+  width:72px;background:var(--surface-2);border:1px solid var(--border-2);border-radius:7px;
+  color:var(--text);font-size:13px;font-family:inherit;padding:6px 9px;outline:none;
+}
+.fg .cfg-inline input:focus,.fg .cfg-tier-row input:focus{border-color:var(--text-3)}
+.cfg-inline{display:flex;align-items:center;gap:7px;flex-wrap:wrap;font-size:13px;color:var(--text-2)}
+.cfg-tier-row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:13px;color:var(--text-2);margin-bottom:8px}
+.cfg-tier-row span{display:flex;align-items:center;gap:6px}
+
 /* 预设成果点输入 */
 #presetAchAmountRow input{width:100%;background:var(--surface-2);border:1px solid var(--border-2);border-radius:7px;color:var(--text);font-size:13px;font-family:inherit;padding:7px 10px;outline:none}
 #presetAchAmountRow input:focus{border-color:var(--text-3)}

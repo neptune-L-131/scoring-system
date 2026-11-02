@@ -19,6 +19,7 @@ let affairView='list';
 let affairCalCursor=null;
 let affairCalSelected=null;
 let affairDoneOpen=false;
+let choreDoneOpen=false;
 let editAffairSteps=[];
 function loadStagePresets(){
   const p={stepPct:50,decreasePct:100};
@@ -205,6 +206,48 @@ function migrateActivities(p){
   }
   return defs;
 }
+// ===== 杂事经济配置（统一默认，可被单件杂事覆盖保鲜期）=====
+function defaultChoreConfig(){
+  return{
+    freshDays:7,
+    batchN:5,
+    batchY:5,
+    tier1Max:3,
+    tier1Rate:0.2,
+    tier2Max:7,
+    tier2Rate:1,
+    tier3Rate:3
+  };
+}
+function normalizeChoreConfig(c){
+  const d=defaultChoreConfig();
+  c=c||{};
+  function n(v,def,min){v=Number(v);if(!isFinite(v))return def;return v<min?min:v;}
+  return{
+    freshDays:Math.round(n(c.freshDays,d.freshDays,0)),
+    batchN:Math.max(1,Math.round(n(c.batchN,d.batchN,1))),
+    batchY:n(c.batchY,d.batchY,0),
+    tier1Max:Math.max(1,Math.round(n(c.tier1Max,d.tier1Max,1))),
+    tier1Rate:n(c.tier1Rate,d.tier1Rate,0),
+    tier2Max:Math.max(1,Math.round(n(c.tier2Max,d.tier2Max,1))),
+    tier2Rate:n(c.tier2Rate,d.tier2Rate,0),
+    tier3Rate:n(c.tier3Rate,d.tier3Rate,0)
+  };
+}
+function migrateChore(c){
+  if(!c)return c;
+  if(!c.id)c.id=uid();
+  if(typeof c.name!=='string')c.name=String(c.name||'');
+  c.done=!!c.done;
+  c.doneAt=c.doneAt||null;
+  c.plannedAt=c.plannedAt||null;
+  c.createdAt=c.createdAt||now();
+  c.settled=!!c.settled;
+  c.decayKey=c.decayKey||null;
+  if(c.freshDays===undefined||c.freshDays===null||c.freshDays===''||isNaN(Number(c.freshDays)))c.freshDays=null;
+  else c.freshDays=Math.max(0,Math.round(Number(c.freshDays)));
+  return c;
+}
 function defaults(){
   return{
     scores:{vitality:0,progress:{},achievement:0},
@@ -217,6 +260,8 @@ function defaults(){
     majorCollapsed:[],
     tasks:[],achievements:[],products:[],logs:[],
     affairs:[],
+    chores:[],
+    choreConfig:defaultChoreConfig(),
     affairPresets:[],
     affairCollapsed:[],
     affairUndo:{},
@@ -288,6 +333,8 @@ function parseState(raw){
       majorCollapsed:p.majorCollapsed||[],
       tasks:tasks,achievements:p.achievements||[],
       affairs:Array.isArray(p.affairs)?p.affairs.map(migrateAffair):[],
+      chores:Array.isArray(p.chores)?p.chores.map(migrateChore):[],
+      choreConfig:normalizeChoreConfig(p.choreConfig),
       affairPresets:Array.isArray(p.affairPresets)?p.affairPresets:[],
       affairCollapsed:p.affairCollapsed||[],
       affairUndo:p.affairUndo||{},
@@ -735,6 +782,7 @@ function schedulerTick(){
   processDailyTaskDebts();
   processMetabolism();
   processLoans();
+  processChoreDecay();
   render();
 }
 
@@ -1660,7 +1708,7 @@ function manualAdjustBalance(){
 }
 
 // ===== 清除数据 =====
-// 只清除数据成果，保留任务/事务/商品/周期/领域/集合等全部设定
+// 只清除数据成果，保留任务/项目/杂事/商品/周期/领域/集合等全部设定
 function clearDataResults(){
   state.scores={vitality:0,progress:{},achievement:0};
   state.loans=[];
@@ -1690,6 +1738,15 @@ function clearDataResults(){
     if(Array.isArray(a.steps))a.steps.forEach(s=>{s.doneAt=null;});
   });
 
+  // 杂事：清空完成与腐化记录，保留杂事定义与经济配置
+  (state.chores||[]).forEach(c=>{
+    c.done=false;
+    c.doneAt=null;
+    c.settled=false;
+    c.decayKey=dayKey(now()); // 腐化从今天重新起算，不追溯历史
+  });
+  choreDoneOpen=false;
+
   state.achievements.forEach(a=>{a.unlocked=false;a.unlockedAt=null;});
 
   state.products.forEach(p=>{
@@ -1713,6 +1770,7 @@ function clearEverything(){
   affairCalCursor=null;
   affairCalSelected=null;
   affairDoneOpen=false;
+  choreDoneOpen=false;
   loadIssue=null;
   save();
   idbDelete(KEY+'_corrupt').catch(function(){});
@@ -1801,6 +1859,7 @@ function renderWork(){
     +'<button class="btn btn-sm" onclick="addDomain()">添加</button></div>';
   dp.innerHTML=dpHtml;
 
+  renderChores();
   renderAffairs();
   syncMajorCollapse();
 
@@ -1873,7 +1932,7 @@ function renderWork(){
   }
 }
 
-// ===== 事务（GTD 待办） =====
+// ===== 项目（原「事务」完整结构） =====
 function affairSteps(a){return Array.isArray(a.steps)?a.steps.filter(function(s){return s&&s.text;}):[];}
 function affairTotalSteps(a){return affairSteps(a).length;}
 function affairDoneSteps(a){return affairSteps(a).filter(function(s){return s.doneAt;}).length;}
@@ -1888,7 +1947,7 @@ function fmtPlan(ts){const d=new Date(ts);return (d.getMonth()+1)+'/'+d.getDate(
 function fmtDateCal(ts){const d=new Date(ts),wd=['日','一','二','三','四','五','六'];return (d.getMonth()+1)+'月'+d.getDate()+'日 周'+wd[d.getDay()];}
 function toLocalInput(ts){if(!ts)return '';const d=new Date(ts);const p=function(x){return String(x).padStart(2,'0');};return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+'T'+p(d.getHours())+':'+p(d.getMinutes());}
 function fromLocalInput(v){if(!v)return null;const t=new Date(v).getTime();return isNaN(t)?null:t;}
-// ===== 事务奖励曲线（10 格累计比例，格 9 恒为 100）=====
+// ===== 项目奖励曲线（10 格累计比例，格 9 恒为 100）=====
 const AFFAIR_CURVES={
   even:[10,20,30,40,50,60,70,80,90,100],
   lateHeavy:[2,5,10,17,26,37,50,65,82,100],
@@ -1938,7 +1997,7 @@ function migrateAffair(a){
   return a;
 }
 
-// ===== 事务预设 =====
+// ===== 项目预设 =====
 let editPresetCurve={type:'even',values:AFFAIR_CURVES.even.slice()};
 function renderAffairPresetsHTML(){
   const presets=state.affairPresets||[];
@@ -1950,7 +2009,7 @@ function renderAffairPresetsHTML(){
       return '<span class="affair-preset-chip" onclick="openPresetModal(\''+p.id+'\')">'+esc(p.name)+'<b>+'+fmt(p.totalReward)+'</b></span>';
     }).join('')+'</div>';
   }else{
-    h+='<div class="affair-presets-empty">没有预设。新建后，可在新建事务时一键套用总奖励与曲线。</div>';
+    h+='<div class="affair-presets-empty">没有预设。新建后，可在新建项目时一键套用总奖励与曲线。</div>';
   }
   h+='</div>';
   return h;
@@ -2081,7 +2140,7 @@ function renderAffairs(){
   const inProg=affairs.filter(function(a){return !a.doneAt&&(affairTotalSteps(a)>0||(a.currentCell||0)>0);})
     .sort(function(a,b){return (b.totalReward||0)-(a.totalReward||0)||affairLastAdvance(a)-affairLastAdvance(b);});
   html+=affairZoneStart('inprog','进行中',inProg.length,'');
-  html+=inProg.length?inProg.map(affairInProgressCardHTML).join(''):'<div class="affair-empty">暂无进行中的事务</div>';
+  html+=inProg.length?inProg.map(affairInProgressCardHTML).join(''):'<div class="affair-empty">暂无进行中的项目</div>';
   html+=AFFAIR_ZONE_END;
   // 2. 日程区（列表/日历视图切换只影响本区呈现）
   const schedCount=affairUnits().length;
@@ -2360,9 +2419,9 @@ function addAffairFromInput(){
   const inp=document.getElementById('affairInput');
   if(!inp)return;
   const name=inp.value.trim();
-  if(!name){toast('请输入事务名称','err');return;}
+  if(!name){toast('请输入项目名称','err');return;}
   state.affairs.push({id:uid(),name:name,totalReward:0.1,curve:{type:'even',values:AFFAIR_CURVES.even.slice()},currentCell:0,alreadyGiven:0,domainId:null,plannedAt:null,steps:[],ach:{enabled:false,amount:0},createdAt:now(),startedAt:null,doneAt:null});
-  addLog('',0,'创建事务「'+name+'」','affair-create');
+  addLog('',0,'创建项目「'+name+'」','affair-create');
   save();
   inp.value='';
   inp.focus();
@@ -2400,17 +2459,17 @@ function affairApplyProgress(a,cell){
   const target=affairTargetAt(a,cell);
   const diff=round2(target-(a.alreadyGiven||0));
   if(diff>0){
-    applyAffairValue(a,diff,'事务「'+a.name+'」进度结算');
+    applyAffairValue(a,diff,'项目「'+a.name+'」进度结算');
     a.alreadyGiven=round2(target);
   }
   if(cell>=9&&!a.doneAt){
     a.doneAt=now();
     if(a.ach&&a.ach.enabled&&a.ach.amount>0){
       state.scores.achievement=(state.scores.achievement||0)+a.ach.amount;
-      addLog('achievement',a.ach.amount,'完成事务「'+a.name+'」','affair','',{affairId:a.id});
-      toast('事务「'+a.name+'」完成 · 成果点 +'+fmt(a.ach.amount),'warn');
+      addLog('achievement',a.ach.amount,'完成项目「'+a.name+'」','affair','',{affairId:a.id});
+      toast('项目「'+a.name+'」完成 · 成果点 +'+fmt(a.ach.amount),'warn');
     }else{
-      toast('事务「'+a.name+'」已完成');
+      toast('项目「'+a.name+'」已完成');
     }
   }
 }
@@ -2431,10 +2490,10 @@ function affairUndoAction(id){
   const snap=stack.pop();
   if(!snap){toast('没有可撤销的操作','warn');return;}
   const revoked=round2((a.alreadyGiven||0)-(snap.given||0));
-  if(revoked>0)reverseAffairValue(a,revoked,'撤销事务「'+a.name+'」推进');
+  if(revoked>0)reverseAffairValue(a,revoked,'撤销项目「'+a.name+'」推进');
   if(!!a.doneAt&&!snap.doneAt&&a.ach&&a.ach.enabled&&a.ach.amount>0){
     state.scores.achievement=(state.scores.achievement||0)-a.ach.amount;
-    addLog('achievement',-a.ach.amount,'撤销事务「'+a.name+'」成果点','affair','',{affairId:a.id});
+    addLog('achievement',-a.ach.amount,'撤销项目「'+a.name+'」成果点','affair','',{affairId:a.id});
   }
   a.currentCell=snap.cell;a.alreadyGiven=snap.given;a.doneAt=snap.doneAt;a.startedAt=snap.startedAt;
   save();render();
@@ -2459,7 +2518,7 @@ function advanceAffairStep(id){
 function completeAffair(id){
   const a=state.affairs.find(function(x){return x.id===id;});
   if(!a)return;
-  if(a.doneAt){toast('该事务已完成','warn');return;}
+  if(a.doneAt){toast('该项目已完成','warn');return;}
   affairPushUndo(a);
   affairApplyProgress(a,9);
   save();render();
@@ -2467,7 +2526,7 @@ function completeAffair(id){
 function completeAffairStep(id,idx){
   const a=state.affairs.find(function(x){return x.id===id;});
   if(!a)return;
-  if(a.doneAt){toast('该事务已完成','warn');return;}
+  if(a.doneAt){toast('该项目已完成','warn');return;}
   const steps=affairSteps(a);
   const s=steps[idx];
   if(!s){toast('步骤不存在','warn');return;}
@@ -2544,7 +2603,7 @@ function saveAffairPlan(){
   a.plannedAt=fromLocalInput(v);
   save();
   closeModal('affairPlanModal');
-  toast('已规划事务「'+a.name+'」');
+  toast('已规划项目「'+a.name+'」');
   render();
 }
 
@@ -2563,7 +2622,7 @@ function openAffairModal(id){
   if(id){
     const a=state.affairs.find(function(x){return x.id===id;});
     if(!a)return;
-    document.getElementById('affairModalTitle').textContent='编辑事务';
+    document.getElementById('affairModalTitle').textContent='编辑项目';
     document.getElementById('affairName').value=a.name;
     document.getElementById('affairReward').value=(a.totalReward===undefined?'':a.totalReward);
     document.getElementById('affairPlannedAt').value=a.plannedAt?toLocalInput(a.plannedAt):'';
@@ -2576,7 +2635,7 @@ function openAffairModal(id){
     toggleAffairAch();
     if(delBtn)delBtn.style.display='';
   }else{
-    document.getElementById('affairModalTitle').textContent='新建事务';
+    document.getElementById('affairModalTitle').textContent='新建项目';
     document.getElementById('affairName').value='';
     document.getElementById('affairReward').value='';
     document.getElementById('affairPlannedAt').value='';
@@ -2605,7 +2664,7 @@ function handleAffairSave(){
   const domainId=document.getElementById('affairDomain').value||null;
   const plannedAt=fromLocalInput(document.getElementById('affairPlannedAt').value);
   const steps=readAffairSteps();
-  if(!name){toast('请输入事务名称','err');return;}
+  if(!name){toast('请输入项目名称','err');return;}
   const ach={enabled:achEnabled,amount:achEnabled?achAmount:0};
   if(id){
     const a=state.affairs.find(function(x){return x.id===id;});
@@ -2613,26 +2672,26 @@ function handleAffairSave(){
     a.name=name;a.totalReward=totalReward;a.curve=curve;a.ach=ach;a.domainId=domainId;
     if(!a.doneAt)a.plannedAt=plannedAt;
     a.steps=steps;
-    addLog('',0,'修改事务「'+name+'」','affair-edit');
+    addLog('',0,'修改项目「'+name+'」','affair-edit');
   }else{
     state.affairs.push({id:uid(),name:name,totalReward:totalReward,curve:curve,currentCell:0,alreadyGiven:0,domainId:domainId,plannedAt:plannedAt,steps:steps,ach:ach,createdAt:now(),startedAt:null,doneAt:null});
-    addLog('',0,'创建事务「'+name+'」','affair-create');
+    addLog('',0,'创建项目「'+name+'」','affair-create');
   }
   save();
   closeModal('affairModal');
-  toast(id?'事务已更新':'事务已创建');
+  toast(id?'项目已更新':'项目已创建');
   render();
 }
 
 function delAffair(id){
   const a=state.affairs.find(function(x){return x.id===id;});
   if(!a)return;
-  if(!confirm('删除事务「'+a.name+'」？'))return;
+  if(!confirm('删除项目「'+a.name+'」？'))return;
   state.affairs=state.affairs.filter(function(x){return x.id!==id;});
-  addLog('',0,'删除事务「'+a.name+'」','affair-del');
+  addLog('',0,'删除项目「'+a.name+'」','affair-del');
   save();
   closeModal('affairModal');
-  toast('事务已删除');
+  toast('项目已删除');
   render();
 }
 
@@ -2640,7 +2699,7 @@ function renderAffairSteps(){
   const cont=document.getElementById('affairSteps');
   if(!cont)return;
   if(editAffairSteps.length===0){
-    cont.innerHTML='<div class="affair-step-empty">暂无步骤（可选填，保存后可直接「完成」整件事务）</div>';
+    cont.innerHTML='<div class="affair-step-empty">暂无步骤（可选填，保存后可直接「完成」整个项目）</div>';
     return;
   }
   cont.innerHTML=editAffairSteps.map(function(s,i){
@@ -2724,6 +2783,292 @@ function affairCalShift(d){
   affairCalCursor={y:y,m:m};
   affairCalSelected=null;
   render();
+}
+
+// ===== 杂事（极简快速清单）=====
+// 与「项目」是两个独立入口：杂事只记名称、勾选和可选日期，走批量结算 + 腐化债。
+function choreCfg(){return normalizeChoreConfig(state.choreConfig);}
+function choreFreshDays(c){
+  if(c&&typeof c.freshDays==='number'&&isFinite(c.freshDays)&&c.freshDays>=0)return c.freshDays;
+  return choreCfg().freshDays;
+}
+function choreBaseTs(c){
+  const base=(c&&c.plannedAt)?c.plannedAt:((c&&c.createdAt)?c.createdAt:now());
+  return dayStartTs(base);
+}
+// 超期天数：日期（或创建日）+ 保鲜期之后开始计腐化，当天不算
+function choreOverdueDays(c,ts){
+  if(!c||c.done)return 0;
+  const today=dayStartTs(ts||now());
+  const deadline=choreBaseTs(c)+Math.round(choreFreshDays(c))*864e5;
+  const d=Math.round((today-deadline)/864e5);
+  return d>0?d:0;
+}
+// 腐化档位：按「超期件数」匹配，返回每件每天的系数
+function choreTierRate(count,cfg){
+  cfg=cfg||choreCfg();
+  if(count<=0)return 0;
+  if(count<=cfg.tier1Max)return cfg.tier1Rate;
+  if(count<=cfg.tier2Max)return cfg.tier2Rate;
+  return cfg.tier3Rate;
+}
+function choreDailyDecay(count,cfg){return round2(count*choreTierRate(count,cfg));}
+function choreUnsettled(){
+  return (state.chores||[]).filter(function(c){return c.done&&!c.settled;});
+}
+// 批量结算：每 N 件已完成且未结算的杂事发放 Y 活力点（可一次结算多批）
+function settleChoreBatches(silent){
+  const cfg=choreCfg();
+  const need=Math.max(1,Math.round(cfg.batchN));
+  const pool=choreUnsettled().sort(function(a,b){return (a.doneAt||0)-(b.doneAt||0);});
+  const batches=Math.floor(pool.length/need);
+  if(batches<=0)return 0;
+  const used=pool.slice(0,batches*need);
+  used.forEach(function(c){c.settled=true;});
+  const gain=round2(batches*cfg.batchY);
+  if(gain>0){
+    state.scores.vitality=round2((state.scores.vitality||0)+gain);
+    addLog('vitality',gain,'杂事批量结算：'+used.length+' 件','chore-batch');
+    if(!silent)toast('批量结算 '+used.length+' 件杂事 · 活力点 +'+fmt(gain));
+  }else{
+    addLog('',0,'杂事批量结算：'+used.length+' 件（当前奖励为 0）','chore-batch');
+  }
+  return gain;
+}
+// 腐化债静默结算：超期杂事按档位系数逐日累积，直接从活力点扣除，不弹提示
+function processChoreDecay(){
+  const chores=state.chores||[];
+  if(!chores.length)return 0;
+  const cfg=choreCfg();
+  const today=dayStartTs(now());
+  const overdue=chores.filter(function(c){return !c.done&&choreOverdueDays(c)>0;});
+  if(!overdue.length)return 0;
+  const rate=choreTierRate(overdue.length,cfg);
+  let total=0,dueDays=0,charged=0;
+  overdue.forEach(function(c){
+    const deadline=choreBaseTs(c)+Math.round(choreFreshDays(c))*864e5;
+    let start=deadline+864e5;
+    if(c.decayKey){
+      const p=String(c.decayKey).split('-');
+      const last=new Date(Number(p[0]),Number(p[1])-1,Number(p[2])).getTime();
+      if(isFinite(last))start=Math.max(start,last+864e5);
+    }
+    const days=Math.round((today-start)/864e5)+1;
+    if(days<=0)return;
+    charged++;
+    dueDays+=days;
+    total+=rate*days;
+    c.decayKey=dayKey(today);
+  });
+  total=round2(total);
+  if(total<=0||charged<=0)return 0;
+  state.scores.vitality=round2((state.scores.vitality||0)-total);
+  addLog('vitality',-total,'杂事腐化债：'+charged+' 件超期，累计 '+dueDays+' 天','chore-decay');
+  save();
+  return total;
+}
+function addChoreFromInput(){
+  const inp=document.getElementById('choreInput');
+  if(!inp)return;
+  const name=inp.value.trim();
+  if(!name){toast('请输入杂事内容','err');return;}
+  if(!Array.isArray(state.chores))state.chores=[];
+  state.chores.push({id:uid(),name:name,done:false,doneAt:null,plannedAt:null,createdAt:now(),settled:false,freshDays:null,decayKey:null});
+  addLog('',0,'新增杂事「'+name+'」','chore-create');
+  save();
+  inp.value='';inp.focus();
+  render();
+}
+function toggleChoreDone(id){
+  const c=(state.chores||[]).find(function(x){return x.id===id;});
+  if(!c)return;
+  if(c.done){
+    c.done=false;c.doneAt=null;
+    // 取消勾选：腐化从今天重新起算；已结算的批次不回退，避免反复领取
+    c.decayKey=dayKey(now());
+  }else{
+    c.done=true;c.doneAt=now();
+    c.decayKey=dayKey(now());
+    settleChoreBatches();
+  }
+  save();render();
+}
+function toggleChoreDoneZone(){choreDoneOpen=!choreDoneOpen;render();}
+function fmtChoreDate(ts){
+  const d=new Date(ts);
+  return (d.getMonth()+1)+'/'+d.getDate();
+}
+function choreCardHTML(c){
+  const overdue=choreOverdueDays(c);
+  let meta='';
+  if(c.plannedAt)meta+='<span class="chore-date">📅 '+fmtChoreDate(c.plannedAt)+'</span>';
+  if(overdue>0)meta+='<span class="chore-overdue">超期 '+overdue+' 天</span>';
+  return '<div class="card chore-card'+(c.done?' done':'')+(overdue>0?' overdue':'')+'" data-chore-id="'+c.id+'" onclick="openChoreModal(\''+c.id+'\')">'
+    +'<label class="chore-check" onclick="event.stopPropagation()">'
+    +'<input type="checkbox"'+(c.done?' checked':'')+' onchange="toggleChoreDone(\''+c.id+'\')">'
+    +'</label>'
+    +'<div class="chore-main">'
+    +'<div class="chore-name">'+esc(c.name)+'</div>'
+    +(meta?'<div class="chore-meta">'+meta+'</div>':'')
+    +'</div>'
+    +'</div>';
+}
+function renderChores(){
+  const panel=document.getElementById('chorePanel');
+  if(!panel)return;
+  const chores=state.chores||[];
+  const cfg=choreCfg();
+  const todo=chores.filter(function(c){return !c.done;}).sort(function(a,b){
+    const ap=a.plannedAt||9e15,bp=b.plannedAt||9e15;
+    return ap-bp||((b.createdAt||0)-(a.createdAt||0));
+  });
+  const done=chores.filter(function(c){return c.done;}).sort(function(a,b){return (b.doneAt||0)-(a.doneAt||0);});
+  const unsettled=choreUnsettled().length;
+  const need=Math.max(1,Math.round(cfg.batchN));
+  const rem=unsettled%need;
+  const next=rem===0?need:need-rem;
+  const readyBatches=Math.floor(unsettled/need);
+  const meta=document.getElementById('choreMeta');
+  if(meta)meta.textContent=chores.length?('待办 '+todo.length+' · 已完成 '+done.length):'';
+  let html='<div class="chore-econ-bar">'
+    +'<span>单件不发放活力 · 每完成 <b>'+need+'</b> 件 → <b>+'+fmt(cfg.batchY)+'</b> 活力</span>'
+    +'<span>'+(readyBatches>0
+      ?('待结算 '+unsettled+' 件 · 已完成 '+readyBatches+' 批，完成下一件即入账')
+      :('待结算 '+unsettled+' 件 · 再完成 '+next+' 件可结算'))+'</span>'
+    +'</div>';
+  html+=todo.length?todo.map(choreCardHTML).join(''):'<div class="affair-empty">还没有杂事。输入名称回车，即刻创建。</div>';
+  if(done.length){
+    const collapsed=!choreDoneOpen;
+    html+='<div class="affair-zone'+(collapsed?' collapsed':'')+'" id="chore-zone-done">'
+      +'<div class="affair-zone-title" onclick="toggleChoreDoneZone()">'
+      +'<span class="coll-toggle">▼</span>已完成 <span class="affair-zone-count">'+done.length+'</span></div>'
+      +'<div class="affair-zone-body">'+done.map(choreCardHTML).join('')+'</div>'
+      +'</div>';
+  }
+  panel.innerHTML=html;
+}
+// 杂事编辑：名称、可选日期、可选覆盖保鲜期
+function toDateInputValue(ts){
+  if(!ts)return '';
+  const d=new Date(ts);
+  return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+}
+function openChoreModal(id){
+  const c=(state.chores||[]).find(function(x){return x.id===id;});
+  const isEdit=!!c;
+  document.getElementById('choreModalTitle').textContent=isEdit?'编辑杂事':'新建杂事';
+  document.getElementById('choreId').value=isEdit?c.id:'';
+  document.getElementById('choreName').value=isEdit?c.name:'';
+  document.getElementById('choreDate').value=isEdit&&c.plannedAt?toDateInputValue(c.plannedAt):'';
+  document.getElementById('choreFreshDays').value=isEdit&&typeof c.freshDays==='number'?c.freshDays:'';
+  const hint=document.getElementById('choreFreshDefaultHint');
+  if(hint)hint.textContent=choreCfg().freshDays;
+  document.getElementById('choreDelBtn').style.display=isEdit?'':'none';
+  openModal('choreModal');
+  if(!isEdit)setTimeout(function(){document.getElementById('choreName').focus();},50);
+}
+function saveChore(){
+  const id=document.getElementById('choreId').value;
+  const name=document.getElementById('choreName').value.trim();
+  if(!name){toast('请输入杂事名称','err');return;}
+  const dv=document.getElementById('choreDate').value;
+  const plannedAt=dv?new Date(dv+'T00:00:00').getTime():null;
+  const fv=String(document.getElementById('choreFreshDays').value).trim();
+  let fresh=null;
+  if(fv!==''){
+    const n=Number(fv);
+    if(!isFinite(n)){toast('保鲜期需为数字','err');return;}
+    fresh=Math.max(0,Math.round(n));
+  }
+  if(!Array.isArray(state.chores))state.chores=[];
+  if(id){
+    const c=state.chores.find(function(x){return x.id===id;});
+    if(!c)return;
+    c.name=name;c.plannedAt=plannedAt;c.freshDays=fresh;
+    // 日期或保鲜期改动后从今天重新起算腐化，不补扣历史
+    c.decayKey=dayKey(now());
+    addLog('',0,'修改杂事「'+name+'」','chore-edit');
+  }else{
+    state.chores.push({id:uid(),name:name,done:false,doneAt:null,plannedAt:plannedAt,createdAt:now(),settled:false,freshDays:fresh,decayKey:null});
+    addLog('',0,'新增杂事「'+name+'」','chore-create');
+  }
+  save();closeModal('choreModal');render();
+  toast(id?'杂事已更新':'杂事已创建');
+}
+function delChore(){
+  const id=document.getElementById('choreId').value;
+  const c=(state.chores||[]).find(function(x){return x.id===id;});
+  if(!c)return;
+  if(!confirm('删除杂事「'+c.name+'」？'))return;
+  state.chores=state.chores.filter(function(x){return x.id!==id;});
+  addLog('',0,'删除杂事「'+c.name+'」','chore-create');
+  save();closeModal('choreModal');render();
+  toast('杂事已删除');
+}
+// 杂事经济设置（统一入口；设置后作为所有杂事的默认）
+function choreCfgInputPreview(){
+  const cont=document.getElementById('choreCfgPreview');
+  if(!cont)return;
+  const cfg=normalizeChoreConfig({
+    freshDays:document.getElementById('choreCfgFresh').value,
+    batchN:document.getElementById('choreCfgN').value,
+    batchY:document.getElementById('choreCfgY').value,
+    tier1Max:document.getElementById('choreCfgT1Max').value,
+    tier1Rate:document.getElementById('choreCfgT1Rate').value,
+    tier2Max:document.getElementById('choreCfgT2Max').value,
+    tier2Rate:document.getElementById('choreCfgT2Rate').value,
+    tier3Rate:document.getElementById('choreCfgT3Rate').value
+  });
+  if(cfg.tier2Max<=cfg.tier1Max)cfg.tier2Max=cfg.tier1Max+1;
+  const ex1=choreDailyDecay(cfg.tier1Max,cfg);
+  const ex2=choreDailyDecay(cfg.tier2Max,cfg);
+  const ex3=choreDailyDecay(cfg.tier2Max+1,cfg);
+  cont.innerHTML='超期 '+cfg.tier1Max+' 件 → '+fmt(ex1)+' 活力/天 · 超期 '+cfg.tier2Max+' 件 → '+fmt(ex2)+' 活力/天 · 超期 '+(cfg.tier2Max+1)+' 件及以上 → '+fmt(ex3)+' 活力/天';
+}
+function openChoreConfigModal(){
+  const cfg=choreCfg();
+  document.getElementById('choreCfgFresh').value=cfg.freshDays;
+  document.getElementById('choreCfgN').value=cfg.batchN;
+  document.getElementById('choreCfgY').value=cfg.batchY;
+  document.getElementById('choreCfgT1Max').value=cfg.tier1Max;
+  document.getElementById('choreCfgT1Rate').value=cfg.tier1Rate;
+  document.getElementById('choreCfgT2Max').value=cfg.tier2Max;
+  document.getElementById('choreCfgT2Rate').value=cfg.tier2Rate;
+  document.getElementById('choreCfgT3Rate').value=cfg.tier3Rate;
+  choreCfgInputPreview();
+  openModal('choreConfigModal');
+}
+function resetChoreConfig(){
+  const d=defaultChoreConfig();
+  document.getElementById('choreCfgFresh').value=d.freshDays;
+  document.getElementById('choreCfgN').value=d.batchN;
+  document.getElementById('choreCfgY').value=d.batchY;
+  document.getElementById('choreCfgT1Max').value=d.tier1Max;
+  document.getElementById('choreCfgT1Rate').value=d.tier1Rate;
+  document.getElementById('choreCfgT2Max').value=d.tier2Max;
+  document.getElementById('choreCfgT2Rate').value=d.tier2Rate;
+  document.getElementById('choreCfgT3Rate').value=d.tier3Rate;
+  choreCfgInputPreview();
+}
+function saveChoreConfig(){
+  const cfg=normalizeChoreConfig({
+    freshDays:document.getElementById('choreCfgFresh').value,
+    batchN:document.getElementById('choreCfgN').value,
+    batchY:document.getElementById('choreCfgY').value,
+    tier1Max:document.getElementById('choreCfgT1Max').value,
+    tier1Rate:document.getElementById('choreCfgT1Rate').value,
+    tier2Max:document.getElementById('choreCfgT2Max').value,
+    tier2Rate:document.getElementById('choreCfgT2Rate').value,
+    tier3Rate:document.getElementById('choreCfgT3Rate').value
+  });
+  if(cfg.tier2Max<=cfg.tier1Max)cfg.tier2Max=cfg.tier1Max+1;
+  state.choreConfig=cfg;
+  // 规则收紧/放宽后，腐化债从今天重新起算，避免追溯补扣
+  (state.chores||[]).forEach(function(c){
+    if(!c.done)c.decayKey=dayKey(now());
+  });
+  save();closeModal('choreConfigModal');render();
+  toast('杂事经济设置已保存，作为所有杂事的默认');
 }
 
 function stageBarHTML(t){
@@ -4414,7 +4759,7 @@ function toggleMajor(key){
   if(el)el.classList.toggle('collapsed',arr.indexOf(key)>=0);
 }
 function syncMajorCollapse(){
-  ['affair','task','archive'].forEach(function(k){
+  ['chore','affair','task','archive'].forEach(function(k){
     const el=document.getElementById('major_'+k);
     if(el)el.classList.toggle('collapsed',(state.majorCollapsed||[]).indexOf(k)>=0);
   });
@@ -5521,6 +5866,8 @@ function importData(ev){
         majorCollapsed:d.majorCollapsed||[],
         tasks:tasks,achievements:d.achievements||[],
         affairs:Array.isArray(d.affairs)?d.affairs.map(migrateAffair):[],
+        chores:Array.isArray(d.chores)?d.chores.map(migrateChore):[],
+        choreConfig:normalizeChoreConfig(d.choreConfig),
         affairPresets:Array.isArray(d.affairPresets)?d.affairPresets:[],
         affairCollapsed:d.affairCollapsed||[],
         affairUndo:d.affairUndo||{},
@@ -5727,8 +6074,10 @@ async function init(){
   document.getElementById('affairSaveBtn').addEventListener('click',handleAffairSave);
   document.getElementById('affairPlanSaveBtn').addEventListener('click',saveAffairPlan);
   document.getElementById('presetSaveBtn').addEventListener('click',savePreset);
+  document.getElementById('choreSaveBtn').addEventListener('click',saveChore);
+  document.getElementById('choreCfgSaveBtn').addEventListener('click',saveChoreConfig);
 
-  ['taskModal','achModal','prodModal','metricModal','activityModal','affairModal','affairPlanModal','presetModal'].forEach(mid=>{
+  ['taskModal','achModal','prodModal','metricModal','activityModal','affairModal','affairPlanModal','presetModal','choreModal','choreConfigModal'].forEach(mid=>{
     document.getElementById(mid).addEventListener('keydown',e=>{
       if(e.key==='Enter'&&e.target.tagName==='INPUT'){
         e.preventDefault();
@@ -5745,6 +6094,7 @@ async function init(){
   processMetabolism();
   processLoans();
   processActivities();
+  processChoreDecay();
   setInterval(schedulerTick,60000);
   initDrag();
   initTaskReveal();
