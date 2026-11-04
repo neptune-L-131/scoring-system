@@ -3,6 +3,56 @@
 // ===== State =====
 const KEY='score_sys_v3';
 const THEME_KEY='score_sys_theme';
+// Schema 版本与全局常量（必须在 defaults() 首次调用前初始化）
+// v2：商品层级（tier）与门槛（gate）；ext 增加累计成果点与活跃度索引
+const SCHEMA_VERSION=2;
+const PROD_TIERS=['daily','quality','exclusive'];
+const PROD_TIER_NAMES={daily:'日常级',quality:'品质级',exclusive:'专属级'};
+const ACTIVITY_MAX_DAYS=90;
+const ACH_EARN_SOURCES={achievement:true,reward:true,affair:true};
+function defaultProductGate(){
+  return{minLifetime:0,activity:{domainId:'',days:0,times:0},milestoneId:''};
+}
+function tierCurrency(tier){return tier==='daily'?'vitality':'achievement';}
+const MIGRATIONS={
+  // v1 → v2：旧商品补 tier/gate（旧成果点商品映射为品质级，保持原支付币种不变）
+  // 旧存档的“累计获得成果点”按正向往期流水 + 当前余额 + 已解锁里程碑金额做一次性基线，
+  // 并把历史上出现过的成就 id 记入已计入清单，避免升级后撤销/再解锁重复累计。
+  2:function(p){
+    const prods=Array.isArray(p.products)?p.products:[];
+    prods.forEach(function(prod){
+      if(!prod||typeof prod!=='object')return;
+      if(PROD_TIERS.indexOf(prod.tier)<0)prod.tier=(prod.currency==='achievement')?'quality':'daily';
+      if(!prod.gate||typeof prod.gate!=='object')prod.gate=defaultProductGate();
+    });
+    const ext=(p.ext&&typeof p.ext==='object')?p.ext:(p.ext={});
+    if(!ext.stats||typeof ext.stats!=='object')ext.stats={};
+    if(!ext.activity||typeof ext.activity!=='object')ext.activity={};
+    if(typeof ext.stats.lifetimeAchievementEarned!=='number'){
+      const logs=Array.isArray(p.logs)?p.logs:[];
+      const counted={};
+      let sum=0;
+      logs.forEach(function(l){
+        if(!l||l.st!=='achievement')return;
+        const src=String(l.src||'');
+        if(src.indexOf('undo')===0||src==='loan-draw'||src==='manual-adjust')return;
+        const amt=Number(l.amt);
+        if(!isFinite(amt)||amt<=0)return;
+        sum+=amt;
+        if(l.achId)counted[l.achId]=Math.max(Number(counted[l.achId])||0,amt);
+      });
+      (Array.isArray(p.achievements)?p.achievements:[]).forEach(function(a){
+        if(a&&a.id&&a.unlocked)counted[a.id]=Math.max(Number(counted[a.id])||0,Number(a.points)||0);
+      });
+      let countedSum=0;
+      Object.keys(counted).forEach(function(k){countedSum+=counted[k];});
+      const base=Math.max(0,Number((p.scores||{}).achievement)||0);
+      ext.stats.lifetimeAchievementEarned=Math.max(sum,base,countedSum);
+      if(!ext.achievementCounted||typeof ext.achievementCounted!=='object')ext.achievementCounted=counted;
+    }
+  }
+};
+const AUDIT_MAX=50;
 let state=defaults();
 let editCurrency='vitality';
 let editTypes=['vitality'];
@@ -36,11 +86,11 @@ function stageValues(t,type){const sr=stageRewards(t);if(!sr)return null;const a
 function stageSel(t){const sr=stageRewards(t);const l=sr&&typeof sr.last==='number'?sr.last:0;return Math.max(0,Math.min(9,Math.round(l)));}
 function stageValueAt(t,type,cell){const v=stageValues(t,type);if(!v)return 0;if(cell>=9)return v[4]+(v[4]-v[3])/2;const i=cell>>1,rem=cell&1;return rem?(v[i]+v[i+1])/2:v[i];}
 function stageCellLabel(cell){if(cell<=8&&cell%2===0)return STAGE_NAMES[cell/2];return STAGE_NAMES[Math.min(4,(cell-1)>>1)]+'+';}
-// 阶段任务结算：档位值 + 连胜利息(初始值×利率×(连胜-1)) - 待扣债；待扣债 > 初始值时本次收益为 0
+// 阶段任务结算：档位值 + 连胜利息(初始值×利率×(连胜-1)) - 待扣债，最低为 0
+// 与普通任务同一债务口径：待扣债照常扣减，扣完清零、不因债务大于初始值而整体免除
 function stageNetAt(t,type,cell,c){
   const base=stageValueAt(t,type,cell);
   const info=c||calcCheckIn(t);
-  if((info.debt||0)>(t.initialValue||0))return 0;
   return Math.max(0,base+(info.bonus||0)-(info.debt||0));
 }
 function round2(v){return Math.round(v*100)/100;}
@@ -82,28 +132,6 @@ const COND_RANGES=[
 ];
 function validRange(r){return r==='period'||r==='total'||r==='recent'||r==='today';}
 function normOp(op){return ['>','<','<=','>='].indexOf(op)>=0?op:'>=';}
-// 将旧数据中 target/domainId（仅指领域）迁移为 targetType/target；若已有合法 targetType 则保留
-function applyCondTarget(o,it){
-  const tt=it.targetType;
-  // 迁移上一版 one-off 主体「本周期新增任务」→ 可组合结构
-  if(tt==='new_task'){o.targetType='all';o.newFilter='new_task';o.aggregate='any';return;}
-  if(tt==='task'&&it.target){o.targetType='task';o.target=it.target;}
-  else if(tt==='domain'&&it.target){o.targetType='domain';o.target=it.target;}
-  else if(tt==='domain'){o.targetType='domain';}
-  else{o.targetType='all';}
-  // 旧版 progress 的 target/domainId 实为领域
-  if(it.metric==='progress'&&(it.target||it.domainId)){o.targetType='domain';o.target=it.domainId||it.target;}
-  o.newFilter=(it.newFilter==='new_task'||it.newFilter==='new_domain')?it.newFilter:'none';
-  o.aggregate=(it.aggregate==='any')?'any':'sum';
-}
-const COND_LEGACY_MAP={
-  'progress_total':{metric:'progress',range:'total'},
-  'progress_domain':{metric:'progress',range:'total'},
-  'checkins_period':{metric:'checkins',range:'period'},
-  'checkins_total':{metric:'checkins',range:'total'},
-  'new_task_period':{metric:'new_tasks',range:'period'},
-  'new_domain_period':{metric:'new_domains',range:'period'}
-};
 function defaultActivities(){
   return[
     {id:'act_exemption',name:'断更豁免卡',enabled:true,period:'week',anchor:1,
@@ -115,27 +143,13 @@ function defaultActivities(){
   ];
 }
 function normalizeCondItem(it){
-  if(!it)return null;
-  // 1) New range leaf format
-  if(validRange(it.range)){
-    if(COND_METRIC_KEYS.indexOf(it.metric)<0)return null;
-    const o={range:it.range,metric:it.metric,op:normOp(it.op),value:Number(it.value)||0};
-    if(it.range==='recent')o.days=Math.max(1,Math.round(Number(it.days)||7));
-    applyCondTarget(o,it);
-    return o;
-  }
-  // 2) Previous 5-field scope format (scope→range)
-  if(COND_METRIC_KEYS.indexOf(it.metric)>=0){
-    const range=it.scope==='total'?'total':'period';
-    const o={range:range,metric:it.metric,op:normOp(it.op),value:Number(it.value)||0};
-    applyCondTarget(o,it);
-    return o;
-  }
-  // 3) Legacy metric-name migration
-  const lm=COND_LEGACY_MAP[it.metric];
-  if(!lm)return null;
-  const o={range:lm.range,metric:lm.metric,op:normOp(it.op),value:Number(it.value)||0};
-  applyCondTarget(o,it);
+  if(!it||!validRange(it.range)||COND_METRIC_KEYS.indexOf(it.metric)<0)return null;
+  const o={range:it.range,metric:it.metric,op:normOp(it.op),value:Number(it.value)||0};
+  if(it.range==='recent')o.days=Math.max(1,Math.round(Number(it.days)||7));
+  o.targetType=(it.targetType==='task'||it.targetType==='domain')?it.targetType:'all';
+  o.target=(o.targetType==='all')?'':(it.target||'');
+  o.newFilter=(it.newFilter==='new_task'||it.newFilter==='new_domain')?it.newFilter:'none';
+  o.aggregate=(it.aggregate==='any')?'any':'sum';
   return o;
 }
 function normalizeCondNode(node){
@@ -166,20 +180,10 @@ function normalizeRewardItem(it){
 function normalizeResult(r){
   r=r||{};
   if(Array.isArray(r.items))return {items:r.items.map(normalizeRewardItem).filter(Boolean)};
-  if(r.type==='grant_cards')
-    return {items:[{type:'card',card:r.card||'exemption',amount:Math.max(0,Math.round(r.amount||0)),cap:Math.max(1,Math.round(r.cap||3))}]};
-  if(r.type==='grant_points'){
-    const items=(r.items||[]).map(it=>{
-      if(it.currency==='vitality')return {type:'vitality',amount:Number(it.amount)||0};
-      if(it.currency==='progress')return {type:'progress',domainId:it.domainId||'d_default',amount:Number(it.amount)||0};
-      if(it.currency==='achievement')return {type:'achievement',amount:Number(it.amount)||0};
-      return null;
-    }).filter(Boolean);
-    return {items:items};
-  }
   return {items:[]};
 }
 function normalizeActivity(a){
+  a=a||{};
   return{
     id:a.id||uid(),name:a.name||'未命名活动',enabled:a.enabled!==false,
     period:a.period||'week',anchor:a.anchor||1,
@@ -189,22 +193,8 @@ function normalizeActivity(a){
   };
 }
 function migrateActivities(p){
-  if(Array.isArray(p.activities))return p.activities.map(normalizeActivity);
-  const defs=defaultActivities().map(normalizeActivity);
-  const ex=defs.find(a=>(a.result.items||[]).some(it=>it.type==='card'&&it.card==='exemption'));
-  const oldEx=(p.rules&&p.rules.exemption)||null;
-  if(ex&&oldEx){
-    const cardItem=(ex.result.items||[]).find(it=>it.type==='card'&&it.card==='exemption');
-    if(cardItem){
-      ex.enabled=oldEx.enabled!==false;
-      ex.period=oldEx.period||'week';
-      ex.anchor=oldEx.anchor||1;
-      cardItem.amount=Math.max(0,Math.round(oldEx.amount||0));
-      cardItem.cap=Math.max(1,Math.round(oldEx.cap||1));
-    }
-    if(p.ruleLastRun&&p.ruleLastRun.exemption)ex.lastRun=p.ruleLastRun.exemption;
-  }
-  return defs;
+  const arr=asArray(p.activities).filter(Boolean).map(normalizeActivity);
+  return arr.length?arr:defaultActivities().map(normalizeActivity);
 }
 // ===== 杂事经济配置（统一默认，可被单件杂事覆盖保鲜期）=====
 function defaultChoreConfig(){
@@ -223,7 +213,7 @@ function normalizeChoreConfig(c){
   const d=defaultChoreConfig();
   c=c||{};
   function n(v,def,min){v=Number(v);if(!isFinite(v))return def;return v<min?min:v;}
-  return{
+  const out={
     freshDays:Math.round(n(c.freshDays,d.freshDays,0)),
     batchN:Math.max(1,Math.round(n(c.batchN,d.batchN,1))),
     batchY:n(c.batchY,d.batchY,0),
@@ -233,6 +223,9 @@ function normalizeChoreConfig(c){
     tier2Rate:n(c.tier2Rate,d.tier2Rate,0),
     tier3Rate:n(c.tier3Rate,d.tier3Rate,0)
   };
+  // 档位必须递增：第二档下限恒大于第一档
+  if(out.tier2Max<=out.tier1Max)out.tier2Max=out.tier1Max+1;
+  return out;
 }
 function migrateChore(c){
   if(!c)return c;
@@ -248,8 +241,25 @@ function migrateChore(c){
   else c.freshDays=Math.max(0,Math.round(Number(c.freshDays)));
   return c;
 }
+// ===== Schema 版本与扩展区 =====
+// v1 为原点：新装/归一后的存档均带 schema.ext；MIGRATIONS 表留给后续版本使用。
+function defaultWatermark(){return {best:0,at:null};}
+function newExtState(){
+  return{
+    stats:{totalAchievement:0,lifetimeVitalityIn:0,lifetimeVitalityOut:0,totalCheckins:0,lifetimeAchievementEarned:0,updatedAt:null},
+    watermarks:{vitality:defaultWatermark(),achievement:defaultWatermark(),totalProgress:defaultWatermark(),progress:{}},
+    budgets:{period:'week',items:[],records:[]},
+    investment:{window:30},
+    reports:[],
+    audit:[],
+    activity:{},
+    achievementCounted:{},
+    features:{audit:true}
+  };
+}
 function defaults(){
   return{
+    schema:{v:SCHEMA_VERSION,migratedAt:null},
     scores:{vitality:0,progress:{},achievement:0},
     domains:[{id:'d_default',name:'默认'}],
     collections:[{id:'c_default',name:'默认'}],
@@ -270,7 +280,8 @@ function defaults(){
     activities:defaultActivities(),
     lastDebtDate:null,
     filterDomain:null,
-    metrics:[]
+    metrics:[],
+    ext:newExtState()
   };
 }
 let loadIssue=null;
@@ -295,6 +306,190 @@ function salvageJSON(raw){
   }
   return null;
 }
+// ===== 存档数值归一（只强转已有字段，不新增字段，保证旧存档兼容）=====
+function toNum(v,def){const n=Number(v);return isFinite(n)?n:(def===undefined?0:def);}
+function toTs(v){const n=Number(v);return (isFinite(n)&&n>0)?n:null;}
+function asArray(v){return Array.isArray(v)?v:[];}
+function normalizeScores(s){
+  const o={vitality:0,progress:{},achievement:0};
+  if(!s||typeof s!=='object')return o;
+  o.vitality=toNum(s.vitality);
+  o.achievement=toNum(s.achievement);
+  const pr=(s.progress&&typeof s.progress==='object'&&!Array.isArray(s.progress))?s.progress:{};
+  Object.keys(pr).forEach(function(k){o.progress[k]=toNum(pr[k]);});
+  return o;
+}
+function normalizeTaskNums(t){
+  if(!t||typeof t!=='object')return t;
+  t.initialValue=toNum(t.initialValue);
+  t.interestRate=toNum(t.interestRate);
+  t.debtRate=toNum(t.debtRate);
+  t.vitalityCost=toNum(t.vitalityCost);
+  t.checkInCount=Math.max(0,Math.round(toNum(t.checkInCount)));
+  t.streak=Math.max(0,Math.round(toNum(t.streak)));
+  t.totalEarned=toNum(t.totalEarned);
+  t.pendingDebt=toNum(t.pendingDebt);
+  t.lastCheckIn=toTs(t.lastCheckIn);
+  if(t.lastExempt!==undefined)t.lastExempt=toTs(t.lastExempt);
+  if(t.archivedAt!==undefined)t.archivedAt=toTs(t.archivedAt);
+  if(t.lastDebtDate!==undefined)t.lastDebtDate=toTs(t.lastDebtDate);
+  return t;
+}
+function normalizeAchNums(a){
+  if(!a||typeof a!=='object')return a;
+  a.threshold=toNum(a.threshold);
+  a.points=toNum(a.points);
+  a.unlocked=!!a.unlocked;
+  if(a.unlockedAt!==undefined)a.unlockedAt=toTs(a.unlockedAt);
+  return a;
+}
+function normalizeProdNums(p){
+  if(!p||typeof p!=='object')return p;
+  p.price=toNum(p.price);
+  p.stock=toNum(p.stock,-1);
+  p.sold=Math.max(0,Math.round(toNum(p.sold)));
+  p.debtRate=toNum(p.debtRate);
+  p.createdAt=toTs(p.createdAt);
+  return p;
+}
+// 商品门槛归一：负数/非整数夹回合法区间；未知层级回落 daily；
+// 引用不存在的领域/里程碑时清空对应引用（其余门槛字段保留，便于用户重新选择）
+function normalizeProductGate(g,ctx){
+  const out=defaultProductGate();
+  if(!g||typeof g!=='object'||Array.isArray(g))return out;
+  out.minLifetime=Math.max(0,Math.round(toNum(g.minLifetime)));
+  const a=(g.activity&&typeof g.activity==='object'&&!Array.isArray(g.activity))?g.activity:{};
+  const did=String(a.domainId||'');
+  out.activity.domainId=(!ctx||!ctx.domainIds||ctx.domainIds.has(did))?did:'';
+  out.activity.days=Math.max(0,Math.min(ACTIVITY_MAX_DAYS,Math.round(toNum(a.days))));
+  out.activity.times=Math.max(0,Math.round(toNum(a.times)));
+  const mid=String(g.milestoneId||'');
+  out.milestoneId=(!ctx||!ctx.achIds||ctx.achIds.has(mid))?mid:'';
+  return out;
+}
+function normalizeProduct(p,ctx){
+  p=normalizeProdNums(p);
+  if(!p||typeof p!=='object')return p;
+  if(PROD_TIERS.indexOf(p.tier)<0)p.tier='daily';
+  p.gate=normalizeProductGate(p.gate,ctx);
+  // 支付币种由层级决定：日常级活力点，品质/专属级成果点
+  p.currency=tierCurrency(p.tier);
+  return p;
+}
+// 活跃度查询/写入都只读最近 N 个自然日的日期键（含今天），不遍历日志
+function dateKeyOffset(daysAgo){
+  const d=new Date();
+  d.setHours(12,0,0,0);
+  d.setDate(d.getDate()-Math.max(0,Math.round(Number(daysAgo)||0)));
+  return dayKey(d.getTime());
+}
+function normalizeActivityIndex(raw){
+  const out={};
+  if(!raw||typeof raw!=='object'||Array.isArray(raw))return out;
+  const cutoff=dateKeyOffset(ACTIVITY_MAX_DAYS-1);
+  Object.keys(raw).forEach(function(did){
+    const bucket=raw[did];
+    if(!bucket||typeof bucket!=='object'||Array.isArray(bucket))return;
+    const b={};
+    Object.keys(bucket).forEach(function(k){
+      if(!/^\d{4}-\d{2}-\d{2}$/.test(k)||k<cutoff)return;
+      const v=Math.max(0,Math.round(toNum(bucket[k])));
+      if(v>0)b[k]=v;
+    });
+    if(Object.keys(b).length)out[did]=b;
+  });
+  return out;
+}
+function normalizeAchievementCounted(raw){
+  const out={};
+  if(!raw||typeof raw!=='object'||Array.isArray(raw))return out;
+  Object.keys(raw).forEach(function(k){
+    const v=toNum(raw[k]);
+    if(v>0)out[k]=v;
+  });
+  return out;
+}
+function normalizePresetNums(p){
+  if(!p||typeof p!=='object')return p;
+  p.totalReward=toNum(p.totalReward);
+  if(p.curve&&Array.isArray(p.curve.values))p.curve.values=p.curve.values.map(function(v){return toNum(v);});
+  if(p.ach&&typeof p.ach==='object'){
+    p.ach.enabled=!!p.ach.enabled;
+    p.ach.amount=toNum(p.ach.amount);
+  }
+  return p;
+}
+function normalizeLoanNums(l){
+  if(!l||typeof l!=='object')return l;
+  l.amount=toNum(l.amount);
+  l.debtRate=toNum(l.debtRate);
+  if(l.date!==undefined)l.date=toTs(l.date);
+  return l;
+}
+function normalizeLogNums(l){
+  if(!l||typeof l!=='object')return l;
+  l.time=toTs(l.time)||0;
+  l.amt=toNum(l.amt);
+  if(l.amtV!==undefined)l.amtV=toNum(l.amtV);
+  if(l.amtP!==undefined)l.amtP=toNum(l.amtP);
+  return l;
+}
+function normalizeCards(c){
+  const o={exemption:0};
+  if(c&&typeof c==='object')Object.keys(c).forEach(function(k){o[k]=toNum(c[k]);});
+  return o;
+}
+function normalizeWatermark(w){
+  w=w&&typeof w==='object'?w:{};
+  return{best:toNum(w.best),at:toTs(w.at)};
+}
+function normalizeExt(x){
+  x=x&&typeof x==='object'?x:{};
+  const s=x.stats&&typeof x.stats==='object'?x.stats:{};
+  const wm=x.watermarks&&typeof x.watermarks==='object'?x.watermarks:{};
+  const out={
+    stats:{
+      totalAchievement:toNum(s.totalAchievement),
+      lifetimeVitalityIn:toNum(s.lifetimeVitalityIn),
+      lifetimeVitalityOut:toNum(s.lifetimeVitalityOut),
+      totalCheckins:Math.max(0,Math.round(toNum(s.totalCheckins))),
+      lifetimeAchievementEarned:Math.max(0,toNum(s.lifetimeAchievementEarned)),
+      updatedAt:toTs(s.updatedAt)
+    },
+    watermarks:{
+      vitality:normalizeWatermark(wm.vitality),
+      achievement:normalizeWatermark(wm.achievement),
+      totalProgress:normalizeWatermark(wm.totalProgress),
+      progress:{}
+    },
+    budgets:(x.budgets&&typeof x.budgets==='object'&&!Array.isArray(x.budgets))
+      ?{period:x.budgets.period||'week',items:asArray(x.budgets.items),records:asArray(x.budgets.records)}
+      :{period:'week',items:[],records:[]},
+    investment:{window:Math.max(1,Math.round(toNum((x.investment||{}).window,30)))},
+    reports:asArray(x.reports).filter(Boolean),
+    audit:asArray(x.audit).filter(Boolean).slice(-AUDIT_MAX),
+    activity:normalizeActivityIndex(x.activity),
+    achievementCounted:normalizeAchievementCounted(x.achievementCounted),
+    features:{audit:(x.features&&x.features.audit!==false)}
+  };
+  const pr=wm.progress&&typeof wm.progress==='object'?wm.progress:{};
+  Object.keys(pr).forEach(function(k){out.watermarks.progress[k]=normalizeWatermark(pr[k]);});
+  return out;
+}
+// 版本迁移：v1 为原点，MIGRATIONS 表留给后续版本；不推进版本号即表示迁移失败（下次启动重试）
+function applyMigrations(p){
+  const from=(p.schema&&typeof p.schema.v==='number')?p.schema.v:0;
+  if(from>SCHEMA_VERSION){loadIssue={type:'salvaged'};return;}
+  for(let v=from;v<SCHEMA_VERSION;v++){
+    const step=MIGRATIONS[v+1];
+    if(!step)continue;
+    try{step(p);}
+    catch(e){loadIssue={type:'salvaged'};return;}
+    p.schema={v:v+1,migratedAt:now()};
+  }
+  if(!p.schema||typeof p.schema!=='object')p.schema={v:SCHEMA_VERSION,migratedAt:null};
+  else p.schema.v=SCHEMA_VERSION;
+}
 function parseState(raw){
   if(!raw)return defaults();
   let p;
@@ -306,45 +501,53 @@ function parseState(raw){
     loadIssue={type:'salvaged'};
   }
   try{
-    const tasks=(p.tasks||[]).map(t=>{
-      // Migrate old single domainId to domainIds array
-      if(t.domainIds===undefined){
-        t.domainIds=t.domainId?[t.domainId]:['d_default'];
-        delete t.domainId;
-      }
-      // Ensure description field exists
+    if(!p||typeof p!=='object'||Array.isArray(p)){loadIssue={type:'corrupt'};return defaults();}
+    applyMigrations(p);
+    const tasks=asArray(p.tasks).filter(Boolean).map(function(t){
+      if(!Array.isArray(t.domainIds)||!t.domainIds.length)t.domainIds=['d_default'];
+      if(!Array.isArray(t.scoreTypes)||!t.scoreTypes.length)t.scoreTypes=['vitality'];
       if(t.description===undefined)t.description='';
       if(t.archived===undefined)t.archived=false;
-      // Migrate single scoreType to scoreTypes array
-      if(t.scoreTypes===undefined){
-        t.scoreTypes=(t.scoreType==='progress')?['progress']:['vitality'];
-        delete t.scoreType;
-      }
-      return t;
+      return normalizeTaskNums(t);
     });
+    const domains=asArray(p.domains).filter(Boolean);
+    if(!domains.length)domains.push({id:'d_default',name:'默认'});
+    const collections=asArray(p.collections).filter(Boolean);
+    if(!collections.length)collections.push({id:'c_default',name:'默认'});
+    const shopCategories=asArray(p.shopCategories).filter(Boolean);
+    if(!shopCategories.length)shopCategories.push({id:'sc_default',name:'默认'});
+    const achievements=asArray(p.achievements).filter(Boolean).map(normalizeAchNums);
+    const prodCtx={
+      domainIds:new Set(domains.map(function(d){return d.id;})),
+      achIds:new Set(achievements.map(function(a){return a.id;}))
+    };
     return{
-      scores:p.scores||{vitality:0,progress:{},achievement:0},
-      domains:p.domains||[{id:'d_default',name:'默认'}],
-      collections:p.collections||[{id:'c_default',name:'默认'}],
-      shopCategories:p.shopCategories||[{id:'sc_default',name:'默认'}],
-      collapsedColls:p.collapsedColls||[],
-      collapsedAchDoms:p.collapsedAchDoms||[],
-      collapsedShopCats:p.collapsedShopCats||[],
-      majorCollapsed:p.majorCollapsed||[],
-      tasks:tasks,achievements:p.achievements||[],
-      affairs:Array.isArray(p.affairs)?p.affairs.map(migrateAffair):[],
-      chores:Array.isArray(p.chores)?p.chores.map(migrateChore):[],
+      schema:{v:SCHEMA_VERSION,migratedAt:toTs(p.schema&&p.schema.migratedAt)},
+      scores:normalizeScores(p.scores),
+      domains:domains,
+      collections:collections,
+      shopCategories:shopCategories,
+      collapsedColls:asArray(p.collapsedColls),
+      collapsedAchDoms:asArray(p.collapsedAchDoms),
+      collapsedShopCats:asArray(p.collapsedShopCats),
+      majorCollapsed:asArray(p.majorCollapsed),
+      tasks:tasks,
+      achievements:achievements,
+      affairs:asArray(p.affairs).filter(Boolean).map(migrateAffair),
+      chores:asArray(p.chores).filter(Boolean).map(migrateChore),
       choreConfig:normalizeChoreConfig(p.choreConfig),
-      affairPresets:Array.isArray(p.affairPresets)?p.affairPresets:[],
-      affairCollapsed:p.affairCollapsed||[],
-      affairUndo:p.affairUndo||{},
-      products:p.products||[],logs:p.logs||[],
-      loans:p.loans||[],
-      lastDebtDate:p.lastDebtDate||null,
+      affairPresets:asArray(p.affairPresets).filter(Boolean).map(normalizePresetNums),
+      affairCollapsed:asArray(p.affairCollapsed),
+      affairUndo:(p.affairUndo&&typeof p.affairUndo==='object'&&!Array.isArray(p.affairUndo))?p.affairUndo:{},
+      products:asArray(p.products).filter(Boolean).map(function(prod){return normalizeProduct(prod,prodCtx);}),
+      logs:asArray(p.logs).filter(Boolean).map(normalizeLogNums),
+      loans:asArray(p.loans).filter(Boolean).map(normalizeLoanNums),
+      lastDebtDate:toTs(p.lastDebtDate),
       filterDomain:p.filterDomain||null,
-      metrics:Array.isArray(p.metrics)?p.metrics:[],
-      cards:Object.assign({exemption:0},p.cards||{}),
-      activities:migrateActivities(p)
+      metrics:asArray(p.metrics).filter(Boolean),
+      cards:normalizeCards(p.cards),
+      activities:migrateActivities(p),
+      ext:normalizeExt(p.ext)
     };
   }catch(e){loadIssue={type:'corrupt'};return defaults();}
 }
@@ -369,6 +572,15 @@ function openIDB(){
   return _idbPromise;
 }
 // 仅保留主数据键；其余历史 key 见 migrateLegacy()
+// 读盘超时保护：IndexedDB 在部分环境下会长时间不回调，避免启动白屏
+function withTimeout(p,ms,fallback){
+  return new Promise(function(resolve){
+    let done=false;
+    const timer=setTimeout(function(){if(done)return;done=true;resolve(fallback);},ms);
+    p.then(function(v){if(done)return;done=true;clearTimeout(timer);resolve(v);})
+     .catch(function(){if(done)return;done=true;clearTimeout(timer);resolve(fallback);});
+  });
+}
 function idbGet(key){
   return openIDB().then(function(db){
     return new Promise(function(resolve,reject){
@@ -401,12 +613,43 @@ function idbDelete(key){
   });
 }
 
-// save()：同步序列化当前 state，再串行写入 IndexedDB（异步落盘，调用方无需改动）
+// ===== 持久化调度：合并写盘（200ms 尾随防抖）+ 强制 flush =====
+// _saveChain 保持不变：所有写入仍串行；区别只在于「何时序列化/入链」。
 let _saveChain=Promise.resolve();
-function save(){
-  const json=JSON.stringify(state);
-  _saveChain=_saveChain.then(function(){return idbPut(KEY,json);})
-    .catch(function(e){console.warn('IndexedDB save failed',e);/* 写失败不阻塞 UI */});
+const Persist=(function(){
+  const SAVE_DELAY=200;
+  let timer=null;
+  let pending=false;
+  function serialize(){return JSON.stringify(state);}
+  function flush(){
+    if(timer){clearTimeout(timer);timer=null;}
+    if(!pending)return _saveChain;
+    pending=false;
+    let json;
+    try{json=serialize();}catch(e){console.warn('serialize failed',e);return _saveChain;}
+    _saveChain=_saveChain.then(function(){return idbPut(KEY,json);})
+      .catch(function(e){console.warn('IndexedDB save failed',e);/* 写失败不阻塞 UI */});
+    return _saveChain;
+  }
+  function schedule(delay){
+    pending=true;
+    if(timer)clearTimeout(timer);
+    timer=setTimeout(flush,delay===undefined?SAVE_DELAY:delay);
+  }
+  return {schedule:schedule,flush:flush,serialize:serialize,delay:SAVE_DELAY,isPending:function(){return pending;}};
+})();
+function save(){Persist.schedule();}
+try{
+  document.addEventListener('visibilitychange',function(){if(document.hidden)Persist.flush();});
+  window.addEventListener('pagehide',function(){Persist.flush();});
+}catch(e){}
+// 一次提交：落盘 + 全量渲染 + 可选提示（仅用于原本 save()+render()(+toast) 的调用点）
+function commit(msg,type){save();render();if(msg)toast(msg,type);}
+// 合并渲染：同一帧内的多次请求只渲染一次（仅用于定时调度批量处理后的收尾）
+let _renderRAF=null;
+function scheduleRender(){
+  if(_renderRAF!==null)return;
+  _renderRAF=requestAnimationFrame(function(){_renderRAF=null;render();});
 }
 
 // ===== Utils =====
@@ -437,6 +680,18 @@ function fmtTime(ts){
   return(d.getMonth()+1)+'/'+d.getDate();
 }
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+// 用于 value="..." 等双引号属性：esc 不转义引号，需额外处理避免属性截断
+function escAttr(s){return esc(String(s==null?'':s)).replace(/"/g,'&quot;');}
+// 统一的重命名输入：空值 / 长度 / 重名校验；用户取消返回 null
+function promptName(msg,current,maxLen,taken){
+  const raw=window.prompt(msg,current||'');
+  if(raw===null)return null;
+  const name=String(raw).trim();
+  if(!name){toast('名称不能为空','err');return null;}
+  if(maxLen&&name.length>maxLen){toast('名称最多 '+maxLen+' 个字符','err');return null;}
+  if(taken&&taken(name)){toast('「'+name+'」已存在','err');return null;}
+  return name;
+}
 function totalProgress(){return Object.values(state.scores.progress||{}).reduce((s,v)=>s+v,0)}
 function domainName(id){const d=state.domains.find(x=>x.id===id);return d?d.name:'未知'}
 function taskNameLabel(id){const t=state.tasks.find(x=>x.id===id);return t?t.name:'未知'}
@@ -444,15 +699,13 @@ function collectionName(id){const c=state.collections.find(x=>x.id===id);return 
 function domainProgress(id){return(state.scores.progress[id])||(0)}
 function metricValue(m){return (m.domainIds||[]).reduce((s,did)=>s+domainProgress(did),0)}
 
-// Get domain IDs for a task — supports both new (domainIds array) and old (domainId string) format
+// 任务所属领域（新装/导入均由 parseState 归一为 domainIds 数组）
 function getTaskDomainIds(t){
   if(t.domainIds&&Array.isArray(t.domainIds)&&t.domainIds.length>0)return t.domainIds;
-  if(t.domainId)return[t.domainId];
   return['d_default'];
 }
 function taskScoreTypes(t){
   if(t.scoreTypes&&Array.isArray(t.scoreTypes)&&t.scoreTypes.length>0)return t.scoreTypes;
-  if(t.scoreType)return t.scoreType==='progress'?['progress']:['vitality'];
   return ['vitality'];
 }
 function taskHasType(t,type){return taskScoreTypes(t).indexOf(type)>=0;}
@@ -461,25 +714,451 @@ function applyCheckinGain(log,mult){
   const types=log.st==='both'?['vitality','progress']:[log.st];
   types.forEach(st=>{
     const amt=logAmt(log,st);
-    if(st==='vitality')state.scores.vitality=(state.scores.vitality||0)+mult*amt;
-    else if(st==='progress'){
-      let dids=(log.dom||'').split(',').filter(Boolean);
-      if(dids.length===0&&log.taskId){const t=state.tasks.find(x=>x.id===log.taskId);if(t)dids=getTaskDomainIds(t);}
-      if(dids.length===0)dids=['d_default'];
-      const share=amt/dids.length;
-      dids.forEach(did=>{state.scores.progress[did]=(state.scores.progress[did]||0)+mult*share;});
+    if(st==='vitality'){
+      Ledger.post({op:'grant',account:'vitality',delta:mult*amt,visible:false,reason:{src:'checkin-replay'}});
+    }else if(st==='progress'){
+      // 优先按流水自带的分配明细精确反向；无明细时回退到按领域均分
+      if(Array.isArray(log.splits)&&log.splits.length){
+        log.splits.forEach(function(sp){
+          Ledger.post({op:'grant',account:'progress:'+(sp.dom||'d_default'),delta:mult*(Number(sp.amt)||0),visible:false,reason:{src:'checkin-replay'}});
+        });
+      }else{
+        let dids=(log.dom||'').split(',').filter(Boolean);
+        if(dids.length===0&&log.taskId){const t=state.tasks.find(x=>x.id===log.taskId);if(t)dids=getTaskDomainIds(t);}
+        if(dids.length===0)dids=['d_default'];
+        Ledger.postSplits({splits:[{domainIds:dids,delta:mult*amt}],visible:false,reason:{src:'checkin-replay'}});
+      }
     }
   });
 }
 
-function addLog(st,amt,desc,src,domId,extra){
-  const entry={id:uid(),time:now(),st:st,amt:amt,desc:desc,src:src||'',dom:domId||''};
-  if(extra)Object.assign(entry,extra);
-  state.logs.unshift(entry);
-  if(state.logs.length>300)state.logs=state.logs.slice(0,300);
+const LOG_MAX=300;
+// 银行页最多渲染的流水条数
+const LOG_DISPLAY=100;
+// 深拷贝（优先原生 structuredClone，旧环境回退 JSON 往返）
+function clone(o){
+  if(typeof structuredClone==='function'){
+    try{return structuredClone(o);}catch(e){}
+  }
+  return JSON.parse(JSON.stringify(o));
+}
+// 按"分"为单位平均分摊：尾差按领域顺序逐个 +1 分，保证各份之和逐分等于原额
+function splitCents(amount,n){
+  if(!n||n<1)return[];
+  const cents=Math.round((Number(amount)||0)*100);
+  const sign=cents<0?-1:1;
+  const abs=Math.abs(cents);
+  const base=Math.floor(abs/n);
+  const rem=abs-base*n;
+  const out=[];
+  for(let i=0;i<n;i++)out.push(sign*(base+(i<rem?1:0))/100);
+  return out;
 }
 
-// ===== Cycle Engine (time periods & rules) =====
+// ===== 账务引擎（唯一资产写入入口）=====
+// 约定：账户键是运行时映射，不落盘；可见流水字段与事件流水完全一致。
+// 精度口径由调用方决定，引擎不做 round2。
+const Ledger=(function(){
+  let tx=null;
+  const policies={beforeSpend:[],beforePurchase:[],afterPost:[],onTxnEnd:[]};
+
+  // 记录统一入栈（全文件唯一写入口）：最新的在最前，超过上限原地截断（不复制整表）
+  function pushLog(entry){
+    state.logs.unshift(entry);
+    if(state.logs.length>LOG_MAX)state.logs.length=LOG_MAX;
+    return entry;
+  }
+  // 业务事件（0 元）：业务层不再直接拼装流水
+  function event(desc,src,extra){
+    const entry={id:uid(),time:now(),st:'',amt:0,desc:desc,src:src||'',dom:''};
+    if(extra)Object.assign(entry,extra);
+    return pushLog(entry);
+  }
+  // 追加到末尾：历史重放需要保持时间顺序时不走 unshift
+  function append(entry){state.logs.push(entry);return entry;}
+  // 移除流水（撤销/回收统一入口）
+  function removeLogs(pred){state.logs=state.logs.filter(pred);return state.logs;}
+  // 事务快照：排除 ext.audit（审计只追加、不参与回滚）
+  // 回滚时把原审计数组接回，并保留失败事务产生的审计记录（尝试痕迹）
+  function snapshotState(){
+    const copy=Object.assign({},state);
+    if(copy.ext)copy.ext=Object.assign({},copy.ext,{audit:[]});
+    return clone(copy);
+  }
+  function restoreState(snap,attemptedAudit){
+    const aud=(state.ext&&state.ext.audit)?state.ext.audit:[];
+    state=snap;
+    if(!state.ext)return;
+    state.ext.audit=aud;
+    if(attemptedAudit&&attemptedAudit.length){
+      state.ext.audit=(state.ext.audit||[]).concat(attemptedAudit).slice(-AUDIT_MAX);
+    }
+  }
+
+  function fail(code,info){const e=new Error(code);e.__txn=true;e.code=code;e.info=info||{};throw e;}
+  function accountInfo(key){
+    if(key==='vitality')return{get:function(){return state.scores.vitality;},set:function(v){state.scores.vitality=v;},st:'vitality',dom:''};
+    if(key==='achievement')return{get:function(){return state.scores.achievement;},set:function(v){state.scores.achievement=v;},st:'achievement',dom:''};
+    if(key.indexOf('progress:')===0){
+      const did=key.slice(9);
+      return{get:function(){return state.scores.progress[did]||0;},set:function(v){state.scores.progress[did]=v;},st:'progress',dom:did};
+    }
+    if(key.indexOf('card:')===0){
+      const cid=key.slice(5);
+      return{get:function(){return state.cards[cid]||0;},set:function(v){state.cards[cid]=v;},st:'card',dom:''};
+    }
+    fail('INVALID_ACCOUNT',{account:key});
+  }
+  function audit(rec){
+    if(!tx||!state.ext||state.ext.features&&state.ext.features.audit===false)return;
+    tx.audit.push(rec);
+  }
+  function noteWatermark(key,after){
+    if(!state.ext||!state.ext.watermarks)return;
+    const w=state.ext.watermarks;
+    if(key==='vitality'||key==='achievement'){
+      if(after>w[key].best)w[key]={best:after,at:now()};
+      return;
+    }
+    if(key.indexOf('progress:')===0){
+      const did=key.slice(9);
+      const cur=w.progress[did]||defaultWatermark();
+      if(after>cur.best)w.progress[did]={best:after,at:now()};
+    }
+  }
+  function pickExtra(reason){
+    const o={};
+    Object.keys(reason||{}).forEach(function(k){
+      if(k!=='desc'&&k!=='src'&&k!=='dom'&&k!=='name')o[k]=reason[k];
+    });
+    return o;
+  }
+  function writeEntry(op,acct,delta,reason){
+    if(op.visible===false)return null;
+    let entry;
+    if(op.entry){
+      entry=Object.assign({id:uid(),time:now()},op.entry);
+    }else{
+      entry={id:uid(),time:now(),st:op.st||acct.st,amt:delta,desc:(reason&&reason.desc)||'',src:(reason&&reason.src)||'',dom:(reason&&reason.dom!==undefined)?reason.dom:(acct.dom||'')};
+      Object.assign(entry,pickExtra(reason));
+    }
+    return pushLog(entry);
+  }
+  function post(op){
+    if(!tx){
+      const r=txn(function(){return post(op);},{save:'none',render:false,label:'auto'});
+      return r.ok?r.value:{ok:false,error:r.error};
+    }
+    const reason=op.reason||{};
+    if(op.op==='transfer'){
+      const a=accountInfo(op.from),b=accountInfo(op.to);
+      const amt=Number(op.delta)||0;
+      const beforeA=Number(a.get())||0,beforeB=Number(b.get())||0;
+      a.set(beforeA-amt);b.set(beforeB+amt);
+      tx.accounts.add(op.from);tx.accounts.add(op.to);
+      const entry=writeEntry(op,b,amt,reason);
+      audit({id:entry?entry.id:uid(),ts:now(),txn:tx.label,op:'transfer',from:op.from,to:op.to,delta:amt,src:reason.src||''});
+      noteWatermark(op.to,beforeB+amt);
+      return {ok:true,entryId:entry?entry.id:null,before:beforeA,after:beforeA-amt};
+    }
+    const acct=accountInfo(op.account);
+    const before=Number(acct.get())||0;
+    let delta;
+    if(op.op==='adjust')delta=(Number(op.target)||0)-before;
+    else delta=Number(op.delta)||0;
+    if(!isFinite(delta))fail('INVALID_AMOUNT',{account:op.account,delta:op.delta});
+    if(op.idemKey){
+      if(tx.idem[op.idemKey])return{ok:true,deduped:true,entryId:null,before:before,after:before};
+      tx.idem[op.idemKey]=true;
+    }
+    const after=before+delta;
+    acct.set(after);
+    tx.accounts.add(op.account);
+    if(acct.dom)tx.domains[acct.dom]=true;
+    const entry=writeEntry(op,acct,delta,reason);
+    audit({id:entry?entry.id:uid(),ts:now(),txn:tx.label,op:op.op,acct:op.account,delta:delta,before:before,after:after,visible:op.visible!==false,src:reason.src||''});
+    noteWatermark(op.account,after);
+    if(policies.afterPost.length){
+      policies.afterPost.forEach(function(p){
+        try{p.fn({entry:entry,account:op.account,before:before,after:after,txn:tx});}catch(e){console.warn('policy failed',p.name,e);}
+      });
+    }
+    return {ok:true,entryId:entry?entry.id:null,before:before,after:after};
+  }
+  // 多科目拆分：一次可见流水（用于 checkin 的 both 型与多领域 progress 分摊）
+  function postSplits(op){
+    if(!tx){
+      const r=txn(function(){return postSplits(op);},{save:'none',render:false,label:'auto'});
+      return r.ok?r.value:{ok:false,error:r.error};
+    }
+    const reason=op.reason||{};
+    const splits=op.splits||[];
+    const beforeOf={};
+    const domainSplits=[];
+    let total=0;
+    splits.forEach(function(s){
+      if(s.account){
+        const a=accountInfo(s.account);
+        beforeOf[s.account]=Number(a.get())||0;
+        const d=Number(s.delta)||0;
+        a.set(beforeOf[s.account]+d);
+        tx.accounts.add(s.account);
+        if(a.dom)tx.domains[a.dom]=true;
+        total+=d;
+      }else if(s.domainIds&&s.domainIds.length){
+        // 精确到分的平均分摊：各领域之和与原额逐分相等（尾差按顺序归前几个领域）
+        const parts=splitCents(Number(s.delta)||0,s.domainIds.length);
+        s.domainIds.forEach(function(did,i){
+          const key='progress:'+did;
+          const a=accountInfo(key);
+          beforeOf[key]=Number(a.get())||0;
+          const d=parts[i];
+          a.set(beforeOf[key]+d);
+          tx.accounts.add(key);
+          tx.domains[did]=true;
+          domainSplits.push({dom:did,amt:d});
+        });
+        total+=Number(s.delta)||0;
+      }
+    });
+    const entry=writeEntry(op,{st:op.st||'vitality',dom:''},total,reason);
+    // 分配明细落盘在流水自身，撤销时按原比例逐领域退回（不依赖 ext.audit）
+    if(entry&&domainSplits.length)entry.splits=domainSplits;
+    audit({id:entry?entry.id:uid(),ts:now(),txn:tx.label,op:'splits',accounts:Object.keys(beforeOf),delta:total,visible:op.visible!==false,src:reason.src||''});
+    Object.keys(beforeOf).forEach(function(k){noteWatermark(k,Number(accountInfo(k).get())||0);});
+    return {ok:true,entryId:entry?entry.id:null,accounts:Object.keys(beforeOf)};
+  }
+  function txn(fn,opts){
+    opts=opts||{};
+    if(tx){return {ok:true,value:fn(tx),nested:true};}
+    const snap=(opts.snapshot===false)?null:snapshotState();
+    tx={label:opts.label||'',accounts:new Set(),domains:{},audit:[],idem:{}};
+    let value,error=null;
+    try{value=fn(tx);}
+    catch(e){
+      if(e&&e.__txn){error={code:e.code||'ABORTED',message:e.message,info:e.info||{}};}
+      else{const attempted=tx?tx.audit:null;if(snap)restoreState(snap,attempted);tx=null;throw e;}
+    }
+    if(error){
+      if(snap)restoreState(snap,tx.audit);
+      tx=null;
+      return {ok:false,error:error};
+    }
+    const accounts=Array.from(tx.accounts);
+    try{
+      if(tx.audit.length){
+        state.ext.audit=(state.ext.audit||[]).concat(tx.audit).slice(-AUDIT_MAX);
+      }
+      state.ext.stats.updatedAt=now();
+      if(accounts.some(function(k){return k.indexOf('progress:')===0;})){
+        const tp=totalProgress();
+        if(tp>state.ext.watermarks.totalProgress.best)state.ext.watermarks.totalProgress={best:tp,at:now()};
+      }
+    }catch(e){}
+    const domains=Object.keys(tx.domains);
+    const entries=tx.audit.map(function(a){return a.id;});
+    const label=tx.label;
+    tx=null;
+    if(policies.onTxnEnd.length){
+      policies.onTxnEnd.forEach(function(p){try{p.fn({ok:true,label:label,accounts:accounts,entries:entries});}catch(e){console.warn('policy failed',p.name,e);}});
+    }
+    if(opts.save!=='none')save();
+    if(opts.render!==false)render();
+    return {ok:true,value:value,accounts:accounts,domains:domains,entries:entries};
+  }
+  function grant(account,amount,reason,opts){
+    return post(Object.assign({op:'grant',account:account,delta:amount,reason:reason},opts||{}));
+  }
+  function spend(account,amount,reason,opts){
+    return post(Object.assign({op:'spend',account:account,delta:-Math.abs(Number(amount)||0),reason:reason},opts||{}));
+  }
+  function transfer(from,to,amount,reason,opts){
+    return post(Object.assign({op:'transfer',from:from,to:to,delta:Math.abs(Number(amount)||0),reason:reason},opts||{}));
+  }
+  function adjust(account,target,reason,opts){
+    return post(Object.assign({op:'adjust',account:account,target:target,reason:reason},opts||{}));
+  }
+  const liability={
+    open:function(o){
+      o=o||{};
+      const loan={id:o.id||uid(),amount:Number(o.amount)||0,debtRate:Number(o.debtRate)||0,currency:o.currency||'vitality',productId:o.productId||'',productName:o.productName||'',date:o.date||now()};
+      state.loans.push(loan);
+      audit({id:uid(),ts:now(),txn:tx?tx.label:'',op:'liability-open',liability:loan.id,delta:loan.amount,src:(o.reason&&o.reason.src)||''});
+      return loan;
+    },
+    mutate:function(id,factor,reason){
+      const l=state.loans.find(function(x){return x.id===id;});
+      if(!l)return null;
+      const before=l.amount;
+      l.amount=typeof factor==='function'?factor(before):(Number(factor)||0);
+      audit({id:uid(),ts:now(),txn:tx?tx.label:'',op:'liability-mutate',liability:id,delta:l.amount-before,before:before,after:l.amount,visible:false,src:(reason&&reason.src)||''});
+      return l;
+    },
+    close:function(id,reason){
+      const i=state.loans.findIndex(function(x){return x.id===id;});
+      if(i<0)return false;
+      const l=state.loans[i];
+      state.loans.splice(i,1);
+      audit({id:uid(),ts:now(),txn:tx?tx.label:'',op:'liability-close',liability:id,amount:l.amount,src:(reason&&reason.src)||''});
+      return true;
+    }
+  };
+  function registerPolicy(p){
+    if(!p||!policies[p.phase])return;
+    policies[p.phase].push(p);
+    policies[p.phase].sort(function(a,b){return (a.priority||0)-(b.priority||0);});
+  }
+  // 购买前门槛：策略返回 {deny:true,code,reason} 时抛事务错误，由 txn 统一回滚
+  function runPolicies(phase,ctx){
+    const list=policies[phase]||[];
+    for(let i=0;i<list.length;i++){
+      const p=list[i];
+      let r;
+      try{r=p.fn(ctx);}
+      catch(e){console.warn('policy failed',p.name,e);continue;}
+      if(r&&r.deny)return r;
+    }
+    return null;
+  }
+  function checkPurchase(product){
+    const r=runPolicies('beforePurchase',{product:product});
+    if(r&&r.deny)fail('PURCHASE_DENIED',{code:r.code||'GATE',reason:r.reason||'购买条件未满足',reasons:r.reasons||[]});
+    return true;
+  }
+  return{
+    txn:txn,post:post,postSplits:postSplits,grant:grant,spend:spend,transfer:transfer,adjust:adjust,
+    liability:liability,registerPolicy:registerPolicy,accountInfo:accountInfo,
+    event:event,append:append,removeLogs:removeLogs,checkPurchase:checkPurchase,
+    inTxn:function(){return !!tx;},
+    balance:function(key){return Number(accountInfo(key).get())||0;},
+    entries:function(){return state.logs;},
+    // 复用撤销适配器注册表；业务层不直接触碰适配器实现
+    reverse:function(logId){return undoLog(logId);}
+  };
+})();
+
+// ===== 成果点：累计获得（单调累加）与已计入清单 =====
+// 只有真实“获得”来源计入：里程碑解锁 / 周期活动奖励 / 项目奖励。
+// 贷款、退款、撤销、手动修正都不计入；里程碑按 achId 记录已计入数额，撤销后再解锁不重复累计。
+function noteAchievementEarned(delta,entry){
+  if(!state.ext)return;
+  if(!state.ext.stats)state.ext.stats=newExtState().stats;
+  if(!state.ext.achievementCounted||typeof state.ext.achievementCounted!=='object')state.ext.achievementCounted={};
+  const src=String((entry&&entry.src)||'');
+  if(!ACH_EARN_SOURCES[src])return;
+  let add=Math.max(0,Number(delta)||0);
+  if(src==='achievement'&&entry&&entry.achId){
+    const counted=Math.max(0,Number(state.ext.achievementCounted[entry.achId])||0);
+    add=Math.max(0,add-counted);
+    const points=Math.max(Number(entry.amt)||0,Number(delta)||0);
+    state.ext.achievementCounted[entry.achId]=Math.max(counted,points);
+  }
+  if(add>0)state.ext.stats.lifetimeAchievementEarned=(Number(state.ext.stats.lifetimeAchievementEarned)||0)+add;
+}
+Ledger.registerPolicy({phase:'afterPost',priority:10,name:'achievement-lifetime',
+  fn:function(ctx){
+    if(ctx.account!=='achievement')return;
+    const delta=(Number(ctx.after)||0)-(Number(ctx.before)||0);
+    if(delta>0)noteAchievementEarned(delta,ctx.entry);
+  }
+});
+
+// ===== 活跃度索引：ext.activity[did]['YYYY-MM-DD'] = 次数 =====
+// 写入只发生在打卡路径（以及撤销打卡的反向扣减），查询只读最近 N 个日期键。
+// 索引保留最近 ACTIVITY_MAX_DAYS 个自然日；归档不清空，恢复后按历史活跃度继续计算。
+function pruneActivityBucket(bucket,cutoff){
+  Object.keys(bucket).forEach(function(k){
+    if(k<cutoff||!(Number(bucket[k])>0))delete bucket[k];
+  });
+}
+function noteCheckinActivity(dids,delta,ts){
+  if(!state.ext)return;
+  if(!state.ext.activity||typeof state.ext.activity!=='object')state.ext.activity={};
+  const key=dayKey(ts||now());
+  const cutoff=dateKeyOffset(ACTIVITY_MAX_DAYS-1);
+  const list=(Array.isArray(dids)&&dids.length)?dids:['d_default'];
+  list.forEach(function(did){
+    let bucket=state.ext.activity[did];
+    if(!bucket||typeof bucket!=='object')bucket=state.ext.activity[did]={};
+    const next=Math.max(0,Math.round((Number(bucket[key])||0)+delta));
+    if(next>0)bucket[key]=next;else delete bucket[key];
+    pruneActivityBucket(bucket,cutoff);
+    if(!Object.keys(bucket).length)delete state.ext.activity[did];
+  });
+}
+// 最近 days 个自然日（含今天）的打卡次数：逐日哈希读取，复杂度 O(days)
+function activityCountForDomain(did,days){
+  const bucket=(state.ext&&state.ext.activity&&state.ext.activity[did])||{};
+  let n=0;
+  const d=Math.max(0,Math.round(Number(days)||0));
+  for(let i=0;i<d;i++)n+=Math.max(0,Math.round(Number(bucket[dateKeyOffset(i)])||0));
+  return n;
+}
+
+// ===== 商品层级门槛 =====
+// 只读 ext.stats / ext.activity / 领域与里程碑定义，不遍历 state.logs。
+function validProductTier(tier){return PROD_TIERS.indexOf(tier)>=0?tier:'daily';}
+function isArchivedEntity(o){return !!(o&&(o.archived||o.archivedAt));}
+function evaluateProductGate(p){
+  const tier=validProductTier(p&&p.tier);
+  const out={ok:true,deny:false,tier:tier,code:null,reasons:[],reason:''};
+  if(tier==='daily')return out;
+  const gate=(p&&p.gate)||defaultProductGate();
+  if(tier==='quality'){
+    const need=Math.max(0,Math.round(toNum(gate.minLifetime)));
+    const earned=Math.max(0,toNum(state.ext&&state.ext.stats&&state.ext.stats.lifetimeAchievementEarned));
+    if(earned<need){
+      out.ok=false;out.code=out.code||'GATE_LIFETIME';
+      out.reasons.push('差 '+fmt(need-earned)+' 累计成果点');
+    }
+    const act=(gate.activity&&typeof gate.activity==='object')?gate.activity:{};
+    const did=String(act.domainId||'');
+    const days=Math.max(0,Math.min(ACTIVITY_MAX_DAYS,Math.round(toNum(act.days))));
+    const times=Math.max(0,Math.round(toNum(act.times)));
+    if(did&&days>0&&times>0){
+      const d=state.domains.find(function(x){return x.id===did;});
+      if(!d){
+        out.ok=false;out.code=out.code||'GATE_DOMAIN';
+        out.reasons.push('关联领域不存在');
+      }else if(isArchivedEntity(d)){
+        out.ok=false;out.code=out.code||'GATE_DOMAIN_ARCHIVED';
+        out.reasons.push('关联领域已归档');
+      }else{
+        const cnt=activityCountForDomain(did,days);
+        if(cnt<times){
+          out.ok=false;out.code=out.code||'GATE_ACTIVITY';
+          out.reasons.push('最近 '+days+' 天需打卡 '+times+' 次，当前 '+cnt+' 次');
+        }
+      }
+    }
+  }else{
+    const mid=String(gate.milestoneId||'');
+    const a=mid?state.achievements.find(function(x){return x.id===mid;}):null;
+    if(!mid){
+      out.ok=false;out.code='GATE_MILESTONE';
+      out.reasons.push('未绑定里程碑');
+    }else if(!a){
+      out.ok=false;out.code='GATE_MILESTONE_MISSING';
+      out.reasons.push('绑定的里程碑不存在');
+    }else if(isArchivedEntity(a)){
+      out.ok=false;out.code='GATE_MILESTONE_ARCHIVED';
+      out.reasons.push('里程碑已归档');
+    }else if(!a.unlocked){
+      out.ok=false;out.code='GATE_MILESTONE_LOCKED';
+      out.reasons.push('里程碑未解锁');
+    }
+  }
+  if(!out.ok){
+    out.deny=true;
+    out.reason=out.reasons.join('；');
+  }
+  return out;
+}
+// 唯一门槛调用点由 buyProduct 触发；策略拒绝 → txn 回滚
+Ledger.registerPolicy({phase:'beforePurchase',priority:10,name:'product-tier-gate',
+  fn:function(ctx){return evaluateProductGate(ctx.product);}
+});
+
 function dayKey(ts){
   const d=new Date(ts);
   return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
@@ -675,7 +1354,7 @@ function evalCountMetric(it,w){
 }
 function evalCondItem(it,act,ts){
   const v=Number(it.value)||0;
-  const range=validRange(it.range)?it.range:(it.scope==='total'?'total':'period');
+  const range=validRange(it.range)?it.range:'period';
   const w=range==='total'?{start:0,end:ts+1}:condWindowByRange(range,act,ts,it.days);
   // 成果点：全局累计，无主体/新增/聚合概念
   if(it.metric==='achievement'){
@@ -707,58 +1386,53 @@ function evalCondItem(it,act,ts){
 function applyResult(act,ts){
   const items=(act.result&&act.result.items)||[];
   let grantedAny=false;
-  items.forEach(it=>{
-    if(!it)return;
-    if(it.type==='card'){
-      const card=it.card||'exemption';
-      const cap=Math.max(1,Math.round(it.cap||1));
-      const amount=Math.max(0,Math.round(it.amount||0));
-      const before=state.cards[card]||0;
-      if(amount>0&&before<cap){
-        const granted=Math.min(cap,before+amount)-before;
-        state.cards[card]=before+granted;
-        if(granted>0){addLog('',0,'周期活动「'+act.name+'」发放 '+granted+' 张'+cardName(card),'card-grant','',{actId:act.id,granted:granted});grantedAny=true;}
-      }
-    }else if(it.type==='progress'){
-      const amt=Number(it.amount)||0;
-      if(amt>0){
-        if(it.domainId){
-          state.scores.progress[it.domainId]=(state.scores.progress[it.domainId]||0)+amt;
-          addLog('progress',amt,'「'+act.name+'」奖励 '+domainName(it.domainId)+' 进度','reward',it.domainId,{actId:act.id});
-        }else{
-          // No domain specified: distribute equally across all domains
-          const dids=state.domains.map(d=>d.id);
-          if(dids.length){
-            const share=amt/dids.length;
-            dids.forEach(did=>{
-              state.scores.progress[did]=(state.scores.progress[did]||0)+share;
-            });
+  const txr=Ledger.txn(function(){
+    items.forEach(it=>{
+      if(!it)return;
+      if(it.type==='card'){
+        const card=it.card||'exemption';
+        const cap=Math.max(1,Math.round(it.cap||1));
+        const amount=Math.max(0,Math.round(it.amount||0));
+        const before=state.cards[card]||0;
+        if(amount>0&&before<cap){
+          const granted=Math.min(cap,before+amount)-before;
+          if(granted>0){
+            Ledger.post({op:'grant',account:'card:'+card,delta:granted,entry:{st:'',amt:0,desc:'周期活动「'+act.name+'」发放 '+granted+' 张'+cardName(card),src:'card-grant',dom:'',actId:act.id,granted:granted},reason:{src:'card-grant'}});
+            grantedAny=true;
           }
-          addLog('progress',amt,'「'+act.name+'」奖励 进度（全领域）','reward','',{actId:act.id});
         }
-        grantedAny=true;
+      }else if(it.type==='progress'){
+        const amt=Number(it.amount)||0;
+        if(amt>0){
+          if(it.domainId){
+            Ledger.post({op:'grant',account:'progress:'+it.domainId,delta:amt,entry:{st:'progress',amt:amt,desc:'「'+act.name+'」奖励 '+domainName(it.domainId)+' 进度',src:'reward',dom:it.domainId,actId:act.id},reason:{src:'reward'}});
+          }else{
+            const dids=state.domains.map(d=>d.id);
+            Ledger.postSplits({splits:[{domainIds:dids,delta:amt}],entry:{st:'progress',amt:amt,desc:'「'+act.name+'」奖励 进度（全领域）',src:'reward',dom:'',actId:act.id},reason:{src:'reward'}});
+          }
+          grantedAny=true;
+        }
+      }else if(it.type==='vitality'){
+        const amt=Number(it.amount)||0;
+        if(amt>0){
+          const tName=it.taskId?(state.tasks.find(t=>t.id===it.taskId)||{}).name:'';
+          const lbl=tName?('「'+tName+'」活力'):'活力';
+          Ledger.post({op:'grant',account:'vitality',delta:amt,entry:{st:'vitality',amt:amt,desc:'「'+act.name+'」奖励 '+lbl+' +'+fmt(amt),src:'reward',dom:'',actId:act.id,taskId:it.taskId||''},reason:{src:'reward'}});
+          grantedAny=true;
+        }
+      }else if(it.type==='achievement'){
+        const amt=Number(it.amount)||0;
+        if(amt>0){
+          Ledger.post({op:'grant',account:'achievement',delta:amt,entry:{st:'achievement',amt:amt,desc:'「'+act.name+'」奖励 成果 +'+fmt(amt),src:'reward',dom:'',actId:act.id},reason:{src:'reward'}});
+          grantedAny=true;
+        }
       }
-    }else if(it.type==='vitality'){
-      const amt=Number(it.amount)||0;
-      if(amt>0){
-        state.scores.vitality=(state.scores.vitality||0)+amt;
-        const tName=it.taskId?(state.tasks.find(t=>t.id===it.taskId)||{}).name:'';
-        const lbl=tName?('「'+tName+'」活力'):'活力';
-        addLog('vitality',amt,'「'+act.name+'」奖励 '+lbl+' +'+fmt(amt),'reward','',{actId:act.id,taskId:it.taskId||''});
-        grantedAny=true;
-      }
-    }else if(it.type==='achievement'){
-      const amt=Number(it.amount)||0;
-      if(amt>0){
-        state.scores.achievement=(state.scores.achievement||0)+amt;
-        addLog('achievement',amt,'「'+act.name+'」奖励 成果 +'+fmt(amt),'reward','',{actId:act.id});
-        grantedAny=true;
-      }
-    }
-  });
-  if(grantedAny)checkAchievements();
+    });
+    if(grantedAny)checkAchievements();
+  },{label:'activity-reward',save:'none',render:false});
+  return txr.ok;
 }
-function processActivities(){
+function processActivities(silent=false){
   if(!state.activities)state.activities=[];
   const ts=Date.now();
   let changed=false;
@@ -770,7 +1444,7 @@ function processActivities(){
     act.lastRun=key;
     changed=true;
   });
-  if(changed)save();
+  if(changed&&!silent)save();
 }
 var _lastTickDay=null;
 function schedulerTick(){
@@ -778,12 +1452,14 @@ function schedulerTick(){
   if(_lastTickDay===null){_lastTickDay=d;return;}
   if(d===_lastTickDay)return;
   _lastTickDay=d;
-  processActivities();
-  processDailyTaskDebts();
-  processMetabolism();
-  processLoans();
-  processChoreDecay();
-  render();
+  // 统一以 silent 模式执行各处理器，最后只写盘一次
+  processActivities(true);
+  processDailyTaskDebts(true);
+  processMetabolism(true);
+  processLoansWithDecayReserve();
+  processChoreDecay(true);
+  save();
+  scheduleRender();
 }
 
 // ===== Score Engine =====
@@ -899,64 +1575,63 @@ function checkIn(taskId,stageIdx){
     toast('活力点不足，将进入负值（贷款）','warn');
   }
 
-  // Save previous state for undo
-  const prevStreak=t.streak||0;
-  const prevLastCheckIn=t.lastCheckIn||null;
-  const prevLastDebtDate=t.lastDebtDate||null;
-  const prevPendingDebt=t.pendingDebt||0;
+  const txr=Ledger.txn(function(){
+    // Save previous state for undo
+    const prevStreak=t.streak||0;
+    const prevLastCheckIn=t.lastCheckIn||null;
+    const prevLastDebtDate=t.lastDebtDate||null;
+    const prevPendingDebt=t.pendingDebt||0;
 
-  // Create the check-in log entry ID first so cost log can link to it
-  const checkinLogId=uid();
+    // Create the check-in log entry ID first so cost log can link to it
+    const checkinLogId=uid();
 
-  // Deduct vitality cost (linked to the check-in log for undo)
-  if(cost>0){
-    state.scores.vitality-=cost;
-    addLog('vitality',-cost,'「'+t.name+'」消耗活力点','cost','',{taskId:t.id,link:checkinLogId});
-  }
+    // Deduct vitality cost (linked to the check-in log for undo)
+    if(cost>0){
+      Ledger.spend('vitality',cost,{src:'cost',desc:'「'+t.name+'」消耗活力点',taskId:t.id,link:checkinLogId});
+    }
 
-  const dids=getTaskDomainIds(t);
-  if(hasV)state.scores.vitality+=netV;
-  if(hasP){
-    // Distribute progress equally across all task domains
-    const share=netP/dids.length;
-    dids.forEach(did=>{
-      state.scores.progress[did]=(state.scores.progress[did]||0)+share;
-    });
-  }
-  t.lastCheckIn=now();
-  t.checkInCount=(t.checkInCount||0)+1;
-  t.totalEarned=(t.totalEarned||0)+(hasP?netP:netV);
-  t.streak=c.newStreak;
-  delete t.lastDebtDate; // reset daily debt tracking after check-in
-  t.pendingDebt=0; // clear accumulated debt after check-in
+    const dids=getTaskDomainIds(t);
+    t.lastCheckIn=now();
+    t.checkInCount=(t.checkInCount||0)+1;
+    t.totalEarned=(t.totalEarned||0)+(hasP?netP:netV);
+    t.streak=c.newStreak;
+    delete t.lastDebtDate; // reset daily debt tracking after check-in
+    t.pendingDebt=0; // clear accumulated debt after check-in
 
-  let desc='「'+t.name+'」打卡';
-  if(staged&&stageName){
-    desc+=' · '+stageName;
-    if(hasV&&hasP)desc+=' (活力+'+fmt(netV)+' / 进度+'+fmt(netP)+')';
-    else desc+=' (+'+fmt(hasP?netP:netV)+')';
-  }else{
-    if(c.bonus>0)desc+=' (连胜'+c.newStreak+'天 +'+fmt(c.bonus)+')';
-    if(c.debt>0)desc+=' (抵扣待扣债-'+fmt(c.debt)+')';
-  }
-  if(cost>0)desc+=' (消耗活力-'+fmt(cost)+')';
+    let desc='「'+t.name+'」打卡';
+    if(staged&&stageName){
+      desc+=' · '+stageName;
+      if(hasV&&hasP)desc+=' (活力+'+fmt(netV)+' / 进度+'+fmt(netP)+')';
+      else desc+=' (+'+fmt(hasP?netP:netV)+')';
+    }else{
+      if(c.bonus>0)desc+=' (连胜'+c.newStreak+'天 +'+fmt(c.bonus)+')';
+      if(c.debt>0)desc+=' (抵扣待扣债-'+fmt(c.debt)+')';
+    }
+    if(cost>0)desc+=' (消耗活力-'+fmt(cost)+')';
 
-  // Manually insert with known ID for linking, plus undo metadata
-  const entry={id:checkinLogId,time:now(),st:st,amt:0,desc:desc,src:'checkin',dom:dids.join(','),taskId:t.id,prevStreak:prevStreak,prevLastCheckIn:prevLastCheckIn,prevLastDebtDate:prevLastDebtDate,prevPendingDebt:prevPendingDebt,prevStageLast:prevStageLast};
-  if(hasV&&hasP&&netV!==netP){
-    entry.amtV=netV;entry.amtP=netP;entry.amt=netV;
-  }else{
-    entry.amt=hasP?netP:netV;
-  }
-  state.logs.unshift(entry);
-  if(state.logs.length>300)state.logs=state.logs.slice(0,300);
+    // Manually insert with known ID for linking, plus undo metadata
+    const entry={id:checkinLogId,time:now(),st:st,amt:0,desc:desc,src:'checkin',dom:dids.join(','),taskId:t.id,prevStreak:prevStreak,prevLastCheckIn:prevLastCheckIn,prevLastDebtDate:prevLastDebtDate,prevPendingDebt:prevPendingDebt,prevStageLast:prevStageLast};
+    if(hasV&&hasP&&netV!==netP){
+      entry.amtV=netV;entry.amtP=netP;entry.amt=netV;
+    }else{
+      entry.amt=hasP?netP:netV;
+    }
+    const splits=[];
+    if(hasV)splits.push({account:'vitality',delta:netV});
+    if(hasP)splits.push({domainIds:dids,delta:netP});
+    Ledger.postSplits({splits:splits,entry:entry,reason:{src:'checkin',desc:desc,dom:dids.join(',')}});
+    // 活跃度索引的唯一写入点：打卡流水写入之后（事务内，回滚由 Ledger 统一处理）
+    noteCheckinActivity(dids,1);
 
+    if(hasP){
+      dids.forEach(did=>checkAchievements(did));
+    }
+    // 先跑各处理器（不各自写盘），最后统一保存一次
+    processDailyTaskDebts(true);
+    processLoansWithDecayReserve();
+  },{label:'checkin',save:'none',render:false});
+  if(!txr.ok)return;
   save();
-  if(hasP){
-    dids.forEach(did=>checkAchievements(did));
-  }
-  processDailyTaskDebts();
-  processLoans();
 
   let toastMsg;
   if(staged&&stageName){
@@ -999,14 +1674,14 @@ function useExemption(taskId){
   const prevLastDebtDate=t.lastDebtDate||null;
   const wasBroken=gapDays>=2;
 
-  state.cards.exemption=(state.cards.exemption||0)-1;
+  Ledger.post({op:'spend',account:'card:exemption',delta:-1,visible:false,reason:{src:'exempt-use'}});
   t.lastExempt=today.getTime()+864e5-1000; // end of today
   t.pendingDebt=0;
   delete t.lastDebtDate;
 
-  addLog('',0,'「'+t.name+'」使用断更豁免卡'+(wasBroken?'（补救）':'（请假）'),'exempt','',{taskId:t.id,prevLastExempt:prevLastExempt,prevPendingDebt:prevPendingDebt,prevLastDebtDate:prevLastDebtDate});
+  Ledger.event('「'+t.name+'」使用断更豁免卡'+(wasBroken?'（补救）':'（请假）'),'exempt',{taskId:t.id,prevLastExempt:prevLastExempt,prevPendingDebt:prevPendingDebt,prevLastDebtDate:prevLastDebtDate});
+  processDailyTaskDebts(true);
   save();
-  processDailyTaskDebts();
   toast('已使用断更豁免卡'+(wasBroken?'，待扣债已清零':''));
   render();
 }
@@ -1018,8 +1693,7 @@ function checkAchievements(domId){
     if(!a.unlocked&&prog>=a.threshold){
       a.unlocked=true;
       a.unlockedAt=now();
-      state.scores.achievement+=a.points;
-      addLog('achievement',a.points,'里程碑「'+a.name+'」解锁','achievement',a.domainId,{achId:a.id});
+      Ledger.grant('achievement',a.points,{src:'achievement',desc:'里程碑「'+a.name+'」解锁',dom:a.domainId,achId:a.id});
       toast('成就解锁：'+a.name+' (+'+a.points+' 成果点)','warn');
     }
   });
@@ -1031,7 +1705,7 @@ function addCollection(){
   const name=inp.value.trim();
   if(!name){toast('请输入集合名称','err');return}
   state.collections.push({id:uid(),name:name});
-  addLog('',0,'创建集合「'+name+'」','create');
+  Ledger.event('创建集合「'+name+'」','create');
   save();
   inp.value='';
   document.getElementById('collAdd').style.display='none';
@@ -1042,24 +1716,26 @@ function delCollection(id){
   const c=state.collections.find(x=>x.id===id);
   if(!c)return;
   if(id==='c_default'){toast('默认集合不可删除','err');return}
+  const inColl=state.tasks.filter(t=>t.collectionId===id).length;
+  if(!confirm('删除集合「'+c.name+'」？'+(inColl?'其中 '+inColl+' 个任务将移至默认集合。':'')))return;
   // Save affected tasks for undo
   const affectedTasks=state.tasks.filter(t=>t.collectionId===id).map(t=>({id:t.id,prevCollectionId:id}));
   // reassign tasks to default
   state.tasks.forEach(t=>{if(t.collectionId===id)t.collectionId='c_default'});
   // Save collection position for undo
   const collIndex=state.collections.indexOf(c);
-  const collCopy=JSON.parse(JSON.stringify(c));
+  const collCopy=clone(c);
   state.collections=state.collections.filter(x=>x.id!==id);
-  addLog('',0,'删除集合「'+c.name+'」','delete-coll','',{collCopy:collCopy,collIndex:collIndex,affectedTasks:affectedTasks});
-  save();
-  toast('集合已删除，任务已移至默认');
-  render();
+  Ledger.event('删除集合「'+c.name+'」','delete-coll',{collCopy:collCopy,collIndex:collIndex,affectedTasks:affectedTasks});
+  commit('集合已删除，任务已移至默认');
 }
 function renameCollection(id){
   const c=state.collections.find(x=>x.id===id);
   if(!c)return;
-  const name=prompt('重命名集合：',c.name);
-  if(name&&name.trim()){c.name=name.trim();save();render()}
+  const name=promptName('重命名集合：',c.name,20,function(n){return state.collections.some(x=>x.id!==id&&x.name===n);});
+  if(name===null)return;
+  c.name=name;
+  commit();
 }
 
 // ===== Domains =====
@@ -1070,7 +1746,7 @@ function addDomain(){
   const id=uid();
   state.domains.push({id:id,name:name,createdAt:now()});
   state.scores.progress[id]=0;
-  addLog('',0,'创建领域「'+name+'」','create');
+  Ledger.event('创建领域「'+name+'」','create');
   save();
   inp.value='';
   document.getElementById('domAddInline').style.display='none';
@@ -1083,14 +1759,14 @@ function delDomain(id){
   if(id==='d_default'){toast('默认领域不可删除','err');return}
   if(!confirm('删除领域「'+d.name+'」？\n（进度值将合并至默认领域，可在银行流水撤销此操作）'))return;
   const domIndex=state.domains.indexOf(d);
-  const domCopy=JSON.parse(JSON.stringify(d));
+  const domCopy=clone(d);
 
   // Save affected tasks for undo
   const affectedTasks=[];
   state.tasks.forEach(t=>{
     const dids=getTaskDomainIds(t);
     if(dids.includes(id)){
-      affectedTasks.push({id:t.id,prevDomainIds:JSON.parse(JSON.stringify(t.domainIds||[])),prevDomainId:t.domainId||null});
+      affectedTasks.push({id:t.id,prevDomainIds:clone(t.domainIds||[]),prevDomainId:t.domainId||null});
       const newDids=dids.filter(x=>x!==id);
       if(newDids.length===0)newDids.push('d_default');
       t.domainIds=newDids;
@@ -1109,11 +1785,13 @@ function delDomain(id){
 
   // merge progress into default
   const progressVal=state.scores.progress[id]||0;
-  state.scores.progress['d_default']=(state.scores.progress['d_default']||0)+progressVal;
+  Ledger.post({op:'grant',account:'progress:d_default',delta:progressVal,visible:false,reason:{src:'delete-domain'}});
+  // 账户按 0 归零后移除键，等价于原来的 delete
+  if(id in state.scores.progress)Ledger.post({op:'adjust',account:'progress:'+id,target:0,visible:false,reason:{src:'delete-domain'}});
   delete state.scores.progress[id];
 
   state.domains=state.domains.filter(x=>x.id!==id);
-  addLog('',0,'删除领域「'+d.name+'」','delete-domain','',{domCopy:domCopy,domIndex:domIndex,progressVal:progressVal,affectedTasks:affectedTasks,affectedAchs:affectedAchs});
+  Ledger.event('删除领域「'+d.name+'」','delete-domain',{domCopy:domCopy,domIndex:domIndex,progressVal:progressVal,affectedTasks:affectedTasks,affectedAchs:affectedAchs});
   checkAchievements();
   save();
   toast('领域已删除，进度已合并至默认');
@@ -1122,8 +1800,10 @@ function delDomain(id){
 function renameDomain(id){
   const d=state.domains.find(x=>x.id===id);
   if(!d)return;
-  const name=prompt('重命名领域：',d.name);
-  if(name&&name.trim()){d.name=name.trim();save();render()}
+  const name=promptName('重命名领域：',d.name,20,function(n){return state.domains.some(x=>x.id!==id&&x.name===n);});
+  if(name===null)return;
+  d.name=name;
+  commit();
 }
 
 // ===== Task CRUD =====
@@ -1169,7 +1849,7 @@ function saveTaskData(data){
     };
     if(data.stageRewards)nt.stageRewards=data.stageRewards;
     state.tasks.push(nt);
-    addLog('',0,'创建任务「'+data.name+'」','create');
+    Ledger.event('创建任务「'+data.name+'」','create');
     save();
     return true;
   }
@@ -1207,11 +1887,11 @@ function finalizeTaskSave(t,data,opts){
       if(earned!==0&&opts.oldDids.length&&opts.newDids.length){
         const oldShare=earned/opts.oldDids.length;
         opts.oldDids.forEach(did=>{
-          state.scores.progress[did]=(state.scores.progress[did]||0)-oldShare;
+          Ledger.post({op:'grant',account:'progress:'+did,delta:-oldShare,visible:false,reason:{src:'task-domain-migrate'}});
         });
         const newShare=earned/opts.newDids.length;
         opts.newDids.forEach(did=>{
-          state.scores.progress[did]=(state.scores.progress[did]||0)+newShare;
+          Ledger.post({op:'grant',account:'progress:'+did,delta:newShare,visible:false,reason:{src:'task-domain-migrate'}});
         });
       }
     }
@@ -1221,14 +1901,15 @@ function finalizeTaskSave(t,data,opts){
   if(!data.stageRewards)delete t.stageRewards;
   if(opts.domainMode){
     const modeLabel=opts.domainMode==='migrate'?'连同历史迁移':(opts.domainMode==='future'?'仅影响未来':'重算历史');
-    addLog('',0,'任务「'+data.name+'」领域变更：'+modeLabel,'task-domain','',{taskId:t.id,oldDomains:opts.oldDids,newDomains:opts.newDids,mode:opts.domainMode});
+    Ledger.event('任务「'+data.name+'」领域变更：'+modeLabel,'task-domain',{taskId:t.id,oldDomains:opts.oldDids,newDomains:opts.newDids,mode:opts.domainMode});
   }
-  addLog('',0,'修改任务「'+data.name+'」','edit');
+  Ledger.event('修改任务「'+data.name+'」','edit');
   save();
 }
 
 // Replay all check-in logs for a task using new parameters
 function recalcTaskHistory(t, newData){
+  Ledger.txn(function(){
   // Collect all check-in logs for this task, sorted ascending by time
   const checkinLogs=state.logs.filter(l=>l.src==='checkin'&&l.taskId===t.id)
     .sort((a,b)=>a.time-b.time);
@@ -1242,7 +1923,7 @@ function recalcTaskHistory(t, newData){
     applyCheckinGain(log,-1);
     // Undo old vitality cost
     if(oldCost>0){
-      state.scores.vitality+=oldCost;
+      Ledger.post({op:'grant',account:'vitality',delta:oldCost,visible:false,reason:{src:'recalc-cost'}});
     }
   });
   
@@ -1287,16 +1968,17 @@ function recalcTaskHistory(t, newData){
     const net=gross-debt;
     
     // Apply new net to scores (distribute across new domains)
-    if(newScoreTypes.indexOf('vitality')>=0)state.scores.vitality+=net;
+    if(newScoreTypes.indexOf('vitality')>=0)Ledger.post({op:'grant',account:'vitality',delta:net,visible:false,reason:{src:'recalc'}});
+    let newParts=null;
     if(newScoreTypes.indexOf('progress')>=0){
-      const share=net/newDids.length;
-      newDids.forEach(did=>{
-        state.scores.progress[did]=(state.scores.progress[did]||0)+share;
+      newParts=splitCents(net,newDids.length);
+      newDids.forEach((did,i)=>{
+        Ledger.post({op:'grant',account:'progress:'+did,delta:newParts[i],visible:false,reason:{src:'recalc'}});
       });
     }
     
     if(newCost>0){
-      state.scores.vitality-=newCost;
+      Ledger.post({op:'grant',account:'vitality',delta:-newCost,visible:false,reason:{src:'recalc-cost'}});
     }
     
     // Update log entry（清除旧的双分值字段，避免统计仍读到旧值）
@@ -1304,6 +1986,9 @@ function recalcTaskHistory(t, newData){
     log.amt=net;
     log.st=(newScoreTypes.indexOf('vitality')>=0&&newScoreTypes.indexOf('progress')>=0)?'both':(newScoreTypes.indexOf('progress')>=0?'progress':'vitality');
     log.dom=newScoreTypes.indexOf('progress')>=0?newDids.join(','):'';
+    // 重放后刷新分配明细，保证后续撤销仍能逐领域精确反向
+    if(newParts)log.splits=newDids.map((did,i)=>({dom:did,amt:newParts[i]}));
+    else delete log.splits;
     let desc='「'+newData.name+'」打卡';
     if(bonus>0)desc+=' (连胜'+newStreak+'天 +'+fmt(bonus)+')';
     if(newCost>0)desc+=' (消耗活力-'+fmt(newCost)+')';
@@ -1319,10 +2004,10 @@ function recalcTaskHistory(t, newData){
           costLog.amt=-newCost;
           costLog.desc='「'+newData.name+'」消耗活力点';
         }else{
-          state.logs=state.logs.filter(l=>l.id!==costLog.id);
+          Ledger.removeLogs(l=>l.id!==costLog.id);
         }
       }else if(newCost>0&&oldCost===0){
-        state.logs.push({id:uid(),time:logTime,st:'vitality',amt:-newCost,desc:'「'+newData.name+'」消耗活力点',src:'cost',dom:'',taskId:t.id,link:log.id});
+        Ledger.append({id:uid(),time:logTime,st:'vitality',amt:-newCost,desc:'「'+newData.name+'」消耗活力点',src:'cost',dom:'',taskId:t.id,link:log.id});
       }
     }
     
@@ -1341,14 +2026,15 @@ function recalcTaskHistory(t, newData){
   if(newScoreTypes.indexOf('progress')>=0){
     newDids.forEach(did=>checkAchievements(did));
   }
-  processDailyTaskDebts();
-  processLoans();
+  processDailyTaskDebts(true);
+  processLoansWithDecayReserve();
+  },{label:'recalc',save:'none',render:false});
 }
 function delTask(id){
   const t=state.tasks.find(x=>x.id===id);
   if(!t)return;
   const taskIndex=state.tasks.indexOf(t);
-  const taskCopy=JSON.parse(JSON.stringify(t));
+  const taskCopy=clone(t);
 
   // Move earned progress to default domain so it isn't orphaned
   let progressMoved=null;
@@ -1357,17 +2043,17 @@ function delTask(id){
     const share=t.totalEarned/dids.length;
     const fromDomains=dids.map(did=>({did:did,amount:share}));
     dids.forEach(did=>{
-      state.scores.progress[did]=(state.scores.progress[did]||0)-share;
+      Ledger.post({op:'grant',account:'progress:'+did,delta:-share,visible:false,reason:{src:'delete-task'}});
     });
-    state.scores.progress['d_default']=(state.scores.progress['d_default']||0)+t.totalEarned;
+    Ledger.post({op:'grant',account:'progress:d_default',delta:t.totalEarned,visible:false,reason:{src:'delete-task'}});
     progressMoved={fromDomains:fromDomains,totalMoved:t.totalEarned};
   }
 
   state.tasks=state.tasks.filter(x=>x.id!==id);
-  addLog('',0,'删除任务「'+t.name+'」','delete-task','',{taskCopy:taskCopy,taskIndex:taskIndex,progressMoved:progressMoved});
+  Ledger.event('删除任务「'+t.name+'」','delete-task',{taskCopy:taskCopy,taskIndex:taskIndex,progressMoved:progressMoved});
   checkAchievements();
-  processDailyTaskDebts();
-  processLoans();
+  processDailyTaskDebts(true);
+  processLoansWithDecayReserve();
   save();
 }
 
@@ -1382,7 +2068,7 @@ function saveAchData(data){
       id:uid(),name:data.name,domainId:data.domainId,threshold:data.threshold,
       points:data.points,unlocked:false,unlockedAt:null
     });
-    addLog('',0,'设定里程碑「'+data.name+'」','create');
+    Ledger.event('设定里程碑「'+data.name+'」','create');
   }
   save();
   checkAchievements(data.domainId);
@@ -1391,10 +2077,10 @@ function delAch(id){
   const a=state.achievements.find(x=>x.id===id);
   if(!a)return;
   const achIndex=state.achievements.indexOf(a);
-  const achCopy=JSON.parse(JSON.stringify(a));
+  const achCopy=clone(a);
   // Don't subtract achievement points — they were earned and should be kept
   state.achievements=state.achievements.filter(x=>x.id!==id);
-  addLog('',0,'删除里程碑「'+a.name+'」','delete-ach','',{achCopy:achCopy,achIndex:achIndex});
+  Ledger.event('删除里程碑「'+a.name+'」','delete-ach',{achCopy:achCopy,achIndex:achIndex});
   save();
 }
 
@@ -1446,7 +2132,7 @@ function addShopCategory(){
   const name=inp.value.trim();
   if(!name){toast('请输入分类名称','err');return}
   state.shopCategories.push({id:uid(),name:name});
-  addLog('',0,'创建商品分类「'+name+'」','create');
+  Ledger.event('创建商品分类「'+name+'」','create');
   save();
   inp.value='';
   document.getElementById('shopCatAdd').style.display='none';
@@ -1459,7 +2145,7 @@ function delShopCategory(id){
   if(id==='sc_default'){toast('默认分类不可删除','err');return}
   if(!confirm('删除商品分类「'+c.name+'」？\n（商品将移至默认分类，可在银行流水撤销此操作）'))return;
   const catIndex=state.shopCategories.indexOf(c);
-  const catCopy=JSON.parse(JSON.stringify(c));
+  const catCopy=clone(c);
   const affectedProducts=[];
   state.products.forEach(p=>{
     if(p.categoryId===id){
@@ -1468,7 +2154,7 @@ function delShopCategory(id){
     }
   });
   state.shopCategories=state.shopCategories.filter(x=>x.id!==id);
-  addLog('',0,'删除商品分类「'+c.name+'」','delete-shopcat','',{catCopy:catCopy,catIndex:catIndex,affectedProducts:affectedProducts});
+  Ledger.event('删除商品分类「'+c.name+'」','delete-shopcat',{catCopy:catCopy,catIndex:catIndex,affectedProducts:affectedProducts});
   save();
   toast('分类已删除，商品已移至默认');
   render();
@@ -1476,29 +2162,37 @@ function delShopCategory(id){
 function renameShopCategory(id){
   const c=state.shopCategories.find(x=>x.id===id);
   if(!c)return;
-  const name=prompt('重命名分类：',c.name);
-  if(name&&name.trim()){c.name=name.trim();save();render()}
+  const name=promptName('重命名分类：',c.name,20,function(n){return state.shopCategories.some(x=>x.id!==id&&x.name===n);});
+  if(name===null)return;
+  c.name=name;
+  commit();
 }
-function fillShopCatSelect(sel,selected){
-  sel.innerHTML=state.shopCategories.map(c=>
-    '<option value="'+c.id+'"'+(c.id===selected?' selected':'')+'>'+esc(c.name)+'</option>'
-  ).join('');
-}
+function fillShopCatSelect(sel,selected){fillSelect(sel,state.shopCategories,selected);}
 
 // ===== Product CRUD =====
+function productGateContext(){
+  return{
+    domainIds:new Set(state.domains.map(function(d){return d.id;})),
+    achIds:new Set(state.achievements.map(function(a){return a.id;}))
+  };
+}
 function saveProdData(data){
+  const tier=validProductTier(data.tier);
+  const gate=normalizeProductGate(data.gate,productGateContext());
+  const currency=tierCurrency(tier);
   if(data.id){
     const p=state.products.find(x=>x.id===data.id);
     if(!p)return;
-    Object.assign(p,data);
+    Object.assign(p,data,{tier:tier,gate:gate,currency:currency});
   }else{
     state.products.push({
-      id:uid(),name:data.name,desc:data.desc,currency:data.currency,
+      id:uid(),name:data.name,desc:data.desc,currency:currency,
+      tier:tier,gate:gate,
       price:data.price,stock:data.stock,categoryId:data.categoryId||'sc_default',
       debtRate:data.debtRate||0,
       sold:0,createdAt:now()
     });
-    addLog('',0,'上架商品「'+data.name+'」','create');
+    Ledger.event('上架商品「'+data.name+'」','create');
   }
   save();
 }
@@ -1506,43 +2200,48 @@ function delProd(id){
   const p=state.products.find(x=>x.id===id);
   if(!p)return;
   const prodIndex=state.products.indexOf(p);
-  const prodCopy=JSON.parse(JSON.stringify(p));
+  const prodCopy=clone(p);
   state.products=state.products.filter(x=>x.id!==id);
-  addLog('',0,'删除商品「'+p.name+'」','delete-prod','',{prodCopy:prodCopy,prodIndex:prodIndex});
+  Ledger.event('删除商品「'+p.name+'」','delete-prod',{prodCopy:prodCopy,prodIndex:prodIndex});
   save();
 }
 function buyProduct(id){
   const p=state.products.find(x=>x.id===id);
   if(!p)return;
   if(p.stock===0){toast('已售罄','err');return}
-  const cn=p.currency==='vitality'?'活力点':'成果点';
-  const balance=state.scores[p.currency];
+  const tier=validProductTier(p.tier);
+  const cur=tierCurrency(tier);
+  const cn=cur==='vitality'?'活力点':'成果点';
+  const balance=state.scores[cur];
   const willLoan=balance<p.price;
   const loanAmt=willLoan?(p.price-balance):0;
   const loanId=uid();
 
-  if(willLoan)state.scores[p.currency]+=loanAmt;
-  state.scores[p.currency]-=p.price;
-  if(p.stock>0)p.stock--;
-  p.sold=(p.sold||0)+1;
+  const txr=Ledger.txn(function(){
+    // 唯一门槛判定点：策略拒绝抛事务错误，由 txn 统一回滚
+    Ledger.checkPurchase(p);
+    if(willLoan)Ledger.post({op:'grant',account:cur,delta:loanAmt,visible:false,reason:{src:'loan-draw'}});
+    if(p.stock>0)p.stock--;
+    p.sold=(p.sold||0)+1;
 
-  let desc='购买「'+p.name+'」';
-  if(willLoan){
-    desc+=' (贷款'+fmt(loanAmt)+' '+cn+')';
-    state.loans.push({
-      id:loanId,
-      amount:loanAmt,
-      debtRate:p.debtRate||0,
-      currency:p.currency,
-      productId:p.id,
-      productName:p.name,
-      date:now()
-    });
+    let desc='购买「'+p.name+'」';
+    if(willLoan){
+      desc+=' (贷款'+fmt(loanAmt)+' '+cn+')';
+      Ledger.liability.open({
+        id:loanId,amount:loanAmt,debtRate:p.debtRate||0,currency:cur,
+        productId:p.id,productName:p.name,reason:{src:'purchase'}
+      });
+    }
+    Ledger.spend(cur,p.price,{src:'purchase',desc:desc,prodId:p.id,loanId:willLoan?loanId:'',loanAmt:willLoan?loanAmt:0});
+    processDailyTaskDebts(true);
+    processLoansWithDecayReserve();
+  },{label:'buyProduct',save:'none',render:false});
+  if(!txr.ok){
+    const info=(txr.error&&txr.error.info)||{};
+    if(txr.error&&txr.error.code==='PURCHASE_DENIED')toast(info.reason||'购买条件未满足','err');
+    return;
   }
-  addLog(p.currency,-p.price,desc,'purchase','',{prodId:p.id,loanId:willLoan?loanId:'',loanAmt:willLoan?loanAmt:0});
   save();
-  processDailyTaskDebts();
-  processLoans();
   toast('已购买：'+p.name+' (-'+fmt(p.price)+' '+cn+')'+(willLoan?' · 贷款'+fmt(loanAmt):''));
   render();
 }
@@ -1551,10 +2250,11 @@ function buyProduct(id){
 // Accumulates pending debt on each task (does NOT deduct from total scores).
 // Debt is only applied at check-in time, reducing the earnable amount.
 // If net (gross - pendingDebt) goes negative, the excess is deducted from total scores.
-function processDailyTaskDebts(){
+function processDailyTaskDebts(silent=false){
   const today=new Date();today.setHours(0,0,0,0);
 
   state.tasks.forEach(task=>{
+    if(task.archived)return; // 归档任务不参与打卡与债务累积
     if(task.debtRate<=0)return;
     if(!task.lastCheckIn)return;
 
@@ -1582,12 +2282,12 @@ function processDailyTaskDebts(){
     task.lastDebtDate=today.getTime();
   });
 
-  save();
+  if(!silent)save();
 }
 
 // ===== Metabolism (auto-archive / auto-delete) =====
 // Tasks not checked in for 2+ weeks get archived; never-checked tasks get deleted after 2 weeks.
-function processMetabolism(){
+function processMetabolism(silent=false){
   const today=new Date();today.setHours(0,0,0,0);
   const twoWeeks=14*864e5;
   let changed=false;
@@ -1609,77 +2309,84 @@ function processMetabolism(){
       task.archived=true;
       task.archivedAt=now();
       changed=true;
-      addLog('',0,'任务「'+task.name+'」连续两周未打卡，已归档','archive','',{taskId:task.id});
+      Ledger.event('任务「'+task.name+'」连续两周未打卡，已归档','archive',{taskId:task.id});
     }
   });
   if(toDelete.length){
     toDelete.forEach(t=>{
-      addLog('',0,'任务「'+t.name+'」从未打卡且超两周，已自动删除','auto-delete','',{taskName:t.name});
+      Ledger.event('任务「'+t.name+'」从未打卡且超两周，已自动删除','auto-delete',{taskName:t.name});
     });
     const ids=new Set(toDelete.map(t=>t.id));
     state.tasks=state.tasks.filter(t=>!ids.has(t.id));
     changed=true;
   }
-  if(changed)save();
+  if(changed&&!silent)save();
 }
 function unlockTask(taskId){
   const t=state.tasks.find(x=>x.id===taskId);
   if(!t||!t.archived)return;
   const cost=3;
   if((state.scores.vitality||0)<cost){toast('活力点不足（需要'+cost+'点）','err');return}
-  state.scores.vitality-=cost;
-  t.archived=false;
-  delete t.archivedAt;
-  // Reset streak/debt so it's a fresh start
-  t.pendingDebt=0;
-  delete t.lastDebtDate;
-  addLog('vitality',-cost,'解锁归档任务「'+t.name+'」 (-'+cost+'活力)','unlock','',{taskId:t.id});
+  const txr=Ledger.txn(function(){
+    t.archived=false;
+    delete t.archivedAt;
+    // Reset streak/debt so it's a fresh start
+    t.pendingDebt=0;
+    delete t.lastDebtDate;
+    Ledger.spend('vitality',cost,{src:'unlock',desc:'解锁归档任务「'+t.name+'」 (-'+cost+'活力)',taskId:t.id});
+  },{label:'unlock',save:'none',render:false});
+  if(!txr.ok)return;
   save();
   toast('已解锁「'+t.name+'」，可重新打卡');
   render();
 }
 
 // ===== Loan processing (daily interest) =====
-function processLoans(){
-  if(!state.loans)state.loans=[];
-  
-  // Process daily interest if days have passed
-  if(state.loans.length>0){
-    const today=new Date();today.setHours(0,0,0,0);
-    let lastDate;
-    if(state.lastDebtDate){
-      lastDate=new Date(state.lastDebtDate);lastDate.setHours(0,0,0,0);
+// silent：不单独写盘（由调用方统一 commit）
+// reserveVitality：还贷前先预留「当天已腐化但尚未入账」的活力点，避免用这笔钱还贷
+function processLoans(silent=false,reserveVitality=0){
+  Ledger.txn(function(){
+    if(!state.loans)state.loans=[];
+
+    // Process daily interest if days have passed
+    if(state.loans.length>0){
+      const today=new Date();today.setHours(0,0,0,0);
+      let lastDate;
+      if(state.lastDebtDate){
+        lastDate=new Date(state.lastDebtDate);lastDate.setHours(0,0,0,0);
+      }else{
+        lastDate=today;
+      }
+      const days=Math.round((today-lastDate)/864e5);
+      if(days>0){
+        state.loans.slice().forEach(function(loan){
+          if(loan.debtRate<=0)return;
+          // 复利按天换算为一次幂运算，避免按天循环
+          Ledger.liability.mutate(loan.id,function(before){return before*Math.pow(1+loan.debtRate/100,days);},{src:'loan-interest'});
+        });
+        state.lastDebtDate=today.getTime();
+      }
     }else{
-      lastDate=today;
+      state.lastDebtDate=now();
     }
-    const days=Math.round((today-lastDate)/864e5);
-    if(days>0){
-      state.loans.forEach(loan=>{
-        if(loan.debtRate<=0)return;
-        for(let i=0;i<days;i++){
-          loan.amount+=loan.amount*(loan.debtRate/100);
+
+    // Auto-pay loans when balance is sufficient (always check)
+    if(state.loans.length>0){
+      const reserve=(typeof reserveVitality==='number'&&isFinite(reserveVitality))?Math.max(0,reserveVitality):0;
+      state.loans.slice().forEach(function(loan){
+        const avail=(state.scores[loan.currency]||0)-(loan.currency==='vitality'?reserve:0);
+        if(avail>=loan.amount){
+          Ledger.spend(loan.currency,loan.amount,{src:'loan-repay',desc:'偿还贷款「'+loan.productName+'」',loanId:loan.id,loanCopy:clone(loan)});
+          Ledger.liability.close(loan.id,{src:'loan-repay'});
         }
       });
-      state.lastDebtDate=today.getTime();
     }
-  }else{
-    state.lastDebtDate=now();
-  }
-
-  // Auto-pay loans when balance is sufficient (always check)
-  if(state.loans.length>0){
-    const remaining=[];
-    state.loans.forEach(loan=>{
-      if(state.scores[loan.currency]>=loan.amount){
-        state.scores[loan.currency]-=loan.amount;
-        addLog(loan.currency,-loan.amount,'偿还贷款「'+loan.productName+'」','loan-repay','',{loanId:loan.id,loanCopy:JSON.parse(JSON.stringify(loan))});
-      }else{
-        remaining.push(loan);
-      }
-    });
-    state.loans=remaining;
-  }
-  save();
+  },{label:'loans',save:silent?'none':'debounce',render:false});
+}
+// 还贷前统一按当天腐化总额预留（不改变 processLoans 与 processChoreDecay 的先后顺序）
+function processLoansWithDecayReserve(){
+  const decay=computeChoreDecay();
+  processLoans(true,decay.total||0);
 }
 
 // ===== 手动修正余额（用于修复历史版本重复扣减造成的余额偏差） =====
@@ -1700,8 +2407,14 @@ function manualAdjustBalance(){
   if(!isFinite(amt)){toast('请输入有效数字','err');return}
   if(amt===0){toast('调整值为 0，未做修改','err');return}
   const after=Math.round((before+amt)*10000)/10000;
-  state.scores[key]=after;
-  addLog(key,amt,'手动修正'+label+'余额 '+fmt(before)+' → '+fmt(after),'manual-adjust','',{before:before,after:after});
+  const txr=Ledger.txn(function(){
+    Ledger.post({
+      op:'adjust',account:key,target:after,
+      entry:{st:key,amt:amt,desc:'手动修正'+label+'余额 '+fmt(before)+' → '+fmt(after),src:'manual-adjust',dom:'',before:before,after:after},
+      reason:{src:'manual-adjust'}
+    });
+  },{label:'manual-adjust',save:'none',render:false});
+  if(!txr.ok)return;
   save();
   toast(label+'已修正：'+fmt(before)+' → '+fmt(after));
   render();
@@ -1716,6 +2429,13 @@ function clearDataResults(){
   state.cards={exemption:0};
   state.lastDebtDate=null;
   state.affairUndo={};
+  state.ext.stats=newExtState().stats;
+  state.ext.watermarks=newExtState().watermarks;
+  state.ext.budgets={period:'week',items:[],records:[]};
+  state.ext.audit=[];
+  // 结果型扩展数据随清空归零；商品门槛等配置类字段保留
+  state.ext.activity={};
+  state.ext.achievementCounted={};
 
   state.tasks.forEach(t=>{
     t.checkInCount=0;
@@ -1772,8 +2492,13 @@ function clearEverything(){
   affairDoneOpen=false;
   choreDoneOpen=false;
   loadIssue=null;
+  // 清掉 localStorage 残留：保留损坏备份（事故恢复用），清理阶段预设与备份提醒时间
+  try{localStorage.removeItem(STAGE_PRESET_KEY);}catch(e){}
+  try{localStorage.removeItem(BACKUP_KEY);}catch(e){}
+  stagePresets={stepPct:50,decreasePct:100};
+  // 重置每日 tick 基准，避免清空后立刻被当成跨天而触发一轮结算
+  _lastTickDay=dayKey(now());
   save();
-  idbDelete(KEY+'_corrupt').catch(function(){});
   const rb=document.getElementById('recoverBar');if(rb)rb.style.display='none';
   closeModal('clearDataModal');
   render();
@@ -1787,16 +2512,14 @@ function goTab(name){
 }
 
 // ===== Helpers for selects =====
-function fillCollectionSelect(sel,selected){
-  sel.innerHTML=state.collections.map(c=>
-    '<option value="'+c.id+'"'+(c.id===selected?' selected':'')+'>'+esc(c.name)+'</option>'
-  ).join('');
+function fillSelect(sel,items,selected){
+  if(!sel)return;
+  sel.innerHTML=items.map(function(x){
+    return '<option value="'+x.id+'"'+(x.id===selected?' selected':'')+'>'+esc(x.name)+'</option>';
+  }).join('');
 }
-function fillDomainSelect(sel,selected){
-  sel.innerHTML=state.domains.map(d=>
-    '<option value="'+d.id+'"'+(d.id===selected?' selected':'')+'>'+esc(d.name)+'</option>'
-  ).join('');
-}
+function fillCollectionSelect(sel,selected){fillSelect(sel,state.collections,selected);}
+function fillDomainSelect(sel,selected){fillSelect(sel,state.domains,selected);}
 // Multi-select domain checklist for task modal
 function fillDomainChecklist(container, selectedIds){
   const selSet=new Set(selectedIds);
@@ -1806,17 +2529,24 @@ function fillDomainChecklist(container, selectedIds){
       +'<input type="checkbox" value="'+d.id+'" '+(isSel?'checked':'')+'>'
       +'<span>'+esc(d.name)+'</span></label>';
   }).join('');
-  // Toggle visual state on click
-  container.querySelectorAll('.dom-check').forEach(lbl=>{
-    lbl.addEventListener('click',function(e){
-      if(e.target.tagName==='INPUT')return; // let checkbox handle itself
-      const cb=this.querySelector('input');
-      cb.checked=!cb.checked;
-      this.classList.toggle('sel',cb.checked);
-    });
-    lbl.querySelector('input').addEventListener('change',function(){
-      lbl.classList.toggle('sel',this.checked);
-    });
+  // 事件委托（容器只绑一次）：整行点击切换勾选，勾选框自身变化同步高亮
+  if(container._domCheckBound)return;
+  container._domCheckBound=true;
+  container.addEventListener('click',function(e){
+    const lbl=e.target.closest('.dom-check');
+    if(!lbl||!container.contains(lbl))return;
+    if(e.target.tagName==='INPUT')return; // 勾选框本体交给原生 + change 处理
+    // 阻断 label 的原生激活，避免「原生切换 + 手动反转」造成点一次翻两次
+    e.preventDefault();
+    const cb=lbl.querySelector('input');
+    if(!cb)return;
+    cb.checked=!cb.checked;
+    lbl.classList.toggle('sel',cb.checked);
+  });
+  container.addEventListener('change',function(e){
+    if(!e.target||e.target.tagName!=='INPUT')return;
+    const lbl=e.target.closest('.dom-check');
+    if(lbl)lbl.classList.toggle('sel',e.target.checked);
   });
 }
 function getCheckedDomainIds(){
@@ -1826,16 +2556,17 @@ function getCheckedDomainIds(){
 }
 
 // ===== Render: Work =====
+// 三处分数栏（打工/银行/商店）共用的刷新逻辑
+function setScoreCell(id,val){
+  const el=document.getElementById(id);
+  if(!el)return;
+  el.textContent=fmt(val);
+  el.classList.toggle('neg',val<0);
+}
 function renderWork(){
-  const wV=document.getElementById('wVitality');
-  wV.textContent=fmt(state.scores.vitality);
-  wV.classList.toggle('neg',state.scores.vitality<0);
-  const wP=document.getElementById('wProgress');
-  wP.textContent=fmt(totalProgress());
-  wP.classList.toggle('neg',totalProgress()<0);
-  const wA=document.getElementById('wAchievement');
-  wA.textContent=fmt(state.scores.achievement);
-  wA.classList.toggle('neg',state.scores.achievement<0);
+  setScoreCell('wVitality',state.scores.vitality);
+  setScoreCell('wProgress',totalProgress());
+  setScoreCell('wAchievement',state.scores.achievement);
 
   const domCount=state.domains.length;
   document.getElementById('wProgressSub').textContent=domCount>1?domCount+'个领域':'';
@@ -1970,25 +2701,14 @@ function affairTags(a){
 }
 function migrateAffair(a){
   if(!a)return a;
-  // 各字段独立迁移，互不依赖：避免 totalReward 已存在时跳过 linkAch→ach 迁移
-  if(a.totalReward===undefined){
-    const w=Number(a.weight);
-    let scale=a.scale;
-    if(!scale)scale=(!isNaN(w))?(w>=8?'project':(w>=4?'important':'daily')):'daily';
-    a.totalReward=(scale==='project')?1:(scale==='important'?0.5:0.1);
-  }
-  if(a.linkAch!==undefined&&a.ach===undefined){
-    a.ach={enabled:!!a.linkAch,amount:a.linkAch?1:0};
-  }
-  if(a.currentCell===undefined&&a.doneAt)a.currentCell=9;
-  if(a.alreadyGiven===undefined&&a.doneAt&&a.totalReward!==undefined)a.alreadyGiven=a.totalReward;
-  delete a.scale;delete a.linkAch;delete a.weight;
   if(typeof a.totalReward!=='number'||isNaN(a.totalReward))a.totalReward=0.1;
   if(typeof a.currentCell!=='number'||isNaN(a.currentCell))a.currentCell=0;
   a.currentCell=Math.max(0,Math.min(9,Math.round(a.currentCell)));
   if(typeof a.alreadyGiven!=='number'||isNaN(a.alreadyGiven))a.alreadyGiven=0;
   if(!a.curve||!Array.isArray(a.curve.values)||a.curve.values.length!==10){
     a.curve={type:'even',values:AFFAIR_CURVES.even.slice()};
+  }else{
+    a.curve.values=a.curve.values.map(function(v){return toNum(v);});
   }
   if(!a.curve.type)a.curve.type='custom';
   if(!a.ach||typeof a.ach!=='object')a.ach={enabled:false,amount:0};
@@ -2421,7 +3141,7 @@ function addAffairFromInput(){
   const name=inp.value.trim();
   if(!name){toast('请输入项目名称','err');return;}
   state.affairs.push({id:uid(),name:name,totalReward:0.1,curve:{type:'even',values:AFFAIR_CURVES.even.slice()},currentCell:0,alreadyGiven:0,domainId:null,plannedAt:null,steps:[],ach:{enabled:false,amount:0},createdAt:now(),startedAt:null,doneAt:null});
-  addLog('',0,'创建项目「'+name+'」','affair-create');
+  Ledger.event('创建项目「'+name+'」','affair-create');
   save();
   inp.value='';
   inp.focus();
@@ -2432,46 +3152,43 @@ function addAffairFromInput(){
 function applyAffairValue(a,amt,desc){
   if(!amt||amt<=0)return;
   if(a.domainId){
-    state.scores.progress[a.domainId]=(state.scores.progress[a.domainId]||0)+amt;
-    addLog('progress',amt,desc,'affair',a.domainId,{affairId:a.id});
+    Ledger.grant('progress:'+a.domainId,amt,{src:'affair',desc:desc,dom:a.domainId,affairId:a.id});
     checkAchievements(a.domainId);
   }else{
-    state.scores.vitality=(state.scores.vitality||0)+amt;
-    addLog('vitality',amt,desc,'affair','',{affairId:a.id});
+    Ledger.grant('vitality',amt,{src:'affair',desc:desc,affairId:a.id});
   }
   return amt;
 }
 function reverseAffairValue(a,amt,desc){
   if(!amt||amt<=0)return;
   if(a.domainId){
-    state.scores.progress[a.domainId]=(state.scores.progress[a.domainId]||0)-amt;
-    addLog('progress',-amt,desc,'affair',a.domainId,{affairId:a.id});
+    Ledger.spend('progress:'+a.domainId,amt,{src:'affair',desc:desc,dom:a.domainId,affairId:a.id});
   }else{
-    state.scores.vitality=(state.scores.vitality||0)-amt;
-    addLog('vitality',-amt,desc,'affair','',{affairId:a.id});
+    Ledger.spend('vitality',amt,{src:'affair',desc:desc,affairId:a.id});
   }
 }
 // 推进 currentCell 并按水位结算；到达格 9 视为完成 + 发放成果点
 function affairApplyProgress(a,cell){
   cell=Math.max(0,Math.min(9,Math.round(cell)));
-  a.currentCell=cell;
-  if(cell>0&&!a.startedAt)a.startedAt=now();
-  const target=affairTargetAt(a,cell);
-  const diff=round2(target-(a.alreadyGiven||0));
-  if(diff>0){
-    applyAffairValue(a,diff,'项目「'+a.name+'」进度结算');
-    a.alreadyGiven=round2(target);
-  }
-  if(cell>=9&&!a.doneAt){
-    a.doneAt=now();
-    if(a.ach&&a.ach.enabled&&a.ach.amount>0){
-      state.scores.achievement=(state.scores.achievement||0)+a.ach.amount;
-      addLog('achievement',a.ach.amount,'完成项目「'+a.name+'」','affair','',{affairId:a.id});
-      toast('项目「'+a.name+'」完成 · 成果点 +'+fmt(a.ach.amount),'warn');
-    }else{
-      toast('项目「'+a.name+'」已完成');
+  Ledger.txn(function(){
+    a.currentCell=cell;
+    if(cell>0&&!a.startedAt)a.startedAt=now();
+    const target=affairTargetAt(a,cell);
+    const diff=round2(target-(a.alreadyGiven||0));
+    if(diff>0){
+      applyAffairValue(a,diff,'项目「'+a.name+'」进度结算');
+      a.alreadyGiven=round2(target);
     }
-  }
+    if(cell>=9&&!a.doneAt){
+      a.doneAt=now();
+      if(a.ach&&a.ach.enabled&&a.ach.amount>0){
+        Ledger.grant('achievement',a.ach.amount,{src:'affair',desc:'完成项目「'+a.name+'」',affairId:a.id});
+        toast('项目「'+a.name+'」完成 · 成果点 +'+fmt(a.ach.amount),'warn');
+      }else{
+        toast('项目「'+a.name+'」已完成');
+      }
+    }
+  },{label:'affair-progress',save:'none',render:false});
 }
 
 // ===== 撤销（快照持久化到 state，限量保留）=====
@@ -2490,14 +3207,15 @@ function affairUndoAction(id){
   const snap=stack.pop();
   if(!snap){toast('没有可撤销的操作','warn');return;}
   const revoked=round2((a.alreadyGiven||0)-(snap.given||0));
-  if(revoked>0)reverseAffairValue(a,revoked,'撤销项目「'+a.name+'」推进');
-  if(!!a.doneAt&&!snap.doneAt&&a.ach&&a.ach.enabled&&a.ach.amount>0){
-    state.scores.achievement=(state.scores.achievement||0)-a.ach.amount;
-    addLog('achievement',-a.ach.amount,'撤销项目「'+a.name+'」成果点','affair','',{affairId:a.id});
-  }
-  a.currentCell=snap.cell;a.alreadyGiven=snap.given;a.doneAt=snap.doneAt;a.startedAt=snap.startedAt;
-  save();render();
-  toast('已撤销「'+a.name+'」');
+  const txr=Ledger.txn(function(){
+    if(revoked>0)reverseAffairValue(a,revoked,'撤销项目「'+a.name+'」推进');
+    if(!!a.doneAt&&!snap.doneAt&&a.ach&&a.ach.enabled&&a.ach.amount>0){
+      Ledger.grant('achievement',-a.ach.amount,{src:'affair',desc:'撤销项目「'+a.name+'」成果点',affairId:a.id});
+    }
+    a.currentCell=snap.cell;a.alreadyGiven=snap.given;a.doneAt=snap.doneAt;a.startedAt=snap.startedAt;
+  },{label:'affair-undo',save:'none',render:false});
+  if(!txr.ok)return;
+  commit('已撤销「'+a.name+'」');
 }
 
 function _completeAffairStep(a,s){
@@ -2506,13 +3224,13 @@ function _completeAffairStep(a,s){
   const steps=affairSteps(a);
   const allDone=steps.every(function(x){return x.doneAt;});
   affairApplyProgress(a,allDone?9:Math.min(8,(a.currentCell||0)+1));
-  save();render();
+  commit();
 }
 function advanceAffairStep(id){
   const a=state.affairs.find(function(x){return x.id===id;});
   if(!a||a.doneAt)return;
   const next=affairSteps(a).find(function(s){return !s.doneAt;});
-  if(!next){affairPushUndo(a);affairApplyProgress(a,9);save();render();return;}
+  if(!next){affairPushUndo(a);affairApplyProgress(a,9);commit();return;}
   _completeAffairStep(a,next);
 }
 function completeAffair(id){
@@ -2521,7 +3239,7 @@ function completeAffair(id){
   if(a.doneAt){toast('该项目已完成','warn');return;}
   affairPushUndo(a);
   affairApplyProgress(a,9);
-  save();render();
+  commit();
 }
 function completeAffairStep(id,idx){
   const a=state.affairs.find(function(x){return x.id===id;});
@@ -2578,7 +3296,7 @@ function initAffairAxes(){
     });
     function end(e){
       if(e&&e.pointerId!==pid)return;
-      if(pushed){save();render();}
+      if(pushed){commit();}
       dragging=false;decided=false;abandoned=false;pushed=false;
     }
     track.addEventListener('pointerup',end);
@@ -2627,7 +3345,7 @@ function openAffairModal(id){
     document.getElementById('affairReward').value=(a.totalReward===undefined?'':a.totalReward);
     document.getElementById('affairPlannedAt').value=a.plannedAt?toLocalInput(a.plannedAt):'';
     sel.value=a.domainId||'';
-    editAffairSteps=JSON.parse(JSON.stringify(a.steps||[]));
+    editAffairSteps=clone(a.steps||[]);
     editAffairCurve={type:affairCurveType(a),values:affairCurve(a).slice()};
     setAffairCurve(editAffairCurve.type);
     document.getElementById('affairAchEnabled').checked=!!(a.ach&&a.ach.enabled);
@@ -2672,10 +3390,10 @@ function handleAffairSave(){
     a.name=name;a.totalReward=totalReward;a.curve=curve;a.ach=ach;a.domainId=domainId;
     if(!a.doneAt)a.plannedAt=plannedAt;
     a.steps=steps;
-    addLog('',0,'修改项目「'+name+'」','affair-edit');
+    Ledger.event('修改项目「'+name+'」','affair-edit');
   }else{
     state.affairs.push({id:uid(),name:name,totalReward:totalReward,curve:curve,currentCell:0,alreadyGiven:0,domainId:domainId,plannedAt:plannedAt,steps:steps,ach:ach,createdAt:now(),startedAt:null,doneAt:null});
-    addLog('',0,'创建项目「'+name+'」','affair-create');
+    Ledger.event('创建项目「'+name+'」','affair-create');
   }
   save();
   closeModal('affairModal');
@@ -2688,7 +3406,7 @@ function delAffair(id){
   if(!a)return;
   if(!confirm('删除项目「'+a.name+'」？'))return;
   state.affairs=state.affairs.filter(function(x){return x.id!==id;});
-  addLog('',0,'删除项目「'+a.name+'」','affair-del');
+  Ledger.event('删除项目「'+a.name+'」','affair-del');
   save();
   closeModal('affairModal');
   toast('项目已删除');
@@ -2707,7 +3425,7 @@ function renderAffairSteps(){
     const badge=s.plannedAt?('🕒 '+fmtPlan(s.plannedAt)):'';
     return '<div class="affair-step-row">'
       +'<div class="affair-step-line">'
-      +'<input type="text" class="affair-step-input" data-i="'+i+'" value="'+esc(s.text||'')+'" placeholder="步骤 '+(i+1)+'" maxlength="60" oninput="affairStepInput('+i+',this.value)">'
+      +'<input type="text" class="affair-step-input" data-i="'+i+'" value="'+escAttr(s.text||'')+'" placeholder="步骤 '+(i+1)+'" maxlength="60" oninput="affairStepInput('+i+',this.value)">'
       +'<button type="button" class="btn btn-sm btn-danger" onclick="affairRemoveStep('+i+')">×</button>'
       +'</div>'
       +'<div class="affair-step-line">'
@@ -2817,7 +3535,7 @@ function choreUnsettled(){
   return (state.chores||[]).filter(function(c){return c.done&&!c.settled;});
 }
 // 批量结算：每 N 件已完成且未结算的杂事发放 Y 活力点（可一次结算多批）
-function settleChoreBatches(silent){
+function settleChoreBatches(silent=false){
   const cfg=choreCfg();
   const need=Math.max(1,Math.round(cfg.batchN));
   const pool=choreUnsettled().sort(function(a,b){return (a.doneAt||0)-(b.doneAt||0);});
@@ -2826,23 +3544,26 @@ function settleChoreBatches(silent){
   const used=pool.slice(0,batches*need);
   used.forEach(function(c){c.settled=true;});
   const gain=round2(batches*cfg.batchY);
-  if(gain>0){
-    state.scores.vitality=round2((state.scores.vitality||0)+gain);
-    addLog('vitality',gain,'杂事批量结算：'+used.length+' 件','chore-batch');
-    if(!silent)toast('批量结算 '+used.length+' 件杂事 · 活力点 +'+fmt(gain));
-  }else{
-    addLog('',0,'杂事批量结算：'+used.length+' 件（当前奖励为 0）','chore-batch');
-  }
-  return gain;
+  const txr=Ledger.txn(function(){
+    if(gain>0){
+      const target=round2((state.scores.vitality||0)+gain);
+      Ledger.post({op:'adjust',account:'vitality',target:target,entry:{st:'vitality',amt:gain,desc:'杂事批量结算：'+used.length+' 件',src:'chore-batch',dom:''},reason:{src:'chore-batch'}});
+      if(!silent)toast('批量结算 '+used.length+' 件杂事 · 活力点 +'+fmt(gain));
+    }else{
+      Ledger.event('杂事批量结算：'+used.length+' 件（当前奖励为 0）','chore-batch');
+    }
+  },{label:'chore-batch',save:'none',render:false});
+  return txr.ok?gain:0;
 }
 // 腐化债静默结算：超期杂事按档位系数逐日累积，直接从活力点扣除，不弹提示
-function processChoreDecay(){
+// 纯计算：只统计当天应扣总额与件数/天数，不修改 state、不写日志
+function computeChoreDecay(){
   const chores=state.chores||[];
-  if(!chores.length)return 0;
+  if(!chores.length)return {total:0,charged:0,dueDays:0,overdue:[],today:dayStartTs(now())};
   const cfg=choreCfg();
   const today=dayStartTs(now());
   const overdue=chores.filter(function(c){return !c.done&&choreOverdueDays(c)>0;});
-  if(!overdue.length)return 0;
+  if(!overdue.length)return {total:0,charged:0,dueDays:0,overdue:[],today:today};
   const rate=choreTierRate(overdue.length,cfg);
   let total=0,dueDays=0,charged=0;
   overdue.forEach(function(c){
@@ -2858,14 +3579,18 @@ function processChoreDecay(){
     charged++;
     dueDays+=days;
     total+=rate*days;
-    c.decayKey=dayKey(today);
   });
-  total=round2(total);
-  if(total<=0||charged<=0)return 0;
-  state.scores.vitality=round2((state.scores.vitality||0)-total);
-  addLog('vitality',-total,'杂事腐化债：'+charged+' 件超期，累计 '+dueDays+' 天','chore-decay');
-  save();
-  return total;
+  return {total:round2(total),charged:charged,dueDays:dueDays,overdue:overdue,today:today};
+}
+function processChoreDecay(silent=false){
+  const r=computeChoreDecay();
+  if(r.total<=0||r.charged<=0)return 0;
+  const txr=Ledger.txn(function(){
+    const target=round2((state.scores.vitality||0)-r.total);
+    Ledger.post({op:'adjust',account:'vitality',target:target,entry:{st:'vitality',amt:-r.total,desc:'杂事腐化债：'+r.charged+' 件超期，累计 '+r.dueDays+' 天',src:'chore-decay',dom:''},reason:{src:'chore-decay'}});
+    r.overdue.forEach(function(c){c.decayKey=dayKey(r.today);});
+  },{label:'chore-decay',save:silent?'none':'debounce',render:false});
+  return txr.ok?r.total:0;
 }
 function addChoreFromInput(){
   const inp=document.getElementById('choreInput');
@@ -2874,7 +3599,7 @@ function addChoreFromInput(){
   if(!name){toast('请输入杂事内容','err');return;}
   if(!Array.isArray(state.chores))state.chores=[];
   state.chores.push({id:uid(),name:name,done:false,doneAt:null,plannedAt:null,createdAt:now(),settled:false,freshDays:null,decayKey:null});
-  addLog('',0,'新增杂事「'+name+'」','chore-create');
+  Ledger.event('新增杂事「'+name+'」','chore-create');
   save();
   inp.value='';inp.focus();
   render();
@@ -2891,7 +3616,7 @@ function toggleChoreDone(id){
     c.decayKey=dayKey(now());
     settleChoreBatches();
   }
-  save();render();
+  commit();
 }
 function toggleChoreDoneZone(){choreDoneOpen=!choreDoneOpen;render();}
 function fmtChoreDate(ts){
@@ -2933,8 +3658,8 @@ function renderChores(){
   let html='<div class="chore-econ-bar">'
     +'<span>单件不发放活力 · 每完成 <b>'+need+'</b> 件 → <b>+'+fmt(cfg.batchY)+'</b> 活力</span>'
     +'<span>'+(readyBatches>0
-      ?('待结算 '+unsettled+' 件 · 已完成 '+readyBatches+' 批，完成下一件即入账')
-      :('待结算 '+unsettled+' 件 · 再完成 '+next+' 件可结算'))+'</span>'
+      ?('有 '+readyBatches+' 批待入账（'+unsettled+' 件）· 完成下一件即入账')
+      :('待入账 '+unsettled+' 件 · 再完成 '+next+' 件可结算'))+'</span>'
     +'</div>';
   html+=todo.length?todo.map(choreCardHTML).join(''):'<div class="affair-empty">还没有杂事。输入名称回车，即刻创建。</div>';
   if(done.length){
@@ -2987,13 +3712,13 @@ function saveChore(){
     c.name=name;c.plannedAt=plannedAt;c.freshDays=fresh;
     // 日期或保鲜期改动后从今天重新起算腐化，不补扣历史
     c.decayKey=dayKey(now());
-    addLog('',0,'修改杂事「'+name+'」','chore-edit');
+    Ledger.event('修改杂事「'+name+'」','chore-edit');
   }else{
     state.chores.push({id:uid(),name:name,done:false,doneAt:null,plannedAt:plannedAt,createdAt:now(),settled:false,freshDays:fresh,decayKey:null});
-    addLog('',0,'新增杂事「'+name+'」','chore-create');
+    Ledger.event('新增杂事「'+name+'」','chore-create');
   }
-  save();closeModal('choreModal');render();
-  toast(id?'杂事已更新':'杂事已创建');
+  closeModal('choreModal');
+  commit(id?'杂事已更新':'杂事已创建');
 }
 function delChore(){
   const id=document.getElementById('choreId').value;
@@ -3001,74 +3726,64 @@ function delChore(){
   if(!c)return;
   if(!confirm('删除杂事「'+c.name+'」？'))return;
   state.chores=state.chores.filter(function(x){return x.id!==id;});
-  addLog('',0,'删除杂事「'+c.name+'」','chore-create');
-  save();closeModal('choreModal');render();
-  toast('杂事已删除');
+  // 删除类日志应记为 chore-delete（此前误用了 chore-create）
+  Ledger.event('删除杂事「'+c.name+'」','chore-delete');
+  closeModal('choreModal');
+  commit('杂事已删除');
 }
 // 杂事经济设置（统一入口；设置后作为所有杂事的默认）
+// 表单字段与配置键的映射：读写表单都走这张表，避免 8 个字段散落三处
+const CHORE_CFG_FIELDS={
+  freshDays:'choreCfgFresh',
+  batchN:'choreCfgN',
+  batchY:'choreCfgY',
+  tier1Max:'choreCfgT1Max',
+  tier1Rate:'choreCfgT1Rate',
+  tier2Max:'choreCfgT2Max',
+  tier2Rate:'choreCfgT2Rate',
+  tier3Rate:'choreCfgT3Rate'
+};
+function readChoreCfgForm(){
+  const raw={};
+  Object.keys(CHORE_CFG_FIELDS).forEach(function(k){
+    const el=document.getElementById(CHORE_CFG_FIELDS[k]);
+    if(el)raw[k]=el.value;
+  });
+  return normalizeChoreConfig(raw);
+}
+function writeChoreCfgForm(cfg){
+  Object.keys(CHORE_CFG_FIELDS).forEach(function(k){
+    const el=document.getElementById(CHORE_CFG_FIELDS[k]);
+    if(el)el.value=cfg[k];
+  });
+}
 function choreCfgInputPreview(){
   const cont=document.getElementById('choreCfgPreview');
   if(!cont)return;
-  const cfg=normalizeChoreConfig({
-    freshDays:document.getElementById('choreCfgFresh').value,
-    batchN:document.getElementById('choreCfgN').value,
-    batchY:document.getElementById('choreCfgY').value,
-    tier1Max:document.getElementById('choreCfgT1Max').value,
-    tier1Rate:document.getElementById('choreCfgT1Rate').value,
-    tier2Max:document.getElementById('choreCfgT2Max').value,
-    tier2Rate:document.getElementById('choreCfgT2Rate').value,
-    tier3Rate:document.getElementById('choreCfgT3Rate').value
-  });
-  if(cfg.tier2Max<=cfg.tier1Max)cfg.tier2Max=cfg.tier1Max+1;
+  const cfg=readChoreCfgForm();
   const ex1=choreDailyDecay(cfg.tier1Max,cfg);
   const ex2=choreDailyDecay(cfg.tier2Max,cfg);
   const ex3=choreDailyDecay(cfg.tier2Max+1,cfg);
   cont.innerHTML='超期 '+cfg.tier1Max+' 件 → '+fmt(ex1)+' 活力/天 · 超期 '+cfg.tier2Max+' 件 → '+fmt(ex2)+' 活力/天 · 超期 '+(cfg.tier2Max+1)+' 件及以上 → '+fmt(ex3)+' 活力/天';
 }
 function openChoreConfigModal(){
-  const cfg=choreCfg();
-  document.getElementById('choreCfgFresh').value=cfg.freshDays;
-  document.getElementById('choreCfgN').value=cfg.batchN;
-  document.getElementById('choreCfgY').value=cfg.batchY;
-  document.getElementById('choreCfgT1Max').value=cfg.tier1Max;
-  document.getElementById('choreCfgT1Rate').value=cfg.tier1Rate;
-  document.getElementById('choreCfgT2Max').value=cfg.tier2Max;
-  document.getElementById('choreCfgT2Rate').value=cfg.tier2Rate;
-  document.getElementById('choreCfgT3Rate').value=cfg.tier3Rate;
+  writeChoreCfgForm(choreCfg());
   choreCfgInputPreview();
   openModal('choreConfigModal');
 }
 function resetChoreConfig(){
-  const d=defaultChoreConfig();
-  document.getElementById('choreCfgFresh').value=d.freshDays;
-  document.getElementById('choreCfgN').value=d.batchN;
-  document.getElementById('choreCfgY').value=d.batchY;
-  document.getElementById('choreCfgT1Max').value=d.tier1Max;
-  document.getElementById('choreCfgT1Rate').value=d.tier1Rate;
-  document.getElementById('choreCfgT2Max').value=d.tier2Max;
-  document.getElementById('choreCfgT2Rate').value=d.tier2Rate;
-  document.getElementById('choreCfgT3Rate').value=d.tier3Rate;
+  writeChoreCfgForm(defaultChoreConfig());
   choreCfgInputPreview();
 }
 function saveChoreConfig(){
-  const cfg=normalizeChoreConfig({
-    freshDays:document.getElementById('choreCfgFresh').value,
-    batchN:document.getElementById('choreCfgN').value,
-    batchY:document.getElementById('choreCfgY').value,
-    tier1Max:document.getElementById('choreCfgT1Max').value,
-    tier1Rate:document.getElementById('choreCfgT1Rate').value,
-    tier2Max:document.getElementById('choreCfgT2Max').value,
-    tier2Rate:document.getElementById('choreCfgT2Rate').value,
-    tier3Rate:document.getElementById('choreCfgT3Rate').value
-  });
-  if(cfg.tier2Max<=cfg.tier1Max)cfg.tier2Max=cfg.tier1Max+1;
+  const cfg=readChoreCfgForm();
   state.choreConfig=cfg;
   // 规则收紧/放宽后，腐化债从今天重新起算，避免追溯补扣
   (state.chores||[]).forEach(function(c){
     if(!c.done)c.decayKey=dayKey(now());
   });
-  save();closeModal('choreConfigModal');render();
-  toast('杂事经济设置已保存，作为所有杂事的默认');
+  closeModal('choreConfigModal');
+  commit('杂事经济设置已保存，作为所有杂事的默认');
 }
 
 function stageBarHTML(t){
@@ -3180,26 +3895,31 @@ function taskCardHTML(t,collId){
 }
 
 // ===== 阶段奖励：卡片进度条拖拽 =====
+// 单个进度条实例的显示更新（滑块位置 / 档位名高亮 / 数值预览）
+function applyStageBar(bar,t,cell){
+  if(!bar)return;
+  const track=bar.querySelector('.stage-track');
+  if(track){const thumb=track.querySelector('.stage-thumb');if(thumb)thumb.style.left=(cell*10+5)+'%';}
+  bar.querySelectorAll('.stage-labels span').forEach(function(n,k){n.classList.toggle('on',k===(cell>>1));});
+  const preview=bar.querySelector('.stage-preview');
+  if(preview){
+    const hasV=taskHasType(t,'vitality'),hasP=taskHasType(t,'progress');
+    const cc=calcCheckIn(t);
+    let reward='+'+fmt(hasV?stageNetAt(t,'vitality',cell,cc):stageNetAt(t,'progress',cell,cc));
+    reward+=hasV&&hasP?(' 活力 / +'+fmt(stageNetAt(t,'progress',cell,cc))+' 进度'):(hasV?' 活力':' 进度');
+    let cs=t.streak||0;if(cs===0&&t.lastCheckIn)cs=1;
+    let meta='';if(cc.bonus>0)meta+='利息+'+fmt(cc.bonus);
+    if(cs>0)meta+=(meta?' · ':'')+'连胜'+cs+'天';
+    const pend2=t.pendingDebt||0;if(pend2>0)meta+=(meta?' · ':'')+'待扣债'+fmt(pend2);
+    preview.textContent=stageCellLabel(cell)+' · '+reward+(meta?' · '+meta:'');
+  }
+}
+// 同一任务在卡片中存在两个进度条实例（长按展开前 / 展开后），统一按 state 中的唯一值刷新
 function updateStageBar(track,tid,cell){
   const t=state.tasks.find(x=>x.id===tid);if(!t)return;
-  const thumb=track.querySelector('.stage-thumb');if(thumb)thumb.style.left=(cell*10+5)+'%';
-  const bar=track.closest('.stage-bar');
-  if(bar){
-    const spans=bar.querySelectorAll('.stage-labels span');
-    spans.forEach(function(n,k){n.classList.toggle('on',k===(cell>>1));});
-    const preview=bar.querySelector('.stage-preview');
-    if(preview){
-      const hasV=taskHasType(t,'vitality'),hasP=taskHasType(t,'progress');
-      const cc=calcCheckIn(t);
-      let reward='+'+fmt(hasV?stageNetAt(t,'vitality',cell,cc):stageNetAt(t,'progress',cell,cc));
-      reward+=hasV&&hasP?(' 活力 / +'+fmt(stageNetAt(t,'progress',cell,cc))+' 进度'):(hasV?' 活力':' 进度');
-      let cs=t.streak||0;if(cs===0&&t.lastCheckIn)cs=1;
-      let meta='';if(cc.bonus>0)meta+='利息+'+fmt(cc.bonus);
-      if(cs>0)meta+=(meta?' · ':'')+'连胜'+cs+'天';
-      const pend2=t.pendingDebt||0;if(pend2>0)meta+=(meta?' · ':'')+'待扣债'+fmt(pend2);
-      preview.textContent=stageCellLabel(cell)+' · '+reward+(meta?' · '+meta:'');
-    }
-  }
+  document.querySelectorAll('.stage-bar[data-tid="'+tid+'"]').forEach(function(bar){
+    applyStageBar(bar,t,cell);
+  });
 }
 function setStageFromX(track,tid,clientX){
   const t=state.tasks.find(x=>x.id===tid);if(!t||!taskIsStaged(t))return;
@@ -3287,7 +4007,8 @@ function showTaskExtra(card){
 
 function achCardHTML(a,domId){
   const prog=domainProgress(a.domainId);
-  const pct=Math.min(100,(prog/a.threshold)*100);
+  // 门槛为 0 时避免 0/0 产生 NaN 宽度
+  const pct=a.threshold>0?Math.min(100,(prog/a.threshold)*100):(prog>0?100:0);
   return '<div class="card" data-ach-id="'+a.id+'" data-dom-id="'+(domId||a.domainId)+'">'
     +'<div class="card-top">'
     +'<div><span class="tag a">成果</span><span class="card-title">'+(a.unlocked?'✓ ':'')+esc(a.name)+'</span></div>'
@@ -3305,15 +4026,9 @@ function achCardHTML(a,domId){
 
 // ===== Render: Bank =====
 function renderBank(){
-  const bV=document.getElementById('bVitality');
-  bV.textContent=fmt(state.scores.vitality);
-  bV.classList.toggle('neg',state.scores.vitality<0);
-  const bP=document.getElementById('bProgress');
-  bP.textContent=fmt(totalProgress());
-  bP.classList.toggle('neg',totalProgress()<0);
-  const bA=document.getElementById('bAchievement');
-  bA.textContent=fmt(state.scores.achievement);
-  bA.classList.toggle('neg',state.scores.achievement<0);
+  setScoreCell('bVitality',state.scores.vitality);
+  setScoreCell('bProgress',totalProgress());
+  setScoreCell('bAchievement',state.scores.achievement);
 
   // Radar (domain capability) + metric chips
   renderRadar();
@@ -3346,19 +4061,19 @@ function renderBank(){
   const unlocked=state.achievements.filter(a=>a.unlocked).length;
   const purchases=state.logs.filter(l=>l.src==='purchase').length;
 
-  var vIncomeEl=document.getElementById('vIncome');
+  const vIncomeEl=document.getElementById('vIncome');
   vIncomeEl.textContent=fmt(vIn);
   vIncomeEl.classList.toggle('neg',vIn<0);
   document.getElementById('vSpend').textContent=fmt(vOut);
-  var pIncomeEl=document.getElementById('pIncome');
+  const pIncomeEl=document.getElementById('pIncome');
   pIncomeEl.textContent=fmt(pIn);
   pIncomeEl.classList.toggle('neg',pIn<0);
   document.getElementById('totalCheckins').textContent=totalCI;
-  var aIncomeEl=document.getElementById('aIncome');
+  const aIncomeEl=document.getElementById('aIncome');
   aIncomeEl.textContent=fmt(aIn);
   aIncomeEl.classList.toggle('neg',aIn<0);
   document.getElementById('achUnlocked').textContent=unlocked;
-  var aSpendEl=document.getElementById('aSpend');
+  const aSpendEl=document.getElementById('aSpend');
   aSpendEl.textContent=fmt(aOut);
   aSpendEl.classList.toggle('neg',aOut<0);
   document.getElementById('totalPurchases').textContent=purchases;
@@ -3404,13 +4119,15 @@ function renderBank(){
   drawWeekCompareChart();
 
   // Logs
-  document.getElementById('logMeta').textContent=state.logs.length+' 条';
+  const logTotal=state.logs.length;
+  document.getElementById('logMeta').textContent=logTotal+' 条'+(logTotal>LOG_DISPLAY?'（仅显示最近 '+LOG_DISPLAY+' 条）':'');
   const ll=document.getElementById('logList');
   if(!state.logs.length){
     ll.innerHTML='<div class="empty" style="padding:24px"><p style="margin:0">暂无记录</p></div>';
   }else{
-    const undoableSrc=['checkin','cost','purchase','achievement','loan-interest','loan-repay','manual-adjust','delete-coll','delete-task','delete-ach','delete-domain','delete-prod','delete-shopcat','exempt','unlock','archive'];
-    ll.innerHTML=state.logs.slice(0,100).map(l=>{
+    // 可撤销白名单直接来自适配器注册表：新增一种可撤销类型只需在 UNDO_ADAPTERS 加 key
+    const undoableSrc=Object.keys(UNDO_ADAPTERS);
+    ll.innerHTML=state.logs.slice(0,LOG_DISPLAY).map(l=>{
       const isBoth=l.st==='both';
       const cls=l.amt>0?'pos'+(isBoth||l.st==='progress'?' p':l.st==='achievement'?' a':''):l.amt<0?'neg':'zero';
       const dotCls=isBoth?'p':l.st==='vitality'?'v':l.st==='progress'?'p':l.st==='achievement'?'a':'s';
@@ -3477,30 +4194,47 @@ function drawChart(){
   }
   const types=['vitality','progress','achievement'];
   const typeNames={vitality:'活力',progress:'进度',achievement:'成果'};
-  const isDark=document.documentElement.getAttribute('data-theme')==='dark';
-  const colors={vitality:isDark?'#7ab088':'#5b9a6e',progress:isDark?'#7894b5':'#5b7fa8',achievement:isDark?'#c4985c':'#b08640'};
-  const gridColor=isDark?'#42424a':'#e0e0e0';
-  const labelColor=isDark?'#6e6e74':'#aaa';
+  // 取色直接读主题 CSS 变量，避免深/浅色再硬编码一份
+  const rootStyle=getComputedStyle(document.documentElement);
+  function cssVar(name,fallback){const v=(rootStyle.getPropertyValue(name)||'').trim();return v||fallback;}
+  const colors={
+    vitality:cssVar('--vitality','#5b9a6e'),
+    progress:cssVar('--progress','#5b7fa8'),
+    achievement:cssVar('--achievement','#b08640')
+  };
+  const gridColor=cssVar('--border','#e0e0e0');
+  const labelColor=cssVar('--text-3','#aaa');
+  const zeroColor=cssVar('--border-2','#ccc');
+  // 一次遍历日志按天分桶（每类每天净额）；累计模式再做前缀和，避免 O(3×7×logs) 反复扫描
+  const windowStart=dayStart[0];
+  const windowEnd=dayEnd[days-1];
+  const before={};
+  const daily={};
+  types.forEach(type=>{before[type]=0;daily[type]=new Array(days).fill(0);});
+  state.logs.forEach(l=>{
+    const t=l.time;
+    if(t>=windowEnd)return;
+    if(t<windowStart){
+      types.forEach(type=>{if(logHasType(l,type))before[type]+=logAmt(l,type);});
+      return;
+    }
+    for(let i=days-1;i>=0;i--){
+      if(t>=dayStart[i]){
+        types.forEach(type=>{if(logHasType(l,type))daily[type][i]+=logAmt(l,type);});
+        return;
+      }
+    }
+  });
   const series={};
   types.forEach(type=>{
     series[type]=[];
-    if(chartState.trendMode==='cumulative'){
-      // Cumulative: sum all logs up to end of each day
-      for(let i=0;i<days;i++){
-        let cum=0;
-        state.logs.forEach(l=>{
-          if(logHasType(l,type)&&l.time<dayEnd[i])cum+=logAmt(l,type);
-        });
-        series[type].push(cum);
-      }
-    }else{
-      // Daily: net change for each specific day
-      for(let i=0;i<days;i++){
-        let daily=0;
-        state.logs.forEach(l=>{
-          if(logHasType(l,type)&&l.time>=dayStart[i]&&l.time<dayEnd[i])daily+=logAmt(l,type);
-        });
-        series[type].push(daily);
+    let run=before[type];
+    for(let i=0;i<days;i++){
+      if(chartState.trendMode==='cumulative'){
+        run+=daily[type][i];
+        series[type].push(run);
+      }else{
+        series[type].push(daily[type][i]);
       }
     }
   });
@@ -3511,8 +4245,9 @@ function drawChart(){
   });
   const W=700,H=140,padL=36,padR=8,padT=8,padB=22;
   const cW=W-padL-padR,cH=H-padT-padB,stepX=cW/(days-1);
-  // Baseline for daily mode (0 is in the middle if there are negatives)
-  const hasNeg=chartState.trendMode==='daily'&&types.some(t=>!chartState.hiddenSeries[t]&&series[t].some(v=>v<0));
+  // 基线：任一可见序列出现负值（负债）时，0 线居中、上下对称展开；
+  // daily 与 cumulative 都适用，避免累计模式下负值折线跑到图表下方
+  const hasNeg=types.some(t=>!chartState.hiddenSeries[t]&&series[t].some(v=>v<0));
   const baseline=hasNeg?padT+cH/2:padT+cH;
   function pt(type,i){
     const x=padL+i*stepX;
@@ -3523,14 +4258,14 @@ function drawChart(){
   // Grid lines
   for(let g=0;g<=4;g++){
     const y=padT+(cH/4)*g;
-    const range=hasNeg?maxVal*2:maxVal;
-    const val=Math.round(range-(range/4)*g);
+    // 有负值时纵轴从 +maxVal 到 -maxVal，0 刻度正好落在居中基线上
+    const val=hasNeg?Math.round(maxVal-(maxVal/2)*g):Math.round(maxVal-(maxVal/4)*g);
     s+='<line x1="'+padL+'" y1="'+y+'" x2="'+(W-padR)+'" y2="'+y+'" stroke="'+gridColor+'" stroke-width="1"/>';
     s+='<text x="'+(padL-5)+'" y="'+(y+3)+'" text-anchor="end" font-size="9" fill="'+labelColor+'">'+val+'</text>';
   }
-  // Zero line for daily mode
+  // 0 线（daily / cumulative 有负值时均绘制）
   if(hasNeg){
-    s+='<line x1="'+padL+'" y1="'+baseline+'" x2="'+(W-padR)+'" y2="'+baseline+'" stroke="'+(isDark?'#5a5a60':'#ccc')+'" stroke-width="1.5"/>';
+    s+='<line x1="'+padL+'" y1="'+baseline+'" x2="'+(W-padR)+'" y2="'+baseline+'" stroke="'+zeroColor+'" stroke-width="1.5"/>';
   }
   // X axis labels
   dayLabels.forEach((label,i)=>{
@@ -3815,12 +4550,8 @@ function renderMetricChips(){
 
 // ===== Render: Shop =====
 function renderShop(){
-  const sV=document.getElementById('sVitality');
-  sV.textContent=fmt(state.scores.vitality);
-  sV.classList.toggle('neg',state.scores.vitality<0);
-  const sA=document.getElementById('sAchievement');
-  sA.textContent=fmt(state.scores.achievement);
-  sA.classList.toggle('neg',state.scores.achievement<0);
+  setScoreCell('sVitality',state.scores.vitality);
+  setScoreCell('sAchievement',state.scores.achievement);
 
   const sl=document.getElementById('shopList');
   let html='';
@@ -3852,9 +4583,9 @@ function renderShop(){
   });
 
   // Sold-out section
-  var soldoutProds=state.products.filter(p=>p.stock===0);
+  const soldoutProds=state.products.filter(p=>p.stock===0);
   if(soldoutProds.length>0){
-    var isSoldCollapsed=(state.collapsedShopCats||[]).includes('sc_soldout');
+    const isSoldCollapsed=(state.collapsedShopCats||[]).includes('sc_soldout');
     html+='<div class="shop-cat-group'+(isSoldCollapsed?' collapsed':'')+'" data-cat-id="sc_soldout">';
     html+='<div class="coll-header" onclick="toggleCollapse(\'shop-category\',\'sc_soldout\')">';
     html+='<div class="coll-name"><span class="coll-toggle">▼</span>售罄 <span class="coll-count">'+soldoutProds.length+'件</span></div>';
@@ -3864,21 +4595,21 @@ function renderShop(){
     html+='<div class="coll-body">';
 
     // Group sold-out products by their original categoryId
-    var soldByCat={};
+    const soldByCat={};
     soldoutProds.forEach(function(p){
-      var catId=p.categoryId||'sc_default';
+      const catId=p.categoryId||'sc_default';
       if(!soldByCat[catId])soldByCat[catId]=[];
       soldByCat[catId].push(p);
     });
 
     // Render each sub-group
     Object.keys(soldByCat).forEach(function(catId){
-      var cat=state.shopCategories.find(function(c){return c.id===catId;});
-      var catName=cat?cat.name:'默认';
-      var prods=soldByCat[catId];
+      const cat=state.shopCategories.find(function(c){return c.id===catId;});
+      const catName=cat?cat.name:'默认';
+      const prods=soldByCat[catId];
 
       // Build category options for the dropdown
-      var catOptions=state.shopCategories.map(function(c){
+      const catOptions=state.shopCategories.map(function(c){
         return '<option value="'+c.id+'"'+(c.id===catId?' selected':'')+'>'+esc(c.name)+'</option>';
       }).join('');
 
@@ -3911,29 +4642,41 @@ function renderShop(){
 
 // Product card HTML helper
 function shopCardHTML(p,catId,prevCatId){
-  var isV=p.currency==='vitality';
-  var cn=isV?'活力点':'成果点';
-  var balance=state.scores[p.currency];
-  var willLoan=balance<p.price;
-  var isSoldout=p.stock===0;
-  var stockTxt=p.stock===-1?'':p.stock===0?' · 售罄':' · 库存'+p.stock;
-  var debtTxt=(p.debtRate||0)>0?' · 债率'+fmt(p.debtRate)+'%/天':'';
-  var loanWarn=willLoan&&!isSoldout?' · 贷款'+fmt(p.price-balance):'';
-  var soldoutCls=isSoldout?' soldout':'';
-  var dataPrevCat=prevCatId?' data-prev-cat-id="'+prevCatId+'"':'';
-  return '<div class="shop-card'+soldoutCls+'" data-prod-id="'+p.id+'" data-cat-id="'+catId+'"'+dataPrevCat+'>'
+  const tier=validProductTier(p.tier);
+  const cur=tierCurrency(tier);
+  const isV=cur==='vitality';
+  const cn=isV?'活力点':'成果点';
+  const balance=state.scores[cur];
+  const willLoan=balance<p.price;
+  const isSoldout=p.stock===0;
+  const gate=evaluateProductGate(p);
+  const locked=gate.deny&&!isSoldout;
+  const stockTxt=p.stock===-1?'':p.stock===0?' · 售罄':' · 库存'+p.stock;
+  const debtTxt=(p.debtRate||0)>0?' · 债率'+fmt(p.debtRate)+'%/天':'';
+  const loanWarn=willLoan&&!isSoldout&&!gate.deny?' · 贷款'+fmt(p.price-balance):'';
+  const soldoutCls=isSoldout?' soldout':'';
+  const lockedCls=locked?' locked':'';
+  const dataPrevCat=prevCatId?' data-prev-cat-id="'+prevCatId+'"':'';
+  const tierTxt=' · '+(PROD_TIER_NAMES[tier]||PROD_TIER_NAMES.daily);
+  const gateHTML=gate.deny?'<div class="sh-gate">'+gate.reasons.map(function(r){return '<div>'+esc(r)+'</div>';}).join('')+'</div>':'';
+  const buyHTML=isSoldout
+    ?'<div class="sh-buy" style="text-align:center;font-size:12px;color:var(--text-3);padding:8px">售罄</div>'
+    :gate.deny
+      ?'<button class="btn btn-sm sh-buy" disabled>门槛未达标</button>'
+      :'<button class="btn btn-sm sh-buy" onclick="buyProduct(\''+p.id+'\')">'+(willLoan?'贷款购买':'购买')+'</button>';
+  return '<div class="shop-card'+soldoutCls+lockedCls+'" data-prod-id="'+p.id+'" data-cat-id="'+catId+'"'+dataPrevCat+'>'
     +'<div class="card-top" style="margin-bottom:0"><div class="sh-name">'+esc(p.name)+'</div>'
     +'<div class="card-actions"><span class="drag-handle" title="拖拽排序或跨分类移动">⋮⋮</span><button onclick="openProdModal(\''+p.id+'\')">编辑</button><button class="del" onclick="confirmDelProd(\''+p.id+'\')">删除</button></div></div>'
     +(p.desc?'<div class="sh-desc">'+esc(p.desc)+'</div>':'')
-    +'<div class="sh-cost '+(isV?'v':'a')+'">'+fmt(p.price)+'<span class="unit">'+cn+stockTxt+debtTxt+loanWarn+'</span></div>'
-    +(isSoldout?'<div class="sh-buy" style="text-align:center;font-size:12px;color:var(--text-3);padding:8px">售罄</div>'
-      :'<button class="btn btn-sm sh-buy" onclick="buyProduct(\''+p.id+'\')">'+(willLoan?'贷款购买':'购买')+'</button>')
+    +'<div class="sh-cost '+(isV?'v':'a')+'">'+fmt(p.price)+'<span class="unit">'+cn+tierTxt+stockTxt+debtTxt+loanWarn+'</span></div>'
+    +gateHTML
+    +buyHTML
     +'</div>';
 }
 
 // Change sold-out product's original category (sub-grouping)
 function changeSoldoutCat(sel,oldCatId){
-  var newCatId=sel.value;
+  const newCatId=sel.value;
   // Move all sold-out products from oldCatId to newCatId
   state.products.forEach(function(p){
     if(p.stock===0&&(p.categoryId||'sc_default')===oldCatId){
@@ -4306,6 +5049,15 @@ function positionCondPanel(anchor){
   const el=getCondPanelEl();
   el.style.visibility='hidden';
   el.style.display='block';
+  // 移动端以底部抽屉形式展示，位置交给 CSS（.cond-panel.sheet）
+  const sheet=!!(window.matchMedia&&window.matchMedia('(max-width:560px)').matches);
+  el.classList.toggle('sheet',sheet);
+  if(sheet){
+    el.style.left='';
+    el.style.top='';
+    el.style.visibility='visible';
+    return;
+  }
   const r=anchor.getBoundingClientRect();
   const pw=el.offsetWidth||200;
   const ph=el.offsetHeight||0;
@@ -4530,10 +5282,10 @@ function rewardRowHTML(item){
   const isCard=(item.type==='card');
   return '<div class="reward-row">'
     +'<select class="rr-type" onchange="rrTypeChanged(this)">'+typeOpts+'</select>'
-    +'<select class="rr-task" style="display:'+(isVit?'':'none')+'" title="关联任务（可选）">'+taskOpts+'</select>'
-    +'<select class="rr-domain" style="display:'+(isProg?'':'none')+'" title="关联领域（可选）">'+domOpts+'</select>'
-    +'<input type="number" class="rr-amount" value="'+(item.amount||10)+'" min="0" step="0.1" title="数量">'
-    +'<input type="number" class="rr-cap" value="'+(item.cap||3)+'" min="1" step="1" style="display:'+(isCard?'':'none')+'" title="豁免卡累计上限">'
+    +'<select class="rr-task" onchange="updateCondPreview()" style="display:'+(isVit?'':'none')+'" title="关联任务（可选）">'+taskOpts+'</select>'
+    +'<select class="rr-domain" onchange="updateCondPreview()" style="display:'+(isProg?'':'none')+'" title="关联领域（可选）">'+domOpts+'</select>'
+    +'<input type="number" class="rr-amount" oninput="updateCondPreview()" value="'+(item.amount||10)+'" min="0" step="0.1" title="数量">'
+    +'<input type="number" class="rr-cap" oninput="updateCondPreview()" value="'+(item.cap||3)+'" min="1" step="1" style="display:'+(isCard?'':'none')+'" title="豁免卡累计上限">'
     +'<button class="rr-del" onclick="removeRewardRow(this)">×</button>'
     +'</div>';
 }
@@ -4549,8 +5301,13 @@ function addRewardRow(){
   tmp.innerHTML=rewardRowHTML({type:'vitality',amount:10});
   box.appendChild(tmp.firstChild);
   updateActivitySummary();
+  updateCondPreview();
 }
-function removeRewardRow(btn){btn.closest('.reward-row').remove();updateActivitySummary();}
+function removeRewardRow(btn){
+  btn.closest('.reward-row').remove();
+  updateActivitySummary();
+  updateCondPreview();
+}
 function rrTypeChanged(sel){
   const row=sel.closest('.reward-row');
   const dom=row.querySelector('.rr-domain');
@@ -4560,6 +5317,7 @@ function rrTypeChanged(sel){
   task.style.display=(m==='vitality')?'':'none';
   dom.style.display=(m==='progress')?'':'none';
   cap.style.display=(m==='card')?'':'none';
+  updateCondPreview();
 }
 function validateDomain(id){return state.domains.some(d=>d.id===id)?id:'d_default'}
 function handleActivitySave(){
@@ -4581,20 +5339,16 @@ function handleActivitySave(){
   }else{
     state.activities.push({id:uid(),name:name,enabled:true,period:period,anchor:anchor,condition:condition,result:result,lastRun:null});
   }
-  save();
   closeModal('activityModal');
-  processActivities();
-  toast(id?'活动已更新':'活动已创建');
-  render();
+  processActivities(true);
+  commit(id?'活动已更新':'活动已创建');
 }
 function toggleActivity(id,enabled){
   const a=state.activities.find(x=>x.id===id);
   if(!a)return;
   a.enabled=enabled;
-  save();
-  processActivities();
-  render();
-  toast(enabled?'活动已开始运行':'活动已停止');
+  processActivities(true);
+  commit(enabled?'活动已开始运行':'活动已停止');
 }
 let pendingDeleteActivityId=null;
 function askDelActivity(id){
@@ -4617,24 +5371,41 @@ function doDeleteActivity(revoke){
   if(!a)return;
   if(revoke)revokeActivityGrants(id);
   state.activities=state.activities.filter(x=>x.id!==id);
-  save();render();
-  toast(revoke?'活动已删除，历史获得已撤销':'活动已删除');
+  commit(revoke?'活动已删除，历史获得已撤销':'活动已删除');
 }
 function revokeActivityGrants(actId){
   const logs=state.logs.filter(l=>l.actId===actId);
   let cardUndo=0;
-  logs.forEach(l=>{
-    if(l.src==='reward'){
-      const amt=Number(l.amt)||0;
-      if(l.st==='vitality')state.scores.vitality=(state.scores.vitality||0)-amt;
-      else if(l.st==='achievement')state.scores.achievement=(state.scores.achievement||0)-amt;
-      else if(l.st==='progress'){const did=l.dom||'d_default';state.scores.progress[did]=(state.scores.progress[did]||0)-amt;}
-    }else if(l.src==='card-grant'){
-      cardUndo+=(typeof l.granted==='number'?l.granted:parseCardGrantAmt(l.desc));
+  const txr=Ledger.txn(function(){
+    logs.forEach(function(l){
+      if(l.src==='reward'){
+        const amt=Number(l.amt)||0;
+        if(l.st==='vitality')Ledger.post({op:'spend',account:'vitality',delta:-amt,visible:false,reason:{src:'activity-revoke'}});
+        else if(l.st==='achievement')Ledger.post({op:'spend',account:'achievement',delta:-amt,visible:false,reason:{src:'activity-revoke'}});
+        else if(l.st==='progress'){
+          // 按发放时落盘的分配明细逐领域全额退回；旧流水无明细时回退到单一领域
+          if(Array.isArray(l.splits)&&l.splits.length){
+            l.splits.forEach(function(sp){
+              const did=sp.dom||'d_default';
+              Ledger.post({op:'spend',account:'progress:'+did,delta:-(Number(sp.amt)||0),visible:false,reason:{src:'activity-revoke',dom:did}});
+            });
+          }else{
+            const did=l.dom||'d_default';
+            Ledger.post({op:'spend',account:'progress:'+did,delta:-amt,visible:false,reason:{src:'activity-revoke',dom:did}});
+          }
+        }
+      }else if(l.src==='card-grant'){
+        cardUndo+=(typeof l.granted==='number'?l.granted:parseCardGrantAmt(l.desc));
+      }
+    });
+    if(cardUndo>0){
+      const cur=state.cards.exemption||0;
+      Ledger.post({op:'adjust',account:'card:exemption',target:Math.max(0,cur-cardUndo),visible:false,reason:{src:'activity-revoke'}});
     }
-  });
-  if(cardUndo>0)state.cards.exemption=Math.max(0,(state.cards.exemption||0)-cardUndo);
-  state.logs=state.logs.filter(l=>l.actId!==actId);
+    // 删除已回收流水：奖励记录不存在即代表已撤销，重复调用不会二次退款
+    Ledger.removeLogs(function(l){return l.actId!==actId;});
+  },{label:'activity-revoke',save:'none',render:false});
+  return txr.ok;
 }
 function parseCardGrantAmt(desc){
   const m=/(\d+)\s*张/.exec(desc||'');return m?parseInt(m[1],10):0;
@@ -4802,6 +5573,8 @@ function initDrag(){
   document.addEventListener('pointermove',onDragMove);
   document.addEventListener('pointerup',onDragUp);
   document.addEventListener('pointercancel',onDragUp);
+  // 兜底：窗口失焦（系统手势切走、切标签页等）时结束拖拽，避免 body 残留 overflow:hidden
+  window.addEventListener('blur',onDragUp);
   // Suppress click events that fire right after a drag (e.g. on collapsible headers)
   document.addEventListener('click',function(e){
     if(dragJustEnded){e.preventDefault();e.stopPropagation();}
@@ -4940,6 +5713,8 @@ function onDragMove(e){
 }
 
 function onDragUp(e){
+  // 幂等兜底：无论是否处于拖拽状态，都先恢复页面滚动（可被 pointerup/pointercancel/blur 重复调用）
+  document.body.style.overflow='';
   if(!drag.active)return;
 
   // Release pointer capture
@@ -5169,14 +5944,17 @@ function saveShopCatOrderFromDOM(){
   toast('分类顺序已更新');
 }
 
-// ===== Undo log entry =====
-function undoLog(logId){
-  const log=state.logs.find(l=>l.id===logId);
-  if(!log){toast('记录不存在','err');return}
-
-  if(log.src==='checkin'){
+// ===== Undo adapters =====
+// 撤销规则按 src 注册：新增一种可撤销流水 = 在 UNDO_ADAPTERS 里加一个 key。
+// undoLog / Ledger.reverse 只负责查流水、查适配器、开事务与统一收尾。
+// reverse(log,ctx) 返回 false 表示已交由内层撤销处理，外层不再重复收尾（cost → 父打卡）。
+const UNDO_ADAPTERS={
+  checkin:{reverse:function(log){
     // Reverse the score gain (handles 'vitality' / 'progress' / 'both')
     applyCheckinGain(log,-1);
+    // 活跃度索引按原打卡日期反向扣减（与正向写入共用同一维护函数）
+    const actDids=String(log.dom||'').split(',').filter(Boolean);
+    noteCheckinActivity(actDids.length?actDids:['d_default'],-1,log.time);
     // Decrement task stats
     if(log.taskId){
       const t=state.tasks.find(x=>x.id===log.taskId);
@@ -5200,27 +5978,29 @@ function undoLog(logId){
       }
     }
     // Also reverse any linked cost log (restore vitality)
-    const costLogs=state.logs.filter(l=>(l.link||'')===logId);
+    const costLogs=state.logs.filter(l=>(l.link||'')===log.id);
     costLogs.forEach(cl=>{
-      state.scores.vitality-=cl.amt;
+      Ledger.post({op:'grant',account:'vitality',delta:-cl.amt,visible:false,reason:{src:'undo-cost'}});
     });
     // Remove the check-in log and any linked cost log
-    state.logs=state.logs.filter(l=>l.id!==logId&&(l.link||'')!==logId);
+    Ledger.removeLogs(l=>l.id!==log.id&&(l.link||'')!==log.id);
     toast('已撤销打卡');
-  }else if(log.src==='cost'){
+  }},
+  cost:{reverse:function(log,ctx){
     // If cost has a link, undo the parent check-in instead
     if(log.link){
-      undoLog(log.link);
-      return;
+      ctx.undo(log.link);
+      return false;
     }
     // Standalone cost — just reverse
-    state.scores.vitality-=log.amt;
-    state.logs=state.logs.filter(l=>l.id!==logId);
+    Ledger.post({op:'grant',account:'vitality',delta:-log.amt,visible:false,reason:{src:'undo-cost'}});
+    Ledger.removeLogs(l=>l.id!==log.id);
     toast('已撤销');
-  }else if(log.src==='purchase'){
+  }},
+  purchase:{reverse:function(log){
     // Refund and restore stock. 贷款购买时只退自付部分，避免把贷款额一起退回。
     const paidPart=Math.abs(log.amt)-(typeof log.loanAmt==='number'?log.loanAmt:0);
-    state.scores[log.st]=(state.scores[log.st]||0)+paidPart;
+    Ledger.post({op:'grant',account:log.st,delta:paidPart,visible:false,reason:{src:'undo-purchase'}});
     if(log.prodId){
       const p=state.products.find(x=>x.id===log.prodId);
       if(p){
@@ -5233,9 +6013,10 @@ function undoLog(logId){
     if(log.loanId){
       state.loans=state.loans.filter(l=>l.id!==log.loanId);
     }
-    state.logs=state.logs.filter(l=>l.id!==logId);
+    Ledger.removeLogs(l=>l.id!==log.id);
     toast('已撤销购买');
-  }else if(log.src==='achievement'){
+  }},
+  achievement:{reverse:function(log){
     // Un-unlock achievement
     if(log.achId){
       const a=state.achievements.find(x=>x.id===log.achId);
@@ -5244,33 +6025,27 @@ function undoLog(logId){
         a.unlockedAt=null;
       }
     }
-    state.scores.achievement-=log.amt;
-    state.logs=state.logs.filter(l=>l.id!==logId);
+    Ledger.post({op:'grant',account:'achievement',delta:-log.amt,visible:false,reason:{src:'undo-achievement'}});
+    Ledger.removeLogs(l=>l.id!==log.id);
     toast('已撤销成就解锁');
-  }else if(log.src==='loan-interest'){
-    // Reverse loan interest
-    state.scores[log.st]-=log.amt;
-    if(log.loanId){
-      const loan=state.loans.find(l=>l.id===log.loanId);
-      if(loan)loan.amount-=Math.abs(log.amt);
-    }
-    state.logs=state.logs.filter(l=>l.id!==logId);
-    toast('已撤销利息');
-  }else if(log.src==='loan-repay'){
+  }},
+  'loan-repay':{reverse:function(log){
     // Undo loan repayment: restore the repaid amount and re-create the loan
-    state.scores[log.st]=(state.scores[log.st]||0)+Math.abs(log.amt);
+    Ledger.post({op:'grant',account:log.st,delta:Math.abs(log.amt),visible:false,reason:{src:'undo-loan-repay'}});
     if(log.loanCopy){
       // Re-create the loan that was auto-paid
       state.loans.push(log.loanCopy);
     }
-    state.logs=state.logs.filter(l=>l.id!==logId);
+    Ledger.removeLogs(l=>l.id!==log.id);
     toast('已撤销还款，贷款已恢复');
-  }else if(log.src==='manual-adjust'){
+  }},
+  'manual-adjust':{reverse:function(log){
     // 撤销手动修正：反向应用调整值
-    state.scores[log.st]=(state.scores[log.st]||0)-log.amt;
-    state.logs=state.logs.filter(l=>l.id!==logId);
+    Ledger.post({op:'grant',account:log.st,delta:-log.amt,visible:false,reason:{src:'undo-manual-adjust'}});
+    Ledger.removeLogs(l=>l.id!==log.id);
     toast('已撤销余额修正');
-  }else if(log.src==='delete-coll'){
+  }},
+  'delete-coll':{reverse:function(log){
     // Restore deleted collection
     if(log.collCopy){
       // Restore collection at its original position
@@ -5283,38 +6058,41 @@ function undoLog(logId){
         if(t)t.collectionId=at.prevCollectionId;
       });
     }
-    state.logs=state.logs.filter(l=>l.id!==logId);
+    Ledger.removeLogs(l=>l.id!==log.id);
     toast('已撤销删除集合');
-  }else if(log.src==='delete-task'){
+  }},
+  'delete-task':{reverse:function(log){
     // Restore the deleted task
     if(log.taskCopy){
       state.tasks.splice(Math.min(log.taskIndex,state.tasks.length),0,log.taskCopy);
     }
     // Reverse progress move: take back from default, return to original domains
     if(log.progressMoved){
-      state.scores.progress['d_default']=(state.scores.progress['d_default']||0)-log.progressMoved.totalMoved;
+      Ledger.post({op:'grant',account:'progress:d_default',delta:-log.progressMoved.totalMoved,visible:false,reason:{src:'undo-delete-task'}});
       log.progressMoved.fromDomains.forEach(d=>{
-        state.scores.progress[d.did]=(state.scores.progress[d.did]||0)+d.amount;
+        Ledger.post({op:'grant',account:'progress:'+d.did,delta:d.amount,visible:false,reason:{src:'undo-delete-task'}});
       });
     }
-    state.logs=state.logs.filter(l=>l.id!==logId);
+    Ledger.removeLogs(l=>l.id!==log.id);
     toast('已撤销删除任务');
-  }else if(log.src==='delete-ach'){
+  }},
+  'delete-ach':{reverse:function(log){
     // Restore the deleted milestone
     if(log.achCopy){
       state.achievements.splice(Math.min(log.achIndex,state.achievements.length),0,log.achCopy);
     }
-    state.logs=state.logs.filter(l=>l.id!==logId);
+    Ledger.removeLogs(l=>l.id!==log.id);
     toast('已撤销删除里程碑');
-  }else if(log.src==='delete-domain'){
+  }},
+  'delete-domain':{reverse:function(log){
     // Restore the deleted domain
     if(log.domCopy){
       state.domains.splice(Math.min(log.domIndex,state.domains.length),0,log.domCopy);
     }
     // Reverse progress merge: take back from default, return to original domain
     if(log.progressVal){
-      state.scores.progress['d_default']=(state.scores.progress['d_default']||0)-log.progressVal;
-      state.scores.progress[log.domCopy.id]=log.progressVal;
+      Ledger.post({op:'grant',account:'progress:d_default',delta:-log.progressVal,visible:false,reason:{src:'undo-delete-domain'}});
+      Ledger.post({op:'adjust',account:'progress:'+log.domCopy.id,target:log.progressVal,visible:false,reason:{src:'undo-delete-domain'}});
     }
     // Restore tasks' domain assignments
     if(log.affectedTasks){
@@ -5333,16 +6111,18 @@ function undoLog(logId){
         if(a)a.domainId=aa.prevDomainId;
       });
     }
-    state.logs=state.logs.filter(l=>l.id!==logId);
+    Ledger.removeLogs(l=>l.id!==log.id);
     toast('已撤销删除领域');
-  }else if(log.src==='delete-prod'){
+  }},
+  'delete-prod':{reverse:function(log){
     // Restore the deleted product
     if(log.prodCopy){
       state.products.splice(Math.min(log.prodIndex,state.products.length),0,log.prodCopy);
     }
-    state.logs=state.logs.filter(l=>l.id!==logId);
+    Ledger.removeLogs(l=>l.id!==log.id);
     toast('已撤销删除商品');
-  }else if(log.src==='delete-shopcat'){
+  }},
+  'delete-shopcat':{reverse:function(log){
     // Restore the deleted shop category
     if(log.catCopy){
       state.shopCategories.splice(Math.min(log.catIndex,state.shopCategories.length),0,log.catCopy);
@@ -5354,11 +6134,12 @@ function undoLog(logId){
         if(p)p.categoryId=ap.prevCategoryId;
       });
     }
-    state.logs=state.logs.filter(l=>l.id!==logId);
+    Ledger.removeLogs(l=>l.id!==log.id);
     toast('已撤销删除分类');
-  }else if(log.src==='exempt'){
+  }},
+  exempt:{reverse:function(log){
     // Undo exemption: return card + restore pendingDebt/lastExempt/lastDebtDate
-    state.cards.exemption=(state.cards.exemption||0)+1;
+    Ledger.post({op:'grant',account:'card:exemption',delta:1,visible:false,reason:{src:'undo-exempt'}});
     if(log.taskId){
       const t=state.tasks.find(x=>x.id===log.taskId);
       if(t){
@@ -5367,34 +6148,47 @@ function undoLog(logId){
         if(log.prevLastDebtDate)t.lastDebtDate=log.prevLastDebtDate;else delete t.lastDebtDate;
       }
     }
-    state.logs=state.logs.filter(l=>l.id!==logId);
+    Ledger.removeLogs(l=>l.id!==log.id);
     toast('已撤销豁免');
-  }else if(log.src==='unlock'){
+  }},
+  unlock:{reverse:function(log){
     // Undo unlock: re-archive task + refund vitality
-    state.scores.vitality=(state.scores.vitality||0)-log.amt;
+    Ledger.post({op:'grant',account:'vitality',delta:-log.amt,visible:false,reason:{src:'undo-unlock'}});
     if(log.taskId){
       const t=state.tasks.find(x=>x.id===log.taskId);
       if(t){t.archived=true;t.archivedAt=now();}
     }
-    state.logs=state.logs.filter(l=>l.id!==logId);
+    Ledger.removeLogs(l=>l.id!==log.id);
     toast('已撤销解锁，任务已重新归档');
-  }else if(log.src==='archive'){
+  }},
+  archive:{reverse:function(log){
     // Undo auto-archive: un-archive task
     if(log.taskId){
       const t=state.tasks.find(x=>x.id===log.taskId);
       if(t){t.archived=false;delete t.archivedAt;}
     }
-    state.logs=state.logs.filter(l=>l.id!==logId);
+    Ledger.removeLogs(l=>l.id!==log.id);
     toast('已撤销归档');
-  }else{
-    toast('该记录不支持撤销','err');
-    return;
-  }
+  }}
+};
 
+function undoLog(logId){
+  const txr=Ledger.txn(function(){
+    const log=state.logs.find(l=>l.id===logId);
+    if(!log){toast('记录不存在','err');return;}
+    const ad=Object.prototype.hasOwnProperty.call(UNDO_ADAPTERS,log.src)?UNDO_ADAPTERS[log.src]:null;
+    if(!ad){toast('该记录不支持撤销','err');return;}
+    // 适配器返回 false：内层已处理并完成收尾（如 cost → 父打卡）
+    if(ad.reverse(log,{undo:undoLog})===false)return;
+    // 撤销里程碑解锁本身不能再触发重新解锁（否则点数与日志会被立刻补回来）
+    if(log.src!=='achievement')checkAchievements();
+    processDailyTaskDebts(true);
+    processLoansWithDecayReserve();
+  },{label:'undo',save:'none',render:false});
+  if(!txr.ok){console.warn('undo aborted',logId,txr.error);return;}
+  // 嵌套撤销（cost 转父打卡）由最外层统一收尾，避免事务中途渲染
+  if(txr.nested)return;
   save();
-  checkAchievements();
-  processDailyTaskDebts();
-  processLoans();
   render();
 }
 
@@ -5741,10 +6535,53 @@ function handleAchSave(){
   render();
 }
 
+function fillProdGateSelects(domainId,milestoneId){
+  const ds=document.getElementById('prodGateDomain');
+  if(ds){
+    let html='<option value="">不限制活跃度</option>';
+    state.domains.forEach(function(d){
+      html+='<option value="'+escAttr(d.id)+'"'+(d.id===(domainId||'')?' selected':'')+'>'+esc(d.name)+(isArchivedEntity(d)?'（已归档）':'')+'</option>';
+    });
+    ds.innerHTML=html;
+  }
+  const ms=document.getElementById('prodGateMilestone');
+  if(ms){
+    let html='<option value="">请选择里程碑</option>';
+    state.achievements.forEach(function(a){
+      const stateTxt=isArchivedEntity(a)?'（已归档）':(a.unlocked?'（已解锁）':'（未解锁）');
+      html+='<option value="'+escAttr(a.id)+'"'+(a.id===(milestoneId||'')?' selected':'')+'>'+esc(a.name)+stateTxt+'</option>';
+    });
+    ms.innerHTML=html;
+  }
+}
+
+function onProdTierChange(){
+  const sel=document.getElementById('prodTier');
+  const tier=validProductTier(sel?sel.value:'daily');
+  const q=document.getElementById('prodGateQuality');
+  const e=document.getElementById('prodGateExclusive');
+  if(q)q.style.display=tier==='quality'?'block':'none';
+  if(e)e.style.display=tier==='exclusive'?'block':'none';
+  const hint=document.getElementById('prodTierHint');
+  if(hint){
+    hint.textContent=tier==='daily'
+      ?'支付币种：活力点 · 无门槛'
+      :tier==='quality'
+        ?'支付币种：成果点 · 需满足累计成果点与活跃度门槛'
+        :'支付币种：成果点 · 需绑定处于已解锁状态的里程碑';
+  }
+  editCurrency=tierCurrency(tier);
+}
+
 function openProdModal(id,presetCatId){
   const title=document.getElementById('prodModalTitle');
   document.getElementById('prodId').value='';
   fillShopCatSelect(document.getElementById('prodCategory'),presetCatId||'sc_default');
+  fillProdGateSelects('','');
+  document.getElementById('prodTier').value='daily';
+  document.getElementById('prodGateLifetime').value=0;
+  document.getElementById('prodGateDays').value=7;
+  document.getElementById('prodGateTimes').value=1;
   if(id){
     const p=state.products.find(x=>x.id===id);
     if(!p)return;
@@ -5756,7 +6593,16 @@ function openProdModal(id,presetCatId){
     document.getElementById('prodStock').value=p.stock;
     document.getElementById('prodDebtRate').value=p.debtRate||0;
     fillShopCatSelect(document.getElementById('prodCategory'),p.categoryId||'sc_default');
-    pickCurrency(p.currency);
+    const tier=validProductTier(p.tier);
+    const gate=normalizeProductGate(p.gate,productGateContext());
+    document.getElementById('prodTier').value=tier;
+    fillProdGateSelects(gate.activity.domainId,gate.milestoneId);
+    document.getElementById('prodGateLifetime').value=gate.minLifetime;
+    if(gate.activity.domainId){
+      document.getElementById('prodGateDays').value=gate.activity.days||7;
+      document.getElementById('prodGateTimes').value=gate.activity.times||1;
+    }
+    pickCurrency(tierCurrency(tier));
   }else{
     title.textContent='上架商品';
     document.getElementById('prodName').value='';
@@ -5766,14 +6612,27 @@ function openProdModal(id,presetCatId){
     document.getElementById('prodDebtRate').value=0;
     pickCurrency('vitality');
   }
+  onProdTierChange();
   openModal('prodModal');
   setTimeout(()=>document.getElementById('prodName').focus(),50);
 }
 
 function pickCurrency(type){
   editCurrency=type;
-  document.getElementById('ppV').classList.toggle('sel',type==='vitality');
-  document.getElementById('ppA').classList.toggle('sel',type==='achievement');
+  const pv=document.getElementById('ppV');
+  const pa=document.getElementById('ppA');
+  if(pv)pv.classList.toggle('sel',type==='vitality');
+  if(pa)pa.classList.toggle('sel',type==='achievement');
+}
+
+function gateIntField(id,label,min,max){
+  const raw=document.getElementById(id).value;
+  const n=Number(raw);
+  if(raw===''||!isFinite(n)||Math.round(n)!==n||n<min||(max!==undefined&&n>max)){
+    toast(label+'需为 '+(max!==undefined?(min+'~'+max):('≥ '+min))+' 的整数','err');
+    return null;
+  }
+  return n;
 }
 
 function handleProdSave(){
@@ -5784,13 +6643,39 @@ function handleProdSave(){
   const stock=parseInt(document.getElementById('prodStock').value,10);
   const debtRate=parseFloat(document.getElementById('prodDebtRate').value);
   const categoryId=document.getElementById('prodCategory').value;
+  const tier=validProductTier(document.getElementById('prodTier').value);
 
   if(!name){toast('请输入商品名称','err');return}
   if(isNaN(price)||price<0.1){toast('价格需 ≥ 0.1','err');return}
   if(isNaN(stock)||stock<-1){toast('库存需 ≥ -1','err');return}
   if(isNaN(debtRate)||debtRate<0){toast('债率需 ≥ 0','err');return}
 
-  saveProdData({id:id||null,name:name,desc:desc,currency:editCurrency,price:price,stock:stock,debtRate:debtRate,categoryId:categoryId});
+  let gate=defaultProductGate();
+  if(tier==='quality'){
+    const minLifetime=gateIntField('prodGateLifetime','累计成果点门槛',0);
+    if(minLifetime===null)return;
+    const domainId=document.getElementById('prodGateDomain').value;
+    gate.minLifetime=minLifetime;
+    if(domainId){
+      if(!state.domains.some(function(d){return d.id===domainId;})){
+        toast('关联领域不存在，请重新选择','err');return;
+      }
+      const days=gateIntField('prodGateDays','活跃度天数 X',1,ACTIVITY_MAX_DAYS);
+      if(days===null)return;
+      const times=gateIntField('prodGateTimes','活跃度次数 Y',1);
+      if(times===null)return;
+      gate.activity={domainId:domainId,days:days,times:times};
+    }
+  }else if(tier==='exclusive'){
+    const mid=document.getElementById('prodGateMilestone').value;
+    if(!mid){toast('专属级需绑定一个里程碑','err');return}
+    if(!state.achievements.some(function(a){return a.id===mid;})){
+      toast('绑定的里程碑不存在，请重新选择','err');return;
+    }
+    gate.milestoneId=mid;
+  }
+
+  saveProdData({id:id||null,name:name,desc:desc,price:price,stock:stock,debtRate:debtRate,categoryId:categoryId,tier:tier,gate:gate});
   closeModal('prodModal');
   toast(id?'商品已更新':'商品已上架');
   render();
@@ -5812,10 +6697,13 @@ function confirmDelProd(id){
 // ===== Toast =====
 function toast(msg,type){
   const wrap=document.getElementById('toastWrap');
+  if(!wrap)return;
   const t=document.createElement('div');
   t.className='toast'+(type?' '+type:'');
   t.textContent=msg;
   wrap.appendChild(t);
+  // 同时最多 3 条，避免批量操作时堆满屏幕
+  while(wrap.children.length>3)wrap.removeChild(wrap.firstChild);
   setTimeout(()=>t.remove(),2800);
 }
 
@@ -5843,44 +6731,17 @@ function importData(ev){
   const f=ev.target.files[0];if(!f)return;
   const r=new FileReader();
   r.onload=function(e){
+    const raw=e.target.result;
     try{
-      const d=JSON.parse(e.target.result);
-      if(!d.scores)throw 0;
-      // Migrate imported tasks to new domainIds format
-      const tasks=(d.tasks||[]).map(t=>{
-        if(t.domainIds===undefined){
-          t.domainIds=t.domainId?[t.domainId]:['d_default'];
-          delete t.domainId;
-        }
-        if(t.description===undefined)t.description='';
-        if(t.archived===undefined)t.archived=false;
-        return t;
-      });
-      state={
-        scores:d.scores,domains:d.domains||[{id:'d_default',name:'默认'}],
-        collections:d.collections||[{id:'c_default',name:'默认'}],
-        shopCategories:d.shopCategories||[{id:'sc_default',name:'默认'}],
-        collapsedColls:d.collapsedColls||[],
-        collapsedAchDoms:d.collapsedAchDoms||[],
-        collapsedShopCats:d.collapsedShopCats||[],
-        majorCollapsed:d.majorCollapsed||[],
-        tasks:tasks,achievements:d.achievements||[],
-        affairs:Array.isArray(d.affairs)?d.affairs.map(migrateAffair):[],
-        chores:Array.isArray(d.chores)?d.chores.map(migrateChore):[],
-        choreConfig:normalizeChoreConfig(d.choreConfig),
-        affairPresets:Array.isArray(d.affairPresets)?d.affairPresets:[],
-        affairCollapsed:d.affairCollapsed||[],
-        affairUndo:d.affairUndo||{},
-        products:d.products||[],logs:d.logs||[],
-        loans:d.loans||[],
-        lastDebtDate:d.lastDebtDate||null,
-        filterDomain:d.filterDomain||null,
-        metrics:Array.isArray(d.metrics)?d.metrics:[],
-        cards:Object.assign({exemption:0},d.cards||{}),
-        activities:migrateActivities(d)
-      };
-      save();render();toast('导入成功');
-    }catch(err){toast('导入失败：格式不正确','err')}
+      const probe=JSON.parse(raw);
+      if(!probe||typeof probe!=='object'||Array.isArray(probe)||!probe.scores)throw 0;
+    }catch(err){toast('导入失败：格式不正确','err');return;}
+    // 统一走 parseState 的迁移口径，避免导入/加载两套迁移规则漂移
+    loadIssue=null;
+    const s=parseState(raw);
+    if(loadIssue){toast('导入失败：格式不正确','err');return;}
+    state=s;
+    commit('导入成功');
   };
   r.readAsText(f);ev.target.value='';
 }
@@ -5985,30 +6846,35 @@ function installApp(){
   });
 }
 
-// 启动装载：优先 IndexedDB；若无则从 localStorage 迁移后清除旧值
+// 数据损坏/被截断：先备份原始内容，避免被下一次保存覆盖而彻底丢失
+// 固定两个键轮换（latest/prev），不再每次生成时间戳键导致 localStorage 无限膨胀
+const CORRUPT_BACKUP_KEY='score_sys_corrupt_backup';
+function backupCorrupt(raw){
+  try{
+    const cur=localStorage.getItem(CORRUPT_BACKUP_KEY);
+    if(cur)localStorage.setItem(CORRUPT_BACKUP_KEY+'_prev',cur);
+    localStorage.setItem(CORRUPT_BACKUP_KEY,raw);
+    // 清理历史版本留下的时间戳键
+    const stale=[];
+    for(let i=0;i<localStorage.length;i++){
+      const k=localStorage.key(i);
+      if(k&&k.indexOf(CORRUPT_BACKUP_KEY+'_')===0&&k!==CORRUPT_BACKUP_KEY+'_prev')stale.push(k);
+    }
+    stale.forEach(function(k){localStorage.removeItem(k);});
+  }catch(e){}
+}
+
+// 启动装载：只读 IndexedDB；无存档则使用全新默认状态（v1 原点，无旧版迁移）
 async function loadStateFromStorage(){
   loadIssue=null;
   let raw=null;
-  try{raw=await idbGet(KEY);}catch(e){}
+  try{raw=await withTimeout(idbGet(KEY),3000,undefined);}catch(e){}
   const hasIDB=(raw!==undefined&&raw!==null&&raw!=='');
   if(hasIDB){
     const s=parseState(raw);
     if(loadIssue){
       if(loadIssue.type==='corrupt'){try{await idbPut(KEY+'_corrupt',raw);}catch(e){}}
-      // 数据损坏/被截断：先备份原始内容，避免被下一次保存覆盖而彻底丢失
-      try{localStorage.setItem('score_sys_corrupt_backup_'+Date.now(),raw);}catch(e){}
-    }
-    return s;
-  }
-  let legacy=null;
-  try{legacy=localStorage.getItem(KEY);}catch(e){}
-  if(legacy){
-    const s=parseState(legacy);
-    if(loadIssue){
-      if(loadIssue.type==='corrupt'){try{await idbPut(KEY+'_corrupt',legacy);}catch(e){}}
-      try{localStorage.setItem('score_sys_corrupt_backup_'+Date.now(),legacy);}catch(e){}
-    }else{
-      try{await idbPut(KEY,legacy);localStorage.removeItem(KEY);}catch(e){}
+      backupCorrupt(raw);
     }
     return s;
   }
@@ -6023,16 +6889,41 @@ async function attemptRecovery(){
     let raw=null;
     try{raw=await idbGet(KEY+'_corrupt');}catch(e){}
     if(raw===undefined||raw===null||raw===''){toast('未找到可恢复的原始数据','err');return;}
-    let s=null;
-    try{s=JSON.parse(raw);}catch(e){s=salvageJSON(raw);}
+    const s=parseState(raw);
     if(!s||typeof s!=='object'||!s.scores){toast('恢复失败：原始内容无法解析','err');return;}
-    state=parseState(JSON.stringify(s));
+    state=s;
     save();
     render();
     toast('已尝试恢复上次数据','ok');
   }finally{
     if(bar)bar.style.display='none';
     if(btn){btn.disabled=false;btn.textContent='尝试恢复';}
+  }
+}
+
+// 开发期自检：确认日志写入口只存在于 Ledger 内部（#debug 下输出警告，避免业务层回潮直写）
+function devAuditLogWrites(){
+  if(location.hash!=='#debug')return;
+  const bad=[];
+  if(typeof addLog!=='undefined')bad.push('addLog 仍可从业务层调用');
+  if(typeof pushLog!=='undefined')bad.push('pushLog 仍可从业务层调用');
+  if(typeof Ledger.event!=='function')bad.push('Ledger.event 缺失');
+  if(typeof Ledger.append!=='function')bad.push('Ledger.append 缺失');
+  if(typeof Ledger.removeLogs!=='function')bad.push('Ledger.removeLogs 缺失');
+  if(typeof Ledger.reverse!=='function')bad.push('Ledger.reverse 缺失');
+  if(bad.length)console.warn('[dev] 日志写入口自检失败：'+bad.join('；'));
+  // 源码级回潮检查：http(s) 下取样 app.js，确认日志数组直写次数没有超过 Ledger 内部与全量重置的既有额度
+  if(location.protocol==='http:'||location.protocol==='https:'){
+    fetch('app.js').then(function(r){return r.ok?r.text():'';}).then(function(src){
+      if(!src)return;
+      const quotas=[[/state\.logs\.unshift/g,1],[/state\.logs\.push/g,1],[/state\.logs\.length\s*=/g,1],[/state\.logs\s*=(?!=)/g,2]];
+      const hits=[];
+      quotas.forEach(function(q){
+        const n=(src.match(q[0])||[]).length;
+        if(n>q[1])hits.push(q[0].source+' ×'+n+'（上限 '+q[1]+'）');
+      });
+      if(hits.length)console.warn('[dev] 检测到日志直写回潮：'+hits.join('；'));
+    }).catch(function(){});
   }
 }
 
@@ -6066,23 +6957,30 @@ async function init(){
     bg.addEventListener('click',e=>{if(e.target===bg)bg.classList.remove('show')});
   });
 
-  document.getElementById('taskSaveBtn').addEventListener('click',handleTaskSave);
-  document.getElementById('achSaveBtn').addEventListener('click',handleAchSave);
-  document.getElementById('prodSaveBtn').addEventListener('click',handleProdSave);
-  document.getElementById('metricSaveBtn').addEventListener('click',handleMetricSave);
-  document.getElementById('activitySaveBtn').addEventListener('click',handleActivitySave);
-  document.getElementById('affairSaveBtn').addEventListener('click',handleAffairSave);
-  document.getElementById('affairPlanSaveBtn').addEventListener('click',saveAffairPlan);
-  document.getElementById('presetSaveBtn').addEventListener('click',savePreset);
-  document.getElementById('choreSaveBtn').addEventListener('click',saveChore);
-  document.getElementById('choreCfgSaveBtn').addEventListener('click',saveChoreConfig);
-
-  ['taskModal','achModal','prodModal','metricModal','activityModal','affairModal','affairPlanModal','presetModal','choreModal','choreConfigModal'].forEach(mid=>{
-    document.getElementById(mid).addEventListener('keydown',e=>{
-      if(e.key==='Enter'&&e.target.tagName==='INPUT'){
-        e.preventDefault();
-        document.querySelector('#'+mid+' .modal-foot .btn:last-child').click();
-      }
+  // 模态保存按钮集中登记，新增模态只需在此表加一行
+  const MODAL_SAVERS={
+    taskSaveBtn:handleTaskSave,
+    achSaveBtn:handleAchSave,
+    prodSaveBtn:handleProdSave,
+    metricSaveBtn:handleMetricSave,
+    activitySaveBtn:handleActivitySave,
+    affairSaveBtn:handleAffairSave,
+    affairPlanSaveBtn:saveAffairPlan,
+    presetSaveBtn:savePreset,
+    choreSaveBtn:saveChore,
+    choreCfgSaveBtn:saveChoreConfig
+  };
+  Object.keys(MODAL_SAVERS).forEach(id=>{
+    const el=document.getElementById(id);
+    if(el)el.addEventListener('click',MODAL_SAVERS[id]);
+  });
+  // 任意模态内按 Enter 触发该模态右下角主按钮（不再逐模态重复绑定）
+  document.querySelectorAll('.modal-bg').forEach(bg=>{
+    bg.addEventListener('keydown',e=>{
+      if(e.key!=='Enter'||!e.target||e.target.tagName!=='INPUT')return;
+      e.preventDefault();
+      const btn=bg.querySelector('.modal-foot .btn:last-child');
+      if(btn)btn.click();
     });
   });
   document.addEventListener('keydown',e=>{
@@ -6090,16 +6988,19 @@ async function init(){
   });
 
   checkAchievements();
-  processDailyTaskDebts();
-  processMetabolism();
-  processLoans();
-  processActivities();
-  processChoreDecay();
+  // 启动时各处理器统一 silent，最后一次写盘
+  processDailyTaskDebts(true);
+  processMetabolism(true);
+  processLoansWithDecayReserve();
+  processActivities(true);
+  processChoreDecay(true);
+  save();
   setInterval(schedulerTick,60000);
   initDrag();
   initTaskReveal();
   bindTaskSliders();
   initPWA();
+  devAuditLogWrites();
   render();
 }
 

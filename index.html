@@ -24,7 +24,7 @@
     <button class="hbtn" id="installBtn" onclick="installApp()">下载至桌面</button>
     <button class="hbtn" onclick="exportData()">导出</button>
     <button class="hbtn" onclick="document.getElementById('importFile').click()">导入</button>
-    <input type="file" id="importFile" accept=".json" style="display:none" onchange="importData(event)">
+    <input type="file" id="importFile" accept=".json" hidden onchange="importData(event)">
   </div>
 </div>
 
@@ -62,7 +62,7 @@
   <div class="major-group" id="major_chore">
     <div class="sec-head sec-head-major major-head">
       <div class="sec-title major-title" onclick="toggleMajor('chore')"><span class="major-toggle">▼</span>杂事</div>
-      <div style="display:flex;gap:6px;align-items:center">
+      <div class="sec-head-tools">
         <div class="sec-meta" id="choreMeta"></div>
         <button class="btn btn-sm" onclick="openChoreConfigModal()">⚙ 经济设置</button>
       </div>
@@ -80,7 +80,7 @@
   <div class="major-group" id="major_affair">
     <div class="sec-head sec-head-major major-head">
       <div class="sec-title major-title" onclick="toggleMajor('affair')"><span class="major-toggle">▼</span>项目</div>
-      <div style="display:flex;gap:6px;align-items:center">
+      <div class="sec-head-tools">
         <div class="sec-meta" id="affairMeta"></div>
         <button class="btn btn-sm" onclick="openAffairModal()">+ 新建项目</button>
       </div>
@@ -195,7 +195,7 @@
   </div>
   <div class="chart-tooltip" id="chartTooltip" style="display:none"></div>
 
-  <div class="sec-head"><div class="sec-title">流水记录</div><div style="display:flex;gap:6px;align-items:center"><button class="btn btn-sm" onclick="manualAdjustBalance()">手动修正余额</button><button class="btn btn-sm btn-danger" onclick="openModal('clearDataModal')">清除</button><div class="sec-meta" id="logMeta"></div></div></div>
+  <div class="sec-head"><div class="sec-title">流水记录</div><div class="sec-head-tools"><button class="btn btn-sm" onclick="manualAdjustBalance()">手动修正余额</button><button class="btn btn-sm btn-danger" onclick="openModal('clearDataModal')">清除</button><div class="sec-meta" id="logMeta"></div></div></div>
   <div class="log-list" id="logList"></div>
 </div>
 
@@ -214,7 +214,7 @@
   </div>
   <div id="shopList"></div>
 
-  <div class="sec-head" style="margin-top:24px"><div class="sec-title">购买记录</div></div>
+  <div class="sec-head mt-lg"><div class="sec-title">购买记录</div></div>
   <div class="log-list" id="purchaseList"></div>
 </div>
 
@@ -222,8 +222,8 @@
 <div class="panel" id="panel-cycle">
   <div class="score-bar">
     <div class="score-cell"><div class="label">豁免卡余额</div><div class="num" id="cyCardBal">0</div><div class="sub" id="cyCardSub"></div></div>
-    <div class="score-cell"><div class="label">运行中活动</div><div class="num" id="cyGranted" style="font-size:16px">0</div><div class="sub" id="cyGrantedSub"></div></div>
-    <div class="score-cell"><div class="label">下次结算</div><div class="num" id="cyNext" style="font-size:16px">—</div><div class="sub" id="cyNextSub"></div></div>
+    <div class="score-cell"><div class="label">运行中活动</div><div class="num num-sm" id="cyGranted">0</div><div class="sub" id="cyGrantedSub"></div></div>
+    <div class="score-cell"><div class="label">下次结算</div><div class="num num-sm" id="cyNext">—</div><div class="sub" id="cyNextSub"></div></div>
   </div>
 
   <div class="sec-head sec-head-major">
@@ -235,7 +235,7 @@
   </div>
   <div id="cycleActivities"></div>
 
-  <div class="sec-head sec-head-major" style="margin-top:24px">
+  <div class="sec-head sec-head-major mt-lg">
     <div class="sec-title">断更豁免卡</div>
   </div>
   <div class="rule-card" id="exemptUsePanel"></div>
@@ -706,6 +706,32 @@
     <div class="fg"><label>分类</label><select id="prodCategory"></select></div>
     <div class="fg"><label>描述 <span class="h">选填</span></label><input type="text" id="prodDesc" placeholder="简单说明" maxlength="50" autocomplete="off"></div>
     <div class="fg">
+      <label>层级 <span class="h">支付币种由层级决定</span></label>
+      <select id="prodTier" onchange="onProdTierChange()">
+        <option value="daily">日常级 · 活力点 · 无门槛</option>
+        <option value="quality">品质级 · 成果点 · 累计/活跃度门槛</option>
+        <option value="exclusive">专属级 · 成果点 · 绑定里程碑</option>
+      </select>
+      <div id="prodTierHint" style="font-size:11px;color:var(--text-3);margin-top:4px"></div>
+    </div>
+    <div id="prodGateQuality" style="display:none">
+      <div class="fg"><label>累计成果点门槛 <span class="h">历史累计获得，不随消费减少</span></label>
+        <input type="number" id="prodGateLifetime" value="0" min="0" step="1">
+      </div>
+      <div class="fg"><label>活跃度要求 <span class="h">关联领域最近 X 个自然日内打卡 ≥ Y 次</span></label>
+        <div style="display:flex;gap:6px">
+          <select id="prodGateDomain" style="flex:1"></select>
+          <input type="number" id="prodGateDays" value="7" min="1" max="90" step="1" placeholder="天数X" style="width:76px">
+          <input type="number" id="prodGateTimes" value="1" min="1" step="1" placeholder="次数Y" style="width:76px">
+        </div>
+      </div>
+    </div>
+    <div id="prodGateExclusive" style="display:none">
+      <div class="fg"><label>绑定里程碑 <span class="h">购买时需处于已解锁状态</span></label>
+        <select id="prodGateMilestone"></select>
+      </div>
+    </div>
+    <div class="fg" id="prodCurrencyFG" style="display:none">
       <label>支付货币</label>
       <div class="type-pick">
         <div class="type-opt v" id="ppV" onclick="pickCurrency('vitality')">活力点</div>
