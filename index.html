@@ -32,6 +32,7 @@
   <div class="tab" data-tab="work" onclick="goTab('work')">打工</div>
   <div class="tab" data-tab="bank" onclick="goTab('bank')">银行</div>
   <div class="tab" data-tab="shop" onclick="goTab('shop')">商店</div>
+  <div class="tab" data-tab="budget" onclick="goTab('budget')">预算</div>
   <div class="tab" data-tab="cycle" onclick="goTab('cycle')">周期</div>
 </div>
 
@@ -216,6 +217,27 @@
 
   <div class="sec-head mt-lg"><div class="sec-title">购买记录</div></div>
   <div class="log-list" id="purchaseList"></div>
+</div>
+
+<!-- ==================== 预算 ==================== -->
+<div class="panel" id="panel-budget">
+  <div class="score-bar">
+    <div class="score-cell"><div class="label">活力点</div><div class="num" id="bVitality">0</div></div>
+    <div class="score-cell"><div class="label">成果点</div><div class="num" id="bAchievement">0</div></div>
+    <div class="score-cell"><div class="label">本期已花 / 基础额度</div><div class="num num-sm" id="bPeriod">—</div><div class="sub" id="bPeriodSub"></div></div>
+  </div>
+
+  <div class="sec-head">
+    <div class="sec-title">预算分类</div>
+    <div class="sec-actions">
+      <button class="btn btn-sm" onclick="openQuickRecordModal()">✎ 快速记账</button>
+      <button class="btn btn-sm" onclick="openBudgetCatModal()">+ 新建分类</button>
+    </div>
+  </div>
+  <div id="budgetCategories"></div>
+
+  <div class="sec-head mt-lg"><div class="sec-title">现实账目</div><div class="sec-meta" id="budgetLedgerMeta"></div></div>
+  <div class="log-list" id="budgetLedgerList"></div>
 </div>
 
 <!-- ==================== 周期 ==================== -->
@@ -744,9 +766,130 @@
       <label>债率 <span class="h">贷款购买时，每日额外利息%</span></label>
       <input type="number" id="prodDebtRate" value="0" min="0" step="0.1">
     </div>
+    <div class="fg" id="prodBudgetCategoryFG">
+      <label>现实预算联动 <span class="h">绑定后，购买会在同一笔事务里记一笔现实账</span></label>
+      <select id="prodBudgetCategory" onchange="onProdBudgetChange()"></select>
+    </div>
+    <div class="fg" id="prodBudgetAmountFG" style="display:none">
+      <label>现实金额 <span class="h">按该分类的币种计入本期已花</span></label>
+      <input type="number" id="prodBudgetAmount" value="0" min="0" step="0.01">
+    </div>
     <div class="modal-foot">
       <button class="btn" onclick="closeModal('prodModal')">取消</button>
       <button class="btn" id="prodSaveBtn">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Budget Category Modal ===== -->
+<div class="modal-bg" id="budgetCatModal">
+  <div class="modal modal-wide">
+    <h2 id="budgetCatTitle">新建预算分类</h2>
+    <div class="fg-row">
+      <div class="fg">
+        <label>分类名称</label>
+        <input type="text" id="budgetCatName" placeholder="例如：餐饮" maxlength="40" autocomplete="off">
+      </div>
+      <div class="fg">
+        <label>结算周期 <span class="h">周一 00:00 / 每月 1 日切</span></label>
+        <select id="budgetCatCycle">
+          <option value="week">每周</option>
+          <option value="month">每月</option>
+        </select>
+      </div>
+    </div>
+    <div class="fg-row">
+      <div class="fg">
+        <label>基础限额 <span class="h">结余奖励只按它计算</span></label>
+        <input type="number" id="budgetCatLimit" value="300" min="0.01" step="0.01">
+      </div>
+      <div class="fg">
+        <label>默认领域 <span class="h">进度类规则没填领域时用它</span></label>
+        <select id="budgetCatDefaultDomain"></select>
+      </div>
+    </div>
+    <div class="fg">
+      <label class="fg-check"><input type="checkbox" id="budgetCatEnabled" checked> 启用这个分类</label>
+    </div>
+
+    <div class="acc" id="accBudgetOd">
+      <div class="acc-head" onclick="toggleAcc('accBudgetOd')">
+        <div class="acc-title">超额扩容</div>
+        <div class="acc-sum" id="accBudgetOdSum"></div>
+        <span class="acc-arrow">▾</span>
+      </div>
+      <div class="acc-body">
+        <div class="fg">
+          <label class="fg-check"><input type="checkbox" id="budgetOdEnabled"> 允许本期临时扩容</label>
+        </div>
+        <div class="fg-row">
+          <div class="fg">
+            <label>扩容花费币种</label>
+            <select id="budgetOdCurrency">
+              <option value="achievement">成果点</option>
+              <option value="vitality">活力点</option>
+            </select>
+          </div>
+          <div class="fg">
+            <label>汇率 <span class="h">1 币换多少额度</span></label>
+            <input type="number" id="budgetOdRate" value="2" min="0.01" step="0.01">
+          </div>
+        </div>
+        <div class="fg-row">
+          <div class="fg">
+            <label>每期最多扩额度</label>
+            <input type="number" id="budgetOdMaxReality" value="300" min="0" step="0.01">
+          </div>
+          <div class="fg">
+            <label>每期最多花费</label>
+            <input type="number" id="budgetOdMaxCost" value="150" min="0" step="0.01">
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="sec-head" style="margin-top:10px">
+      <div class="sec-title">规则列表 <span class="sec-meta">按优先级从下到上执行</span></div>
+      <div class="sec-actions">
+        <button class="btn btn-sm" onclick="budRuleAdd('penalty')">+ 惩罚</button>
+        <button class="btn btn-sm" onclick="budRuleAdd('reward')">+ 奖励</button>
+        <button class="btn btn-sm" onclick="budRuleAdd('feedback')">+ 反哺</button>
+      </div>
+    </div>
+    <div id="budgetRuleList"></div>
+
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal('budgetCatModal')">取消</button>
+      <button class="btn" onclick="saveBudgetCategory()">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Quick Record Modal ===== -->
+<div class="modal-bg" id="quickRecordModal">
+  <div class="modal">
+    <h2>快速记账</h2>
+    <div class="fg-row">
+      <div class="fg">
+        <label>分类</label>
+        <select id="qrCategory" onchange="renderQuickPreview()"></select>
+      </div>
+      <div class="fg">
+        <label>金额</label>
+        <input type="number" id="qrAmount" min="0" step="0.01" placeholder="0.00" oninput="renderQuickPreview()">
+      </div>
+    </div>
+    <div class="fg">
+      <label>备注 <span class="h">选填</span></label>
+      <input type="text" id="qrNote" placeholder="例如：午饭" maxlength="80" autocomplete="off">
+    </div>
+    <div class="fg">
+      <label>实时预览 <span class="h">只读；确认后才进事务</span></label>
+      <div id="qrPreview"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal('quickRecordModal')">取消</button>
+      <button class="btn" id="qrConfirmBtn" onclick="qrConfirm()">确认记账</button>
     </div>
   </div>
 </div>
