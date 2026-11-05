@@ -5,11 +5,30 @@ const KEY='score_sys_v3';
 const THEME_KEY='score_sys_theme';
 // Schema 版本与全局常量（必须在 defaults() 首次调用前初始化）
 // v2：商品层级（tier）与门槛（gate）；ext 增加累计成果点与活跃度索引
-const SCHEMA_VERSION=2;
+const SCHEMA_VERSION=3;
 const PROD_TIERS=['daily','quality','exclusive'];
 const PROD_TIER_NAMES={daily:'日常级',quality:'品质级',exclusive:'专属级'};
 const ACTIVITY_MAX_DAYS=90;
-const ACH_EARN_SOURCES={achievement:true,reward:true,affair:true};
+const ACH_EARN_SOURCES={achievement:true,reward:true,affair:true,'budget-reward':true};
+// ===== 现实预算（v3）=====
+// 三层模型：categories（定义） / periods（周期实例，权威聚合） / ledger（有界明细）
+const BUDGET_VERSION=3;
+const BUDGET_RULE_KINDS=['penalty','reward','feedback'];
+const BUDGET_RULE_NAMES={penalty:'超支惩罚',reward:'结余奖励',feedback:'消费反哺'};
+const BUDGET_TARGET_NAMES={vitality:'活力点',achievement:'成果点',progress:'进度值'};
+const BUDGET_METRIC_KEYS=['budget_entry_amount','budget_period_spent','budget_period_overspend','budget_entry_count'];
+const BUDGET_LEDGER_MAX=500;
+const BUDGET_PERIOD_KEEP={week:13,month:12};
+function defaultBudgetSettings(){
+  return{
+    ledgerMax:BUDGET_LEDGER_MAX,
+    periodKeep:{week:BUDGET_PERIOD_KEEP.week,month:BUDGET_PERIOD_KEEP.month},
+    quickRecordDefaultCategoryId:''
+  };
+}
+function defaultBudgetsState(){
+  return{version:BUDGET_VERSION,categories:[],current:{},periods:{},ledger:[],settings:defaultBudgetSettings()};
+}
 function defaultProductGate(){
   return{minLifetime:0,activity:{domainId:'',days:0,times:0},milestoneId:''};
 }
@@ -50,6 +69,23 @@ const MIGRATIONS={
       ext.stats.lifetimeAchievementEarned=Math.max(sum,base,countedSum);
       if(!ext.achievementCounted||typeof ext.achievementCounted!=='object')ext.achievementCounted=counted;
     }
+  },
+  // v2 → v3：现实预算引擎。旧 budgets 占位结构整体替换；非空旧内容保留到 legacy 供人工查看。
+  // 商品补 budget 绑定默认值；其它 ext 字段（stats/activity/achievementCounted）不动。
+  3:function(p){
+    const ext=(p.ext&&typeof p.ext==='object')?p.ext:(p.ext={});
+    const old=ext.budgets;
+    if(old&&typeof old==='object'&&old.version===BUDGET_VERSION)return;
+    const legacy=(old&&typeof old==='object'&&(
+      (Array.isArray(old.items)&&old.items.length)||
+      (Array.isArray(old.records)&&old.records.length)
+    ))?JSON.parse(JSON.stringify(old)):null;
+    ext.budgets=defaultBudgetsState();
+    if(legacy)ext.budgets.legacy=legacy;
+    (Array.isArray(p.products)?p.products:[]).forEach(function(prod){
+      if(!prod||typeof prod!=='object')return;
+      if(!prod.budget||typeof prod.budget!=='object')prod.budget={categoryId:'',amount:0};
+    });
   }
 };
 const AUDIT_MAX=50;
@@ -57,7 +93,13 @@ let state=defaults();
 let editCurrency='vitality';
 let editTypes=['vitality'];
 let condDraft={mode:'all',items:[]};
+let condDraftUI={box:'activityCondItems',previewId:'condPreview',previewFn:null,afterChange:null};
 let condPanel={visible:false,kind:'metric',path:'',step:'range',range:'period',days:7,metric:'checkins',targetType:'all',newFilter:'none',target:'',aggregate:'sum'};
+// 预算分类编辑草稿：规则列表动态增删，条件编辑复用全局 condDraft
+let budEditingId='';
+let budDraftRules=[];
+let budCondEditIdx=-1;
+let qrPreview=null;
 
 // ===== 阶段奖励 =====
 const STAGE_NAMES=['起步','训练','进步','突破','超常'];
@@ -123,7 +165,7 @@ function toggleTheme(){
 initTheme();
 
 function cardName(c){return c==='exemption'?'断更豁免卡':(c||'卡');}
-const COND_METRIC_KEYS=['checkins','vitality','progress','achievement','new_tasks','new_domains'];
+const COND_METRIC_KEYS=['checkins','vitality','progress','achievement','new_tasks','new_domains','budget_entry_amount','budget_period_spent','budget_period_overspend','budget_entry_count'];
 const COND_RANGES=[
   {v:'period',n:'本周期'},
   {v:'total',n:'累计'},
@@ -248,7 +290,7 @@ function newExtState(){
   return{
     stats:{totalAchievement:0,lifetimeVitalityIn:0,lifetimeVitalityOut:0,totalCheckins:0,lifetimeAchievementEarned:0,updatedAt:null},
     watermarks:{vitality:defaultWatermark(),achievement:defaultWatermark(),totalProgress:defaultWatermark(),progress:{}},
-    budgets:{period:'week',items:[],records:[]},
+    budgets:defaultBudgetsState(),
     investment:{window:30},
     reports:[],
     audit:[],
@@ -372,6 +414,7 @@ function normalizeProduct(p,ctx){
   if(!p||typeof p!=='object')return p;
   if(PROD_TIERS.indexOf(p.tier)<0)p.tier='daily';
   p.gate=normalizeProductGate(p.gate,ctx);
+  p.budget=normalizeProductBudget(p.budget,ctx);
   // 支付币种由层级决定：日常级活力点，品质/专属级成果点
   p.currency=tierCurrency(p.tier);
   return p;
@@ -443,7 +486,172 @@ function normalizeWatermark(w){
   w=w&&typeof w==='object'?w:{};
   return{best:toNum(w.best),at:toTs(w.at)};
 }
-function normalizeExt(x){
+// ===== 现实预算归一（非法值守卫）=====
+function normalizeBudgetSettings(s){
+  s=s&&typeof s==='object'&&!Array.isArray(s)?s:{};
+  const pk=(s.periodKeep&&typeof s.periodKeep==='object'&&!Array.isArray(s.periodKeep))?s.periodKeep:{};
+  return{
+    ledgerMax:Math.max(1,Math.round(toNum(s.ledgerMax,BUDGET_LEDGER_MAX))),
+    periodKeep:{
+      week:Math.max(1,Math.round(toNum(pk.week,BUDGET_PERIOD_KEEP.week))),
+      month:Math.max(1,Math.round(toNum(pk.month,BUDGET_PERIOD_KEEP.month)))
+    },
+    quickRecordDefaultCategoryId:String(s.quickRecordDefaultCategoryId||'')
+  };
+}
+function normalizeBudgetRule(r,ctx){
+  if(!r||typeof r!=='object'||Array.isArray(r))return null;
+  const kind=BUDGET_RULE_KINDS.indexOf(r.kind)>=0?r.kind:'penalty';
+  const t=(r.target&&typeof r.target==='object'&&!Array.isArray(r.target))?r.target:{};
+  const account=['vitality','achievement','progress'].indexOf(t.account)>=0?t.account:(kind==='feedback'?'progress':'vitality');
+  let domainId=String(t.domainId||'');
+  if(!ctx||!ctx.domainIds||!ctx.domainIds.has(domainId))domainId='';
+  const p=(r.params&&typeof r.params==='object'&&!Array.isArray(r.params))?r.params:{};
+  const baseDefault=kind==='penalty'?'overspendDelta':(kind==='reward'?'periodSurplus':'entryAmount');
+  return{
+    id:String(r.id||uid()),
+    kind:kind,
+    enabled:r.enabled!==false,
+    priority:Math.round(toNum(r.priority,0)),
+    when:normalizeCondition(r.when),
+    target:{account:account,domainId:domainId},
+    params:{
+      mode:p.mode==='ratio'?'ratio':'fixed',
+      value:Math.max(0,toNum(p.value,0)),
+      rate:Math.max(0,toNum(p.rate,0)),
+      base:['overspendDelta','entryAmount','periodSurplus'].indexOf(p.base)>=0?p.base:baseDefault,
+      capPerPeriod:(p.capPerPeriod===null||p.capPerPeriod===undefined||p.capPerPeriod==='')?null:Math.max(0,toNum(p.capPerPeriod,0)),
+      minAmount:Math.max(0,toNum(p.minAmount,0)),
+      per:p.per==='entry'?'entry':'episode'
+    }
+  };
+}
+function normalizeBudgetCategory(c,ctx){
+  if(!c||typeof c!=='object'||Array.isArray(c))return null;
+  const cycle=c.cycle==='month'?'month':'week';
+  let did=String(c.defaultProgressDomainId||'');
+  if(!ctx||!ctx.domainIds||!ctx.domainIds.has(did))did='';
+  const od=(c.overdraft&&typeof c.overdraft==='object'&&!Array.isArray(c.overdraft))?c.overdraft:{};
+  const rules=asArray(c.rules).map(function(r){return normalizeBudgetRule(r,ctx);}).filter(Boolean);
+  rules.sort(function(a,b){return a.priority-b.priority;});
+  return{
+    id:String(c.id||uid()),
+    name:String(c.name||'未命名分类').slice(0,40),
+    enabled:c.enabled!==false,
+    archived:!!c.archived,
+    cycle:cycle,
+    limit:Math.max(0,toNum(c.limit,0)),
+    defaultProgressDomainId:did,
+    rules:rules,
+    overdraft:{
+      enabled:od.enabled===true,
+      currency:(od.currency==='vitality'||od.currency==='achievement')?od.currency:'achievement',
+      rate:Math.max(0.0001,toNum(od.rate,2)),
+      maxRealityPerPeriod:Math.max(0,toNum(od.maxRealityPerPeriod,300)),
+      maxCostPerPeriod:Math.max(0,toNum(od.maxCostPerPeriod,150))
+    },
+    createdAt:toTs(c.createdAt)||now(),
+    updatedAt:toTs(c.updatedAt)||null
+  };
+}
+function normalizeBudgetPeriod(p,key,cycle){
+  if(!p||typeof p!=='object'||Array.isArray(p))return null;
+  const b=budgetBounds(cycle,toNum(p.start,now()));
+  const totals={};
+  if(p.ruleTotals&&typeof p.ruleTotals==='object'&&!Array.isArray(p.ruleTotals)){
+    Object.keys(p.ruleTotals).forEach(function(k){totals[k]=Math.max(0,toNum(p.ruleTotals[k],0));});
+  }
+  return{
+    key:String(p.key||key),
+    start:toNum(p.start,0)||b.start,
+    end:toNum(p.end,0)||b.end,
+    spent:Math.max(0,toNum(p.spent,0)),
+    entryCount:Math.max(0,Math.round(toNum(p.entryCount,0))),
+    topupAmount:Math.max(0,toNum(p.topupAmount,0)),
+    topupCost:Math.max(0,toNum(p.topupCost,0)),
+    penalizedOverspend:Math.max(0,toNum(p.penalizedOverspend,0)),
+    penaltyCharged:Math.max(0,toNum(p.penaltyCharged,0)),
+    feedbackGranted:Math.max(0,toNum(p.feedbackGranted,0)),
+    ruleTotals:totals,
+    rewardSettled:!!p.rewardSettled,
+    rewardAmount:Math.max(0,toNum(p.rewardAmount,0)),
+    settlementSnapshot:(p.settlementSnapshot&&typeof p.settlementSnapshot==='object')?p.settlementSnapshot:null,
+    closedAt:toTs(p.closedAt),
+    settledAt:toTs(p.settledAt)
+  };
+}
+function normalizeBudgetLedgerEntry(e,ctx){
+  if(!e||typeof e!=='object'||Array.isArray(e))return null;
+  const catId=String(e.categoryId||'');
+  if(ctx&&ctx.catIds&&!ctx.catIds.has(catId))return null;
+  const links=(e.links&&typeof e.links==='object'&&!Array.isArray(e.links))?e.links:{};
+  const snap=(e.snapshot&&typeof e.snapshot==='object'&&!Array.isArray(e.snapshot))?e.snapshot:{};
+  return{
+    id:String(e.id||uid()),
+    ts:toTs(e.ts)||now(),
+    txnId:String(e.txnId||''),
+    categoryId:catId,
+    amount:Math.max(0,toNum(e.amount,0)),
+    source:e.source==='product'?'product':'manual',
+    productId:String(e.productId||''),
+    note:String(e.note||'').slice(0,80),
+    periodKey:String(e.periodKey||''),
+    status:e.status==='reversed'?'reversed':'active',
+    reversedAt:toTs(e.reversedAt),
+    topupAdded:Math.max(0,toNum(e.topupAdded,0)),
+    topupCost:Math.max(0,toNum(e.topupCost,0)),
+    penaltyOverspendDelta:Math.max(0,toNum(e.penaltyOverspendDelta,0)),
+    links:{
+      purchaseLogId:String(links.purchaseLogId||''),
+      topupLogId:String(links.topupLogId||''),
+      penaltyLogIds:asArray(links.penaltyLogIds).map(String).filter(Boolean),
+      feedbackLogIds:asArray(links.feedbackLogIds).map(String).filter(Boolean)
+    },
+    snapshot:{
+      limit:Math.max(0,toNum(snap.limit,0)),
+      topupAmount:Math.max(0,toNum(snap.topupAmount,0)),
+      overspendAfter:Math.max(0,toNum(snap.overspendAfter,0)),
+      penaltyAfter:Math.max(0,toNum(snap.penaltyAfter,0))
+    }
+  };
+}
+function normalizeBudgets(x,ctx){
+  const out=defaultBudgetsState();
+  if(!x||typeof x!=='object'||Array.isArray(x))return out;
+  out.categories=asArray(x.categories).map(function(c){return normalizeBudgetCategory(c,ctx);}).filter(Boolean);
+  const ids=new Set(out.categories.map(function(c){return c.id;}));
+  const byId={};
+  out.categories.forEach(function(c){byId[c.id]=c;});
+  out.settings=normalizeBudgetSettings(x.settings);
+  // 周期实例：只保留仍存在的分类；键与周期边界一致
+  const rawPeriods=(x.periods&&typeof x.periods==='object'&&!Array.isArray(x.periods))?x.periods:{};
+  Object.keys(rawPeriods).forEach(function(cid){
+    if(!ids.has(cid))return;
+    const src=rawPeriods[cid];
+    if(!src||typeof src!=='object'||Array.isArray(src))return;
+    const dst={};
+    Object.keys(src).forEach(function(k){
+      const p=normalizeBudgetPeriod(src[k],k,byId[cid].cycle);
+      if(p)dst[k]=p;
+    });
+    out.periods[cid]=dst;
+  });
+  Object.keys(x.current||{}).forEach(function(cid){
+    const key=String((x.current||{})[cid]||'');
+    if(ids.has(cid)&&key&&out.periods[cid]&&out.periods[cid][key])out.current[cid]=key;
+  });
+  if(ctx&&ctx.catIds)ctx.catIds=ids;
+  out.ledger=asArray(x.ledger).map(function(e){return normalizeBudgetLedgerEntry(e,{catIds:ids});}).filter(Boolean);
+  if(x.legacy)out.legacy=x.legacy;
+  return out;
+}
+function normalizeProductBudget(b,ctx){
+  b=b&&typeof b==='object'&&!Array.isArray(b)?b:{};
+  const catId=String(b.categoryId||'');
+  const ok=(!ctx||!ctx.catIds||ctx.catIds.has(catId));
+  return{categoryId:ok?catId:'',amount:ok?Math.max(0,toNum(b.amount,0)):0};
+}
+function normalizeExt(x,ctx){
   x=x&&typeof x==='object'?x:{};
   const s=x.stats&&typeof x.stats==='object'?x.stats:{};
   const wm=x.watermarks&&typeof x.watermarks==='object'?x.watermarks:{};
@@ -462,9 +670,7 @@ function normalizeExt(x){
       totalProgress:normalizeWatermark(wm.totalProgress),
       progress:{}
     },
-    budgets:(x.budgets&&typeof x.budgets==='object'&&!Array.isArray(x.budgets))
-      ?{period:x.budgets.period||'week',items:asArray(x.budgets.items),records:asArray(x.budgets.records)}
-      :{period:'week',items:[],records:[]},
+    budgets:normalizeBudgets(x.budgets,ctx),
     investment:{window:Math.max(1,Math.round(toNum((x.investment||{}).window,30)))},
     reports:asArray(x.reports).filter(Boolean),
     audit:asArray(x.audit).filter(Boolean).slice(-AUDIT_MAX),
@@ -521,6 +727,9 @@ function parseState(raw){
       domainIds:new Set(domains.map(function(d){return d.id;})),
       achIds:new Set(achievements.map(function(a){return a.id;}))
     };
+    // 先归一 ext：预算分类决定商品绑定分类是否有效，再归一商品
+    const extNorm=normalizeExt(p.ext,prodCtx);
+    if(!prodCtx.catIds)prodCtx.catIds=new Set((extNorm.budgets.categories||[]).map(function(c){return c.id;}));
     return{
       schema:{v:SCHEMA_VERSION,migratedAt:toTs(p.schema&&p.schema.migratedAt)},
       scores:normalizeScores(p.scores),
@@ -547,7 +756,7 @@ function parseState(raw){
       metrics:asArray(p.metrics).filter(Boolean),
       cards:normalizeCards(p.cards),
       activities:migrateActivities(p),
-      ext:normalizeExt(p.ext)
+      ext:extNorm
     };
   }catch(e){loadIssue={type:'corrupt'};return defaults();}
 }
@@ -1159,6 +1368,565 @@ Ledger.registerPolicy({phase:'beforePurchase',priority:10,name:'product-tier-gat
   fn:function(ctx){return evaluateProductGate(ctx.product);}
 });
 
+// ===== 现实预算规则引擎 =====
+// 周/月按本地自然日切：周一开始 00:00，每月 1 日 00:00。
+function budgetBounds(cycle,ts){
+  ts=Number(ts)||now();
+  const d=new Date(ts);
+  if(cycle==='month'){
+    const y=d.getFullYear(),m=d.getMonth();
+    return{key:'M:'+y+'-'+String(m+1).padStart(2,'0'),start:new Date(y,m,1).getTime(),end:new Date(y,m+1,1).getTime()};
+  }
+  const s=new Date(d.getFullYear(),d.getMonth(),d.getDate());
+  const dow=(s.getDay()+6)%7; // 0=周一
+  const start=new Date(s.getFullYear(),s.getMonth(),s.getDate()-dow).getTime();
+  const end=new Date(s.getFullYear(),s.getMonth(),s.getDate()-dow+7).getTime();
+  return{key:'W:'+dayKey(start),start:start,end:end};
+}
+function round4(v){return Math.round((Number(v)||0)*10000)/10000;}
+const BudgetEngine=(function(){
+  // 规则处理器注册表：新增规则类型只加一个 handler + UI 描述，主判定流程不变
+  const RULE_HANDLERS={
+    penalty:function(rule,ctx){
+      if(ctx.settlement)return 0;
+      const p=rule.params;
+      if(p.mode==='ratio')return ctx.deltaOverspend>0?ctx.deltaOverspend*(p.rate||0):0;
+      if(p.per==='episode'&&!(ctx.overspendBefore<=0&&ctx.overspendAfter>0))return 0;
+      return p.value||0;
+    },
+    feedback:function(rule,ctx){
+      if(ctx.settlement)return 0;
+      return rule.params.mode==='ratio'?ctx.entryAmount*(rule.params.rate||0):(rule.params.value||0);
+    },
+    reward:function(rule,ctx){
+      if(!ctx.settlement)return 0;
+      return rule.params.mode==='ratio'?ctx.surplus*(rule.params.rate||0):(rule.params.value||0);
+    }
+  };
+  function failB(code,info){const e=new Error(code);e.__txn=true;e.code=code;e.info=info||{};throw e;}
+  function budgets(){
+    if(!state.ext)state.ext=newExtState();
+    const b=state.ext.budgets;
+    if(!b||typeof b!=='object'||!Array.isArray(b.categories)||!b.settings)state.ext.budgets=defaultBudgetsState();
+    return state.ext.budgets;
+  }
+  function settings(){return budgets().settings||defaultBudgetSettings();}
+  function categories(){return budgets().categories;}
+  function category(id){
+    id=String(id||'');
+    return categories().find(function(c){return c.id===id;})||null;
+  }
+  function blankPeriod(b){
+    return{
+      key:b.key,start:b.start,end:b.end,spent:0,entryCount:0,
+      topupAmount:0,topupCost:0,penalizedOverspend:0,penaltyCharged:0,feedbackGranted:0,
+      ruleTotals:{},rewardSettled:false,rewardAmount:0,settlementSnapshot:null,closedAt:null,settledAt:null
+    };
+  }
+  function readPeriod(cat,ts){
+    const b=budgetBounds(cat.cycle,ts);
+    const map=budgets().periods[cat.id]||{};
+    return{b:b,period:map[b.key]||null};
+  }
+  function getPeriod(cat,ts,create){
+    const b=budgetBounds(cat.cycle,ts);
+    const bd=budgets();
+    if(!bd.periods[cat.id])bd.periods[cat.id]={};
+    const map=bd.periods[cat.id];
+    let p=map[b.key];
+    if(!p&&create){
+      p=blankPeriod(b);
+      map[b.key]=p;
+    }
+    if(p&&create)bd.current[cat.id]=b.key;
+    return{b:b,period:p};
+  }
+  function effectiveLimit(cat,p){return round4((Number(cat.limit)||0)+(Number(p&&p.topupAmount)||0));}
+  function overspendOf(cat,p){return Math.max(0,round4((Number(p&&p.spent)||0)-effectiveLimit(cat,p)));}
+  function accountKeyOf(target){
+    if(!target)return '';
+    if(target.account==='progress')return 'progress:'+target.domainId;
+    return target.account;
+  }
+  function resolveTarget(rule,cat){
+    if(rule.target.account!=='progress')return{account:rule.target.account,domainId:''};
+    const did=rule.target.domainId||cat.defaultProgressDomainId;
+    if(!did||!state.domains.some(function(d){return d.id===did;}))return null;
+    return{account:'progress',domainId:did};
+  }
+  // 预算规则的 when 求值：周期范围 = 分类当前周期；预算指标通过 budgetCtx 注入
+  function evalWhen(rule,cat,periodStart,periodEnd,ts,ctx,settlement){
+    const c=rule.when||{mode:'all',items:[]};
+    if(!c.items||!c.items.length)return true;
+    const act={
+      period:cat.cycle,_budget:true,
+      _periodRange:{start:periodStart,end:periodEnd},
+      budgetCtx:{
+        entryAmount:ctx.entryAmount||0,
+        spent:ctx.spentAfter||0,
+        overspend:ctx.overspendAfter||0,
+        entryCount:ctx.entryCountAfter||0,
+        surplus:ctx.surplus||0
+      }
+    };
+    if(settlement)act._periodRange={start:periodStart,end:periodEnd};
+    return evalNode({group:true,mode:c.mode==='any'?'any':'all',items:c.items},act,ts);
+  }
+  function ruleDesc(rule,cat,amt){
+    const target=resolveTarget(rule,cat);
+    const tgt=target?((target.account==='progress'?'进度·'+domainName(target.domainId):BUDGET_TARGET_NAMES[target.account])):'未知目标';
+    if(rule.kind==='penalty')return'预算「'+cat.name+'」超支惩罚 -'+fmt(amt)+' '+tgt;
+    if(rule.kind==='feedback')return'预算「'+cat.name+'」消费反哺 +'+fmt(amt)+' '+tgt;
+    return'预算「'+cat.name+'」结余奖励 +'+fmt(amt)+' '+tgt;
+  }
+  // 计算一条规则在本笔/本期的金额；返回 0 表示不触发。集中处理 min/cap，便于新增规则类型
+  function ruleAmount(rule,cat,ctx){
+    const h=RULE_HANDLERS[rule.kind];
+    if(!h)return 0;
+    let amt=round4(h(rule,ctx)||0);
+    if(amt<=0)return 0;
+    const min=Number(rule.params.minAmount)||0;
+    if(min>0&&amt<min)amt=min;
+    const cap=(rule.params.capPerPeriod===null||rule.params.capPerPeriod===undefined)?null:Number(rule.params.capPerPeriod);
+    if(cap!==null){
+      const used=Number((ctx.period&&ctx.period.ruleTotals||{})[rule.id])||0;
+      if(used>=cap)return 0;
+      amt=Math.min(amt,cap-used);
+    }
+    return round4(amt);
+  }
+  function computeEffects(cat,period,b,ts,ctx,kindFilter){
+    const out=[];
+    const rules=(cat.rules||[]).slice().sort(function(a,b){return (a.priority||0)-(b.priority||0);});
+    rules.forEach(function(rule){
+      if(!rule.enabled)return;
+      if(kindFilter&&kindFilter.indexOf(rule.kind)<0)return;
+      // 奖励只在结期结算；惩罚/反哺只在记账时
+      if(ctx.settlement&&rule.kind!=='reward')return;
+      if(!ctx.settlement&&rule.kind==='reward')return;
+      const target=resolveTarget(rule,cat);
+      if(!target)return;
+      if(!evalWhen(rule,cat,b.start,b.end,ts,ctx,ctx.settlement))return;
+      const amt=ruleAmount(rule,cat,Object.assign({},ctx,{period:period}));
+      if(amt<=0)return;
+      out.push({
+        ruleId:rule.id,kind:rule.kind,account:target.account,domainId:target.domainId,
+        amount:amt,desc:ruleDesc(rule,cat,amt)
+      });
+    });
+    return out;
+  }
+  // 只读分析：preview 与 prepareEntry 共用；不修改任何状态
+  function analyze(catId,amount,ts,opts){
+    opts=opts||{};
+    ts=Number(ts)||now();
+    amount=round4(Number(amount)||0);
+    if(!(amount>0))return{ok:false,code:'BUDGET_INVALID_AMOUNT',reason:'金额必须大于 0'};
+    const cat=category(catId);
+    if(!cat)return{ok:false,code:'BUDGET_CATEGORY_MISSING',reason:'预算分类不存在'};
+    if(cat.archived)return{ok:false,code:'BUDGET_CATEGORY_ARCHIVED',reason:'预算分类已归档'};
+    if(!cat.enabled)return{ok:false,code:'BUDGET_CATEGORY_DISABLED',reason:'预算分类已停用'};
+    const bd=budgets();
+    const b=budgetBounds(cat.cycle,ts);
+    const map=bd.periods[cat.id]||{};
+    const live=map[b.key]||null;
+    const p=live||blankPeriod(b);
+    const topupReq=round4(Math.max(0,Number(opts.topup)||0));
+    if(topupReq>0){
+      if(!cat.overdraft.enabled)return{ok:false,code:'BUDGET_TOPUP_DISABLED',reason:'该分类未开启额度扩容'};
+      const maxReality=Math.max(0,round4(cat.overdraft.maxRealityPerPeriod-p.topupAmount));
+      const maxCost=Math.max(0,round4(cat.overdraft.maxCostPerPeriod-p.topupCost));
+      if(topupReq>maxReality+1e-9)return{ok:false,code:'BUDGET_TOPUP_LIMIT',reason:'扩容额度超过每期上限（还可扩 '+fmt(maxReality)+'）'};
+      const c=round4(topupReq/(cat.overdraft.rate||1));
+      if(c>maxCost+1e-9)return{ok:false,code:'BUDGET_TOPUP_LIMIT',reason:'扩容花费超过每期上限（还可花 '+fmt(maxCost)+' '+BUDGET_TARGET_NAMES[cat.overdraft.currency]+'）'};
+    }
+    const topupCost=topupReq>0?round4(topupReq/(cat.overdraft.rate||1)):0;
+    const limitBefore=effectiveLimit(cat,p);
+    const limitAfter=round4(limitBefore+topupReq);
+    const spentBefore=round4(Number(p.spent)||0);
+    const spentAfter=round4(spentBefore+amount);
+    const overspendBefore=Math.max(0,round4(spentBefore-limitAfter));
+    const waterBefore=Math.min(round4(Number(p.penalizedOverspend)||0),overspendBefore);
+    const overspendAfter=Math.max(0,round4(spentAfter-limitAfter));
+    const deltaOverspend=Math.max(0,round4(overspendAfter-waterBefore));
+    const entryCountAfter=(Number(p.entryCount)||0)+1;
+    const surplus=Math.max(0,round4(cat.limit-spentAfter));
+    const ctx={
+      settlement:false,entryAmount:amount,spentBefore:spentBefore,spentAfter:spentAfter,
+      overspendBefore:overspendBefore,overspendAfter:overspendAfter,deltaOverspend:deltaOverspend,
+      entryCountAfter:entryCountAfter,surplus:surplus,period:p
+    };
+    const effects=computeEffects(cat,p,b,ts,ctx,['penalty','feedback']);
+    // 结余奖励预估（仅展示，不发放）
+    const rewardCtx=Object.assign({},ctx,{settlement:true,entryAmount:0});
+    const rewardPreview=computeEffects(cat,p,b,ts,rewardCtx,['reward']);
+    // 余额变化（只统计货币账户，进度账户允许为负，不阻断整笔）
+    const bal={};
+    ['vitality','achievement'].forEach(function(k){
+      bal[k]={before:round4(Number(state.scores[k])||0),delta:0,after:0};
+    });
+    if(topupReq>0)bal[cat.overdraft.currency].delta=round4(bal[cat.overdraft.currency].delta-topupCost);
+    effects.forEach(function(e){
+      if(e.account==='progress')return;
+      bal[e.account].delta=round4(bal[e.account].delta+(e.kind==='penalty'?-e.amount:e.amount));
+    });
+    Object.keys(bal).forEach(function(k){bal[k].after=round4(bal[k].before+bal[k].delta);});
+    let insufficient=null;
+    ['vitality','achievement'].forEach(function(k){
+      if(insufficient)return;
+      if(bal[k].after<-1e-9){
+        insufficient={account:k,diff:round4(-bal[k].after),
+          reason:'余额不足：还差 '+fmt(round4(-bal[k].after))+' '+BUDGET_TARGET_NAMES[k]};
+      }
+    });
+    // 扩容建议：不静默扩容，只返回建议，由用户确认后显式传入 opts.topup
+    let needsTopup=null;
+    if(topupReq<=0&&cat.overdraft.enabled&&spentAfter>limitBefore+1e-9){
+      const need=round4(spentAfter-limitBefore);
+      const maxReality=Math.max(0,round4(cat.overdraft.maxRealityPerPeriod-p.topupAmount));
+      const maxCost=Math.max(0,round4(cat.overdraft.maxCostPerPeriod-p.topupCost));
+      const byCost=round4(maxCost*(cat.overdraft.rate||1));
+      const sug=round4(Math.min(need,Math.max(0,maxReality),Math.max(0,byCost)));
+      if(sug>0){
+        const cost=round4(sug/(cat.overdraft.rate||1));
+        const cur=round4(Number(state.scores[cat.overdraft.currency])||0);
+        const after=round4(cur+bal[cat.overdraft.currency].delta-cost);
+        needsTopup={
+          amount:sug,cost:cost,currency:cat.overdraft.currency,
+          affordable:after>=-1e-9,
+          reason:after<-1e-9?('扩容花费不足：还差 '+fmt(round4(-after))+' '+BUDGET_TARGET_NAMES[cat.overdraft.currency]):''
+        };
+      }
+    }
+    return{
+      ok:true,catId:cat.id,cat:cat,ts:ts,amount:amount,bounds:b,periodKey:b.key,
+      period:p,periodLive:live,topup:{amount:topupReq,cost:topupCost,currency:cat.overdraft.currency},
+      effects:effects,rewardPreview:rewardPreview,
+      spentBefore:spentBefore,spentAfter:spentAfter,limitBefore:limitBefore,limitAfter:limitAfter,
+      overspendBefore:overspendBefore,overspendAfter:overspendAfter,deltaOverspend:deltaOverspend,
+      waterBefore:waterBefore,entryCountAfter:entryCountAfter,balances:bal,
+      insufficient:insufficient,needsTopup:needsTopup
+    };
+  }
+  function preview(catId,amount,ts,opts){return analyze(catId,amount,ts,opts||{});}
+  function prepareEntry(catId,amount,opts){
+    opts=opts||{};
+    const plan=analyze(catId,amount,opts.ts,opts);
+    if(!plan.ok)failB(plan.code,{reason:plan.reason});
+    if(plan.insufficient)failB('BUDGET_INSUFFICIENT',{
+      reason:plan.insufficient.reason,account:plan.insufficient.account,diff:plan.insufficient.diff
+    });
+    plan.source=opts.source==='product'?'product':'manual';
+    plan.productId=String(opts.productId||'');
+    plan.note=String(opts.note||'').slice(0,80);
+    return plan;
+  }
+  // 唯一写入口：只在 Ledger.txn 正文内执行；所有现实账目/惩罚/反哺/扩容都在此落盘
+  function commitEntry(tx,plan,extra){
+    extra=extra||{};
+    if(!plan||!plan.ok)failB('BUDGET_INVALID_PLAN',{reason:'预算计划无效'});
+    if(!Ledger.inTxn())failB('BUDGET_NO_TXN',{reason:'预算写入必须在事务内执行'});
+    const cat=category(plan.catId);
+    if(!cat)failB('BUDGET_CATEGORY_MISSING',{reason:'预算分类不存在'});
+    const got=getPeriod(cat,plan.ts,true);
+    const p=got.period;
+    const entryId=uid();
+    let topupLogId='';
+    // 1) 扩容（用户已确认）：先扩容再记账
+    if(plan.topup.amount>0){
+      const acc=plan.topup.currency;
+      const res=Ledger.post({
+        op:'spend',account:acc,delta:-plan.topup.cost,visible:false,
+        entry:{st:acc,amt:-plan.topup.cost,desc:'预算「'+cat.name+'」扩容 '+fmt(plan.topup.amount)+'（花费 '+fmt(plan.topup.cost)+' '+BUDGET_TARGET_NAMES[acc]+'）',src:'budget-topup',budCatId:cat.id,budPeriodKey:p.key,budEntryId:entryId,budTopup:plan.topup.amount},
+        reason:{src:'budget-topup'}
+      });
+      topupLogId=res.entryId||'';
+      p.topupAmount=round4(p.topupAmount+plan.topup.amount);
+      p.topupCost=round4(p.topupCost+plan.topup.cost);
+      p.penalizedOverspend=Math.min(p.penalizedOverspend,Math.max(0,round4(p.spent-effectiveLimit(cat,p))));
+    }
+    // 2) 惩罚/反哺
+    const penaltyLogIds=[],feedbackLogIds=[];
+    plan.effects.forEach(function(e){
+      const isPenalty=e.kind==='penalty';
+      const acc=accountKeyOf(e);
+      const amt=isPenalty?-e.amount:e.amount;
+      const res=Ledger.post({
+        op:isPenalty?'spend':'grant',account:acc,delta:amt,
+        entry:{
+          st:e.account,amt:amt,desc:e.desc,src:isPenalty?'budget-penalty':'budget-feedback',
+          dom:e.account==='progress'?e.domainId:'',
+          budCatId:cat.id,budPeriodKey:p.key,budEntryId:entryId,budRuleId:e.ruleId,
+          budOverspendDelta:isPenalty?plan.deltaOverspend:0
+        },
+        reason:{src:isPenalty?'budget-penalty':'budget-feedback'}
+      });
+      if(isPenalty){
+        if(res.entryId)penaltyLogIds.push(res.entryId);
+        p.penaltyCharged=round4(p.penaltyCharged+e.amount);
+      }else{
+        if(res.entryId)feedbackLogIds.push(res.entryId);
+        p.feedbackGranted=round4(p.feedbackGranted+e.amount);
+      }
+      p.ruleTotals[e.ruleId]=round4((Number(p.ruleTotals[e.ruleId])||0)+e.amount);
+    });
+    // 3) 现实账目 + 周期聚合
+    p.spent=round4(p.spent+plan.amount);
+    p.entryCount=(Number(p.entryCount)||0)+1;
+    p.penalizedOverspend=plan.overspendAfter;
+    p.closedAt=null;
+    const entry={
+      id:entryId,ts:plan.ts,txnId:(tx&&tx.label)||'',categoryId:cat.id,amount:plan.amount,
+      source:plan.source||'manual',productId:plan.productId||'',note:plan.note||'',
+      periodKey:p.key,status:'active',reversedAt:null,
+      topupAdded:plan.topup.amount,topupCost:plan.topup.cost,
+      penaltyOverspendDelta:plan.deltaOverspend,
+      links:{purchaseLogId:String(extra.purchaseLogId||''),topupLogId:topupLogId,penaltyLogIds:penaltyLogIds,feedbackLogIds:feedbackLogIds},
+      snapshot:{
+        limit:round4(cat.limit),topupAmount:round4(p.topupAmount),
+        overspendAfter:plan.overspendAfter,penaltyAfter:p.penalizedOverspend
+      }
+    };
+    budgets().ledger.push(entry);
+    budgets().current[cat.id]=p.key;
+    pruneLedger();
+    prunePeriods(cat);
+    return{entry:entry,topupLogId:topupLogId,penaltyLogIds:penaltyLogIds,feedbackLogIds:feedbackLogIds};
+  }
+  function settlePeriod(cat,p,ts){
+    if(!p)return false;
+    if(p.rewardSettled){
+      if(!p.closedAt)p.closedAt=p.end;
+      return false;
+    }
+    const b=budgetBounds(cat.cycle,p.start);
+    const spent=round4(Number(p.spent)||0);
+    const eff=effectiveLimit(cat,p);
+    const overspend=Math.max(0,round4(spent-eff));
+    const surplus=Math.max(0,round4(cat.limit-spent));
+    const ctx={
+      settlement:true,entryAmount:0,spentBefore:spent,spentAfter:spent,
+      overspendBefore:overspend,overspendAfter:overspend,deltaOverspend:0,
+      entryCountAfter:Number(p.entryCount)||0,surplus:surplus,period:p
+    };
+    const effects=computeEffects(cat,p,b,ts,ctx,['reward']);
+    let total=0;
+    effects.forEach(function(e){
+      const acc=accountKeyOf(e);
+      const res=Ledger.post({
+        op:'grant',account:acc,delta:e.amount,
+        entry:{
+          st:e.account,amt:e.amount,desc:e.desc,src:'budget-reward',
+          dom:e.account==='progress'?e.domainId:'',
+          budCatId:cat.id,budPeriodKey:p.key,budRuleId:e.ruleId
+        },
+        reason:{src:'budget-reward'}
+      });
+      total=round4(total+e.amount);
+      p.ruleTotals[e.ruleId]=round4((Number(p.ruleTotals[e.ruleId])||0)+e.amount);
+      return res;
+    });
+    p.rewardSettled=true;
+    p.rewardAmount=total;
+    p.settledAt=ts||now();
+    p.closedAt=p.end;
+    p.settlementSnapshot={
+      limit:round4(cat.limit),topupAmount:round4(p.topupAmount),spent:spent,overspend:overspend,
+      surplus:surplus,rewardAmount:total,settledAt:p.settledAt,
+      rules:effects.map(function(e){return{ruleId:e.ruleId,amount:e.amount};})
+    };
+    return true;
+  }
+  function reconcileDue(catId,ts){
+    ts=Number(ts)||now();
+    function run(){
+      const cat=category(catId);
+      if(!cat)return false;
+      const map=budgets().periods[cat.id];
+      if(!map)return false;
+      let changed=false;
+      Object.keys(map).forEach(function(k){
+        const p=map[k];
+        if(!p||!p.end)return;
+        if(p.end<=ts&&!p.rewardSettled){
+          settlePeriod(cat,p,ts);
+          changed=true;
+        }
+        if(p.end<=ts&&!p.closedAt)p.closedAt=p.end;
+      });
+      if(changed){prunePeriods(cat);pruneLedger();}
+      return changed;
+    }
+    if(Ledger.inTxn())return run();
+    const r=Ledger.txn(run,{label:'budget-settle',save:'none',render:false});
+    return r.ok?r.value:false;
+  }
+  function reconcileAll(ts){
+    ts=Number(ts)||now();
+    function run(){
+      let changed=false;
+      categories().forEach(function(cat){changed=reconcileDue(cat.id,ts)||changed;});
+      return changed;
+    }
+    if(Ledger.inTxn())return run();
+    const r=Ledger.txn(run,{label:'budget-settle',save:'none',render:false});
+    return r.ok?r.value:false;
+  }
+  function prunePeriods(cat){
+    const map=budgets().periods[cat.id];
+    if(!map)return;
+    const keep=Math.max(1,Math.round(Number((settings().periodKeep||{})[cat.cycle])||BUDGET_PERIOD_KEEP[cat.cycle]||12));
+    const cur=budgets().current[cat.id];
+    const keys=Object.keys(map).sort(function(a,b){return (map[a].end||0)-(map[b].end||0);});
+    while(keys.length>keep){
+      const k=keys.shift();
+      if(k===cur){keys.push(k);break;}
+      delete map[k];
+    }
+  }
+  function pruneLedger(){
+    const arr=budgets().ledger;
+    const max=Math.max(1,Math.round(Number(settings().ledgerMax)||BUDGET_LEDGER_MAX));
+    if(arr.length<=max)return;
+    const curKeys={};
+    categories().forEach(function(c){curKeys[c.id]=budgets().current[c.id]||'';});
+    const removable=arr.filter(function(e){
+      if(e.status==='reversed')return true;
+      const ck=curKeys[e.categoryId]||'';
+      return !!(e.periodKey&&ck&&e.periodKey!==ck);
+    });
+    removable.sort(function(a,b){
+      const ar=a.status==='reversed'?0:1,br=b.status==='reversed'?0:1;
+      if(ar!==br)return ar-br;
+      return (a.ts||0)-(b.ts||0);
+    });
+    const drop={};
+    removable.slice(0,arr.length-max).forEach(function(e){drop[e.id]=true;});
+    budgets().ledger=arr.filter(function(e){return !drop[e.id];});
+  }
+  // 惩罚/反哺/奖励流水被单独撤销时，同步回退周期聚合（水位不回退，避免再次被重复惩罚）
+  function noteEffectReversed(log){
+    if(!log)return;
+    const bd=budgets();
+    const cat=category(log.budCatId);
+    if(!cat)return;
+    const map=bd.periods[cat.id];
+    const p=map&&map[log.budPeriodKey];
+    if(!p)return;
+    const amt=round4(Math.abs(Number(log.amt)||0));
+    if(log.src==='budget-penalty'){
+      p.penaltyCharged=Math.max(0,round4(p.penaltyCharged-amt));
+      if(log.budRuleId)p.ruleTotals[log.budRuleId]=Math.max(0,round4((Number(p.ruleTotals[log.budRuleId])||0)-amt));
+    }else if(log.src==='budget-feedback'){
+      p.feedbackGranted=Math.max(0,round4(p.feedbackGranted-amt));
+      if(log.budRuleId)p.ruleTotals[log.budRuleId]=Math.max(0,round4((Number(p.ruleTotals[log.budRuleId])||0)-amt));
+    }else if(log.src==='budget-reward'){
+      p.rewardAmount=Math.max(0,round4(p.rewardAmount-amt));
+    }
+  }
+  function tryRefundTopup(cat,p,entry){
+    let topup=round4(Number(entry.topupAdded)||0);
+    let cost=round4(Number(entry.topupCost)||0);
+    if(topup<=0)return 0;
+    const spentNew=round4(Number(p.spent)||0)-round4(Number(entry.amount)||0);
+    const limitAfter=round4((Number(cat.limit)||0)+((Number(p.topupAmount)||0)-topup));
+    // 撤销扩容会不会立刻制造超支：会则保留扩容，不退款
+    if(spentNew>limitAfter+1e-9)return 0;
+    p.topupAmount=Math.max(0,round4(p.topupAmount-topup));
+    p.topupCost=Math.max(0,round4(p.topupCost-cost));
+    if(cost>0){
+      Ledger.post({
+        op:'grant',account:cat.overdraft.currency,delta:cost,visible:false,
+        entry:{st:cat.overdraft.currency,amt:cost,desc:'预算「'+cat.name+'」扩容撤销退款 +'+fmt(cost),src:'budget-topup-refund',budCatId:cat.id,budPeriodKey:p.key,budEntryId:entry.id},
+        reason:{src:'budget-topup-refund'}
+      });
+    }
+    if(entry.links&&entry.links.topupLogId){
+      const tid=entry.links.topupLogId;
+      Ledger.removeLogs(function(l){return l.id!==tid;});
+      entry.links.topupLogId='';
+    }
+    return topup;
+  }
+  // 撤销一笔现实账目：只允许当期；按原始惩罚/反哺流水精确退回，水位只降不升
+  function reverseEntry(entryId){
+    const r=Ledger.txn(function(){
+      const bd=budgets();
+      const e=bd.ledger.find(function(x){return x.id===entryId;});
+      if(!e)return failB('BUDGET_ENTRY_MISSING',{reason:'账目不存在'});
+      if(e.status==='reversed')return failB('BUDGET_ENTRY_REVERSED',{reason:'该账目已撤销'});
+      const cat=category(e.categoryId);
+      if(!cat)return failB('BUDGET_CATEGORY_MISSING',{reason:'预算分类不存在'});
+      const map=bd.periods[cat.id];
+      const p=map&&map[e.periodKey];
+      if(!p)return failB('BUDGET_PERIOD_MISSING',{reason:'周期实例不存在'});
+      const nowKey=budgetBounds(cat.cycle,now()).key;
+      if(e.periodKey!==nowKey||p.end<=now())
+        return failB('BUDGET_CROSS_PERIOD',{reason:'跨期账目不可撤销'});
+      tryRefundTopup(cat,p,e);
+      const linked=(e.links.penaltyLogIds||[]).concat(e.links.feedbackLogIds||[]);
+      linked.forEach(function(id){
+        if(state.logs.some(function(l){return l.id===id;}))Ledger.reverse(id);
+      });
+      const spentNew=Math.max(0,round4(p.spent-e.amount));
+      p.spent=spentNew;
+      p.entryCount=Math.max(0,(Number(p.entryCount)||0)-1);
+      const eff=effectiveLimit(cat,p);
+      const over=Math.max(0,round4(spentNew-eff));
+      p.penalizedOverspend=Math.max(0,Math.min(over,round4((Number(p.penalizedOverspend)||0)-(Number(e.penaltyOverspendDelta)||0))));
+      e.status='reversed';
+      e.reversedAt=now();
+      e.links.penaltyLogIds=[];
+      e.links.feedbackLogIds=[];
+      return e;
+    },{label:'budget-reverse',save:'none',render:false});
+    if(!r.ok){
+      const info=(r.error&&r.error.info)||{};
+      toast(info.reason||'撤销失败','err');
+      return false;
+    }
+    save();render();
+    toast('已撤销预算账目');
+    return true;
+  }
+  // 校验一条规则：target=progress 且分类无默认领域时拒绝保存，并指明第几条
+  function validateRule(cat,rule,index){
+    const no=index>0?('第 '+index+' 条规则：'):'';
+    const target=rule.target||{};
+    if(target.account==='progress'){
+      const did=target.domainId||cat.defaultProgressDomainId;
+      if(!did)return no+'目标为进度值，但未指定领域且分类没有默认领域';
+      if(!state.domains.some(function(d){return d.id===did;}))return no+'目标领域不存在';
+    }
+    if(rule.params.mode==='ratio'&&!(Number(rule.params.rate)>0))return no+'比例模式必须填写大于 0 的系数';
+    if(rule.params.mode==='fixed'&&!(Number(rule.params.value)>=0))return no+'固定值不能为负';
+    if(rule.params.capPerPeriod!==null&&Number(rule.params.capPerPeriod)<0)return no+'每期上限不能为负';
+    if(!(Number(rule.params.minAmount)>=0))return no+'最低值不能为负';
+    return '';
+  }
+  return{
+    bounds:budgetBounds,categories:categories,category:category,settings:settings,
+    readPeriod:readPeriod,effectiveLimit:effectiveLimit,overspendOf:overspendOf,
+    preview:preview,prepareEntry:prepareEntry,commitEntry:commitEntry,
+    settlePeriod:settlePeriod,reconcileDue:reconcileDue,reconcileAll:reconcileAll,
+    reverseEntry:reverseEntry,noteEffectReversed:noteEffectReversed,validateRule:validateRule,
+    pruneLedger:pruneLedger,prunePeriods:prunePeriods,ruleHandlers:RULE_HANDLERS
+  };
+})();
+// 商品现实预算预检：只读校验，不写状态；金额/惩罚在 buyProduct 事务内实时计算
+Ledger.registerPolicy({phase:'beforePurchase',priority:20,name:'budget-preflight',
+  fn:function(ctx){
+    const p=ctx.product;
+    if(!p||!p.budget||!p.budget.categoryId)return true;
+    const cat=BudgetEngine.category(p.budget.categoryId);
+    if(!cat)return{deny:true,code:'BUDGET_CATEGORY_MISSING',reason:'商品绑定的预算分类不存在'};
+    if(cat.archived)return{deny:true,code:'BUDGET_CATEGORY_ARCHIVED',reason:'商品绑定的预算分类已归档'};
+    if(!cat.enabled)return{deny:true,code:'BUDGET_CATEGORY_DISABLED',reason:'商品绑定的预算分类已停用'};
+    if(!(Number(p.budget.amount)>0))return{deny:true,code:'BUDGET_AMOUNT_INVALID',reason:'商品绑定了预算分类但现实金额为 0'};
+    return true;
+  }
+});
+
 function dayKey(ts){
   const d=new Date(ts);
   return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
@@ -1313,6 +2081,8 @@ function domainMetricValue(metric,domainId,w,range){
 function condWindowByRange(range,act,ts,days){
   if(range==='today'){const s=dayStartTs(ts);return {start:s,end:s+864e5};}
   if(range==='recent'){const d=Math.max(1,Math.round(Number(days)||7));return {start:ts-d*864e5,end:ts};}
+  // 预算规则的条件在当期实时求值：周期范围 = 预算分类当前周期（而非周期活动的“上一周期”）
+  if(act&&act._periodRange)return act._periodRange;
   return prevPeriodRange(act,ts);
 }
 // 值类指标（打卡/活力/进度）的可组合最小实体集合：主体 × 新增筛选
@@ -1355,6 +2125,16 @@ function evalCountMetric(it,w){
 function evalCondItem(it,act,ts){
   const v=Number(it.value)||0;
   const range=validRange(it.range)?it.range:'period';
+  // 预算指标：只读当前预算周期上下文（由 BudgetEngine 注入 act.budgetCtx）
+  if(it.metric.indexOf('budget_')===0){
+    const bc=(act&&act.budgetCtx)||{};
+    let val=0;
+    if(it.metric==='budget_entry_amount')val=Number(bc.entryAmount)||0;
+    else if(it.metric==='budget_period_spent')val=Number(bc.spent)||0;
+    else if(it.metric==='budget_period_overspend')val=Number(bc.overspend)||0;
+    else if(it.metric==='budget_entry_count')val=Number(bc.entryCount)||0;
+    return opSatisfied(val,it.op,v);
+  }
   const w=range==='total'?{start:0,end:ts+1}:condWindowByRange(range,act,ts,it.days);
   // 成果点：全局累计，无主体/新增/聚合概念
   if(it.metric==='achievement'){
@@ -1458,6 +2238,8 @@ function schedulerTick(){
   processMetabolism(true);
   processLoansWithDecayReserve();
   processChoreDecay(true);
+  // 预算结算兜底：周期结束后惰性结算（记一笔/购买/打开预算页之外的最后防线）
+  BudgetEngine.reconcileAll();
   save();
   scheduleRender();
 }
@@ -2217,9 +2999,19 @@ function buyProduct(id){
   const loanAmt=willLoan?(p.price-balance):0;
   const loanId=uid();
 
-  const txr=Ledger.txn(function(){
+  let budgetMsg='';
+  const txr=Ledger.txn(function(tx){
     // 唯一门槛判定点：策略拒绝抛事务错误，由 txn 统一回滚
     Ledger.checkPurchase(p);
+    // 商品绑定现实预算：预检 → 计划（余额不足直接抛错，整笔回滚）→ 虚拟扣款 → 同事务写现实账
+    let budgetPlan=null;
+    if(p.budget&&p.budget.categoryId&&Number(p.budget.amount)>0){
+      BudgetEngine.reconcileDue(p.budget.categoryId,now());
+      budgetPlan=BudgetEngine.prepareEntry(p.budget.categoryId,Number(p.budget.amount),{
+        source:'product',productId:p.id,ts:now(),
+        note:'购买「'+p.name+'」'
+      });
+    }
     if(willLoan)Ledger.post({op:'grant',account:cur,delta:loanAmt,visible:false,reason:{src:'loan-draw'}});
     if(p.stock>0)p.stock--;
     p.sold=(p.sold||0)+1;
@@ -2232,17 +3024,24 @@ function buyProduct(id){
         productId:p.id,productName:p.name,reason:{src:'purchase'}
       });
     }
-    Ledger.spend(cur,p.price,{src:'purchase',desc:desc,prodId:p.id,loanId:willLoan?loanId:'',loanAmt:willLoan?loanAmt:0});
+    const spendRes=Ledger.spend(cur,p.price,{src:'purchase',desc:desc,prodId:p.id,loanId:willLoan?loanId:'',loanAmt:willLoan?loanAmt:0});
+    if(budgetPlan){
+      const br=BudgetEngine.commitEntry(tx,budgetPlan,{purchaseLogId:spendRes&&spendRes.entryId});
+      budgetMsg=' · 记「'+budgetPlan.cat.name+'」'+fmt(budgetPlan.amount);
+      if(br&&br.penaltyLogIds&&br.penaltyLogIds.length)budgetMsg+=' · 触发惩罚';
+      if(br&&br.feedbackLogIds&&br.feedbackLogIds.length)budgetMsg+=' · 反哺';
+    }
     processDailyTaskDebts(true);
     processLoansWithDecayReserve();
   },{label:'buyProduct',save:'none',render:false});
   if(!txr.ok){
     const info=(txr.error&&txr.error.info)||{};
-    if(txr.error&&txr.error.code==='PURCHASE_DENIED')toast(info.reason||'购买条件未满足','err');
+    if(info.reason)toast(info.reason,'err');
+    else if(txr.error&&txr.error.code==='PURCHASE_DENIED')toast('购买条件未满足','err');
     return;
   }
   save();
-  toast('已购买：'+p.name+' (-'+fmt(p.price)+' '+cn+')'+(willLoan?' · 贷款'+fmt(loanAmt):''));
+  toast('已购买：'+p.name+' (-'+fmt(p.price)+' '+cn+')'+(willLoan?' · 贷款'+fmt(loanAmt):'')+budgetMsg);
   render();
 }
 
@@ -4725,14 +5524,18 @@ const COND_METRICS=[
   {v:'progress',n:'进度值'},
   {v:'achievement',n:'成果点'},
   {v:'new_tasks',n:'新增任务'},
-  {v:'new_domains',n:'新增领域'}
+  {v:'new_domains',n:'新增领域'},
+  {v:'budget_entry_amount',n:'本笔金额'},
+  {v:'budget_period_spent',n:'本周期已花'},
+  {v:'budget_period_overspend',n:'本周期超支'},
+  {v:'budget_entry_count',n:'本周期笔数'}
 ];
 const COND_TARGET_TYPES=[{v:'all',n:'全部'},{v:'domain',n:'按领域'},{v:'task',n:'按任务'}];
 const COND_NEW_FILTERS=[{v:'none',n:'当前'},{v:'new_task',n:'本周期新增任务'},{v:'new_domain',n:'本周期新增领域'}];
 const COND_AGGREGATES=[{v:'sum',n:'总计'},{v:'any',n:'任意单个'}];
 // 主体类型：成果点仅全部；计数类(新增任务/新增领域)支持全部+领域；值类(打卡/活力/进度)支持全部+领域+任务
 function condTargetTypesFor(metric){
-  if(metric==='achievement')return ['all'];
+  if(metric==='achievement'||metric.indexOf('budget_')===0)return ['all'];
   if(metric==='new_tasks'||metric==='new_domains')return ['all','domain'];
   return ['all','domain','task'];
 }
@@ -4782,6 +5585,7 @@ function rangeTimeWord(it,act){
   if(it.range==='today')return '今天';
   if(it.range==='recent')return '最近'+(it.days||7)+'天';
   if(it.range==='total')return '累计';
+  if(act&&act._budget)return '本周期';
   if(act.period==='day')return '昨日';
   if(act.period==='month')return '上月';
   return '上周';
@@ -4864,11 +5668,15 @@ function readRewardItems(){
   return rewardItems;
 }
 function updateCondPreview(){
-  const el=document.getElementById('condPreview');
+  const el=document.getElementById(condDraftUI.previewId||'condPreview');
   if(!el)return;
+  // 预算规则条件：交给预算侧的自定义预览，不读取周期活动字段
+  if(condDraftUI.previewFn){condDraftUI.previewFn(el,condDraft);return;}
+  const periodSel=document.getElementById('activityPeriod');
+  if(!periodSel)return;
   const items=condDraft.items||[];
   const mode=condDraft.mode==='any'?'any':'all';
-  const period=document.getElementById('activityPeriod').value;
+  const period=periodSel.value;
   const anchor=parseInt(document.getElementById('activityAnchor').value,10)||1;
   const anchorNames=['','周一','周二','周三','周四','周五','周六','周日'];
   const when=period==='day'?'每天结算时':period==='month'?'每月结算时':('每'+anchorNames[anchor]+'结算时');
@@ -4887,6 +5695,7 @@ function openActivityModal(id){
   document.getElementById('activityName').value=a?a.name:'';
   document.getElementById('activityPeriod').value=a?a.period:'week';
   document.getElementById('activityAnchor').value=a?(a.anchor||1):1;
+  resetCondDraftUI();
   condDraft=normalizeCondition((a&&a.condition)||{mode:'all',items:[]});
   document.getElementById('activityCondMode').value=(condDraft.mode==='any')?'any':'all';
   document.getElementById('activityDeleteBtn').style.display=id?'':'none';
@@ -5007,11 +5816,19 @@ function renderCondNodes(items,parentPath,depth){
   }).join('');
 }
 function renderCondTree(){
-  const box=document.getElementById('activityCondItems');
+  const box=document.getElementById(condDraftUI.box||'activityCondItems');
   if(!box)return;
   box.innerHTML=(condDraft.items&&condDraft.items.length)?renderCondNodes(condDraft.items,'',0):'<div class="cond-empty">还没有条件，满足任意情况即触发</div>';
   updateCondPreview();
-  updateActivitySummary();
+  if(condDraftUI.afterChange)condDraftUI.afterChange();
+  else updateActivitySummary();
+}
+function setCondDraftContext(draft,box,previewId,previewFn,afterChange){
+  condDraft=draft;
+  condDraftUI={box:box,previewId:previewId,previewFn:previewFn||null,afterChange:afterChange||null};
+}
+function resetCondDraftUI(){
+  condDraftUI={box:'activityCondItems',previewId:'condPreview',previewFn:null,afterChange:null};
 }
 function addCondItem(parentPath){condListAt(parentPath).push({range:'period',metric:'checkins',op:'>=',value:1,targetType:'all'});renderCondTree();}
 function addCondGroup(parentPath){condListAt(parentPath).push({group:true,mode:'all',items:[{range:'period',metric:'checkins',op:'>=',value:1,targetType:'all'}]});renderCondTree();}
@@ -5160,8 +5977,11 @@ function confirmCondDays(){
 }
 function pickCondMetric(metric){
   condPanel.metric=metric;
-  // 成果点仅支持「全部」，直接提交
-  if(metric==='achievement'){commitCondValue('all','','none','sum');return;}
+  // 成果点/预算指标仅支持「全部 + 本周期」，直接提交
+  if(metric==='achievement'||metric.indexOf('budget_')===0){
+    if(metric.indexOf('budget_')===0)condPanel.range='period';
+    commitCondValue('all','','none','sum');return;
+  }
   condPanel.step='targetType';
   renderCondPanel();
   positionCondPanel(condPanel.anchor);
