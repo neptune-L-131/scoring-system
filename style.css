@@ -106,6 +106,7 @@ body{
 
 /* ===== Score Bar ===== */
 .score-bar{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px}
+.score-bar-single{grid-template-columns:1fr}
 .score-cell{
   background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
   padding:14px 10px;text-align:center;

@@ -198,6 +198,15 @@
 
   <div class="sec-head"><div class="sec-title">流水记录</div><div class="sec-head-tools"><button class="btn btn-sm" onclick="manualAdjustBalance()">手动修正余额</button><button class="btn btn-sm btn-danger" onclick="openModal('clearDataModal')">清除</button><div class="sec-meta" id="logMeta"></div></div></div>
   <div class="log-list" id="logList"></div>
+
+  <div class="sec-head" style="margin-top:8px">
+    <div class="sec-title" style="font-size:13px;color:var(--text-3)">余额调整记录</div>
+    <div class="sec-head-tools">
+      <div class="sec-meta" id="shadowMeta"></div>
+      <button class="btn btn-sm" onclick="toggleShadowList()">显示/隐藏</button>
+    </div>
+  </div>
+  <div class="log-list" id="shadowList" style="display:none"></div>
 </div>
 
 <!-- ==================== 商店 ==================== -->
@@ -221,12 +230,11 @@
 
 <!-- ==================== 预算 ==================== -->
 <div class="panel" id="panel-budget">
-  <div class="score-bar">
-    <div class="score-cell"><div class="label">活力点</div><div class="num" id="bVitality">0</div></div>
-    <div class="score-cell"><div class="label">成果点</div><div class="num" id="bAchievement">0</div></div>
+  <div class="score-bar score-bar-single">
     <div class="score-cell"><div class="label">本期已花 / 基础额度</div><div class="num num-sm" id="bPeriod">—</div><div class="sub" id="bPeriodSub"></div></div>
   </div>
 
+  <div id="budgetAnchorNotice"></div>
   <div class="sec-head">
     <div class="sec-title">预算分类</div>
     <div class="sec-actions">
@@ -251,7 +259,7 @@
   <div class="sec-head sec-head-major">
     <div class="sec-title">周期活动</div>
     <div style="display:flex;gap:6px">
-      <div class="sec-meta" style="align-self:center">设定周期规则，自动发放奖励 / 道具</div>
+      <div class="sec-meta" style="align-self:center">设定周期规则，自动发放奖励 / 执行结构操作</div>
       <button class="btn btn-sm" onclick="openActivityModal()">+ 新建活动</button>
     </div>
   </div>
@@ -659,15 +667,15 @@
 
     <div class="acc" id="accResult">
       <div class="acc-head" onclick="toggleAcc('accResult')">
-        <div class="acc-title">奖励结果</div>
+        <div class="acc-title">结果动作</div>
         <div class="acc-sum" id="accResultSum"></div>
         <span class="acc-arrow">▾</span>
       </div>
       <div class="acc-body">
         <div class="fg">
-          <label>奖励项 <span class="h">分类选择，可指定关联任务/领域（不指定也行）</span></label>
+          <label>动作项 <span class="h">奖励类发放资产；归档类按不活跃天数修改实体状态</span></label>
           <div id="activityResultDetails"></div>
-          <button class="btn btn-sm" style="margin-top:4px" onclick="addRewardRow()">+ 添加奖励项</button>
+          <button class="btn btn-sm" style="margin-top:4px" onclick="addRewardRow()">+ 添加动作项</button>
         </div>
       </div>
     </div>
@@ -731,33 +739,32 @@
       <label>层级 <span class="h">支付币种由层级决定</span></label>
       <select id="prodTier" onchange="onProdTierChange()">
         <option value="daily">日常级 · 活力点 · 无门槛</option>
-        <option value="quality">品质级 · 成果点 · 累计/活跃度门槛</option>
-        <option value="exclusive">专属级 · 成果点 · 绑定里程碑</option>
+        <option value="quality">品质级 · 成果点 · 自定义门槛条件</option>
+        <option value="exclusive">专属级 · 成果点 · 自定义门槛条件</option>
       </select>
       <div id="prodTierHint" style="font-size:11px;color:var(--text-3);margin-top:4px"></div>
     </div>
-    <div id="prodGateQuality" style="display:none">
-      <div class="fg"><label>累计成果点门槛 <span class="h">历史累计获得，不随消费减少</span></label>
-        <input type="number" id="prodGateLifetime" value="0" min="0" step="1">
-      </div>
-      <div class="fg"><label>活跃度要求 <span class="h">关联领域最近 X 个自然日内打卡 ≥ Y 次</span></label>
-        <div style="display:flex;gap:6px">
-          <select id="prodGateDomain" style="flex:1"></select>
-          <input type="number" id="prodGateDays" value="7" min="1" max="90" step="1" placeholder="天数X" style="width:76px">
-          <input type="number" id="prodGateTimes" value="1" min="1" step="1" placeholder="次数Y" style="width:76px">
+    <div id="prodGateBox" style="display:none">
+      <div class="fg">
+        <label>门槛条件 <span class="h">满足全部/任意条件才能购买；留空表示无门槛</span></label>
+        <div class="cond-group">
+          <div class="cond-group-head">
+            <span class="cg-label">满足</span>
+            <select class="cg-mode" id="prodGateMode" onchange="onProdGateModeChange()">
+              <option value="all">全部</option>
+              <option value="any">任意</option>
+            </select>
+            <span class="cg-label2">以下条件</span>
+          </div>
+          <div class="cond-group-body">
+            <div id="prodGateCondItems"></div>
+            <div class="cond-actions">
+              <button class="btn btn-sm" onclick="addCondItem('')">+ 添加条件</button>
+              <button class="btn btn-sm" onclick="addCondGroup('')">+ 添加条件组</button>
+            </div>
+          </div>
         </div>
-      </div>
-    </div>
-    <div id="prodGateExclusive" style="display:none">
-      <div class="fg"><label>绑定里程碑 <span class="h">购买时需处于已解锁状态</span></label>
-        <select id="prodGateMilestone"></select>
-      </div>
-    </div>
-    <div class="fg" id="prodCurrencyFG" style="display:none">
-      <label>支付货币</label>
-      <div class="type-pick">
-        <div class="type-opt v" id="ppV" onclick="pickCurrency('vitality')">活力点</div>
-        <div class="type-opt a" id="ppA" onclick="pickCurrency('achievement')">成果点</div>
+        <div id="prodGatePreview" class="cond-preview"></div>
       </div>
     </div>
     <div class="fg"><label>价格 <span class="h">支持小数</span></label><input type="number" id="prodPrice" value="10" min="0.1" step="0.1"></div>
@@ -791,10 +798,22 @@
         <input type="text" id="budgetCatName" placeholder="例如：餐饮" maxlength="40" autocomplete="off">
       </div>
       <div class="fg">
-        <label>结算周期 <span class="h">周一 00:00 / 每月 1 日切</span></label>
-        <select id="budgetCatCycle">
+        <label>结算周期 <span class="h">每周按起始日切 / 每月 1 日切</span></label>
+        <select id="budgetCatCycle" onchange="syncBudgetAnchorVisibility()">
           <option value="week">每周</option>
           <option value="month">每月</option>
+        </select>
+      </div>
+      <div class="fg" id="budgetCatAnchorWrap">
+        <label>周起始日 <span class="h">与周期活动的周界一致</span></label>
+        <select id="budgetCatAnchor">
+          <option value="1">周一</option>
+          <option value="2">周二</option>
+          <option value="3">周三</option>
+          <option value="4">周四</option>
+          <option value="5">周五</option>
+          <option value="6">周六</option>
+          <option value="7">周日</option>
         </select>
       </div>
     </div>
@@ -815,7 +834,6 @@
     <div class="acc" id="accBudgetOd">
       <div class="acc-head" onclick="toggleAcc('accBudgetOd')">
         <div class="acc-title">超额扩容</div>
-        <div class="acc-sum" id="accBudgetOdSum"></div>
         <span class="acc-arrow">▾</span>
       </div>
       <div class="acc-body">

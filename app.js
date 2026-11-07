@@ -9,6 +9,16 @@ const SCHEMA_VERSION=3;
 const PROD_TIERS=['daily','quality','exclusive'];
 const PROD_TIER_NAMES={daily:'日常级',quality:'品质级',exclusive:'专属级'};
 const ACTIVITY_MAX_DAYS=90;
+// ===== 统计计数器（ext.stats）=====
+// version 变化时载入阶段会自动从当前日志重建一次（旧存档升级兜底）
+// v2：增加 invisible/evicted 两个账户差额累计，用于让“余额 vs 流水”自检在隐形操作与日志截断后仍精确
+const STATS_VERSION=2;
+// 日桶保留天数：覆盖统计页 7 天趋势/4 周对比与常见“最近 N 天”条件；超出后不再计入窗口统计
+const STATS_KEEP_DAYS=400;
+const STATS_ENTITY_MAPS=['vd','pd','vt','pt','ct','cd'];
+const STATS_SCALARS=['v','p','a','ck','inv','cons','prod'];
+// 余额调整记录（隐形流水）保留条数：只做展示与人工追溯，不参与自检求和口径
+const SHADOW_MAX=200;
 const ACH_EARN_SOURCES={achievement:true,reward:true,affair:true,'budget-reward':true};
 // ===== 现实预算（v3）=====
 // 三层模型：categories（定义） / periods（周期实例，权威聚合） / ledger（有界明细）
@@ -16,81 +26,25 @@ const BUDGET_VERSION=3;
 const BUDGET_RULE_KINDS=['penalty','reward','feedback'];
 const BUDGET_RULE_NAMES={penalty:'超支惩罚',reward:'结余奖励',feedback:'消费反哺'};
 const BUDGET_TARGET_NAMES={vitality:'活力点',achievement:'成果点',progress:'进度值'};
-const BUDGET_METRIC_KEYS=['budget_entry_amount','budget_period_spent','budget_period_overspend','budget_entry_count'];
 const BUDGET_LEDGER_MAX=500;
 const BUDGET_PERIOD_KEEP={week:13,month:12};
 function defaultBudgetSettings(){
   return{
     ledgerMax:BUDGET_LEDGER_MAX,
     periodKeep:{week:BUDGET_PERIOD_KEEP.week,month:BUDGET_PERIOD_KEEP.month},
-    quickRecordDefaultCategoryId:''
+    // 周起始日变更后的可见提示：{categoryId,name,from,to,at}
+    anchorNotice:null
   };
 }
 function defaultBudgetsState(){
   return{version:BUDGET_VERSION,categories:[],current:{},periods:{},ledger:[],settings:defaultBudgetSettings()};
 }
 function defaultProductGate(){
-  return{minLifetime:0,activity:{domainId:'',days:0,times:0},milestoneId:''};
+  return{minLifetime:0,activity:{domainId:'',days:0,times:0},milestoneId:'',condition:{mode:'all',items:[]}};
 }
 function tierCurrency(tier){return tier==='daily'?'vitality':'achievement';}
-const MIGRATIONS={
-  // v1 → v2：旧商品补 tier/gate（旧成果点商品映射为品质级，保持原支付币种不变）
-  // 旧存档的“累计获得成果点”按正向往期流水 + 当前余额 + 已解锁里程碑金额做一次性基线，
-  // 并把历史上出现过的成就 id 记入已计入清单，避免升级后撤销/再解锁重复累计。
-  2:function(p){
-    const prods=Array.isArray(p.products)?p.products:[];
-    prods.forEach(function(prod){
-      if(!prod||typeof prod!=='object')return;
-      if(PROD_TIERS.indexOf(prod.tier)<0)prod.tier=(prod.currency==='achievement')?'quality':'daily';
-      if(!prod.gate||typeof prod.gate!=='object')prod.gate=defaultProductGate();
-    });
-    const ext=(p.ext&&typeof p.ext==='object')?p.ext:(p.ext={});
-    if(!ext.stats||typeof ext.stats!=='object')ext.stats={};
-    if(!ext.activity||typeof ext.activity!=='object')ext.activity={};
-    if(typeof ext.stats.lifetimeAchievementEarned!=='number'){
-      const logs=Array.isArray(p.logs)?p.logs:[];
-      const counted={};
-      let sum=0;
-      logs.forEach(function(l){
-        if(!l||l.st!=='achievement')return;
-        const src=String(l.src||'');
-        if(src.indexOf('undo')===0||src==='loan-draw'||src==='manual-adjust')return;
-        const amt=Number(l.amt);
-        if(!isFinite(amt)||amt<=0)return;
-        sum+=amt;
-        if(l.achId)counted[l.achId]=Math.max(Number(counted[l.achId])||0,amt);
-      });
-      (Array.isArray(p.achievements)?p.achievements:[]).forEach(function(a){
-        if(a&&a.id&&a.unlocked)counted[a.id]=Math.max(Number(counted[a.id])||0,Number(a.points)||0);
-      });
-      let countedSum=0;
-      Object.keys(counted).forEach(function(k){countedSum+=counted[k];});
-      const base=Math.max(0,Number((p.scores||{}).achievement)||0);
-      ext.stats.lifetimeAchievementEarned=Math.max(sum,base,countedSum);
-      if(!ext.achievementCounted||typeof ext.achievementCounted!=='object')ext.achievementCounted=counted;
-    }
-  },
-  // v2 → v3：现实预算引擎。旧 budgets 占位结构整体替换；非空旧内容保留到 legacy 供人工查看。
-  // 商品补 budget 绑定默认值；其它 ext 字段（stats/activity/achievementCounted）不动。
-  3:function(p){
-    const ext=(p.ext&&typeof p.ext==='object')?p.ext:(p.ext={});
-    const old=ext.budgets;
-    if(old&&typeof old==='object'&&old.version===BUDGET_VERSION)return;
-    const legacy=(old&&typeof old==='object'&&(
-      (Array.isArray(old.items)&&old.items.length)||
-      (Array.isArray(old.records)&&old.records.length)
-    ))?JSON.parse(JSON.stringify(old)):null;
-    ext.budgets=defaultBudgetsState();
-    if(legacy)ext.budgets.legacy=legacy;
-    (Array.isArray(p.products)?p.products:[]).forEach(function(prod){
-      if(!prod||typeof prod!=='object')return;
-      if(!prod.budget||typeof prod.budget!=='object')prod.budget={categoryId:'',amount:0};
-    });
-  }
-};
 const AUDIT_MAX=50;
 let state=defaults();
-let editCurrency='vitality';
 let editTypes=['vitality'];
 let condDraft={mode:'all',items:[]};
 let condDraftUI={box:'activityCondItems',previewId:'condPreview',previewFn:null,afterChange:null};
@@ -114,6 +68,7 @@ let affairCalCursor=null;
 let affairCalSelected=null;
 let affairDoneOpen=false;
 let choreDoneOpen=false;
+let choreArchivedOpen=false;
 let editAffairSteps=[];
 function loadStagePresets(){
   const p={stepPct:50,decreasePct:100};
@@ -167,7 +122,26 @@ function toggleTheme(){
 initTheme();
 
 function cardName(c){return c==='exemption'?'断更豁免卡':(c||'卡');}
-const COND_METRIC_KEYS=['checkins','vitality','progress','achievement','new_tasks','new_domains','budget_entry_amount','budget_period_spent','budget_period_overspend','budget_entry_count'];
+const COND_METRIC_KEYS=['checkins','vitality','progress','achievement','new_tasks','new_domains','budget_entry_amount','budget_period_spent','budget_period_overspend','budget_entry_count',
+  // 阶段 1：项目 / 杂事 / 任务不活跃
+  'affair_completed','affair_steps','affair_stall','affair_progress','affair_achievement',
+  'chore_completed','chore_overdue','chore_decay','chore_batches','chore_idle','task_idle',
+  // 阶段 3：商品门槛通用条件
+  'lifetime_achievement','domain_activity','milestone_unlocked','checkin_streak','budget_remaining'];
+// 点态指标：不按时间窗口累计，取“此刻”的实体状态（任务/项目的最近活跃、杂事超期件数等）
+const COND_POINT_METRICS=['affair_stall','chore_overdue','chore_idle','task_idle',
+  'lifetime_achievement','milestone_unlocked','checkin_streak','budget_remaining'];
+// 项目类窗口指标：数据源是项目/步骤上的时间戳与 src='affair' 的流水
+const COND_AFFAIR_METRICS=['affair_completed','affair_steps','affair_stall','affair_progress','affair_achievement'];
+// 杂事类指标：数据源是杂事时间戳与 src='chore-batch' / 'chore-decay' 的流水
+const COND_CHORE_METRICS=['chore_completed','chore_overdue','chore_decay','chore_batches','chore_idle'];
+function isPointMetric(m){return COND_POINT_METRICS.indexOf(m)>=0;}
+function isAffairMetric(m){return COND_AFFAIR_METRICS.indexOf(m)>=0;}
+function isChoreMetric(m){return COND_CHORE_METRICS.indexOf(m)>=0;}
+function isStage1Metric(m){return isAffairMetric(m)||isChoreMetric(m)||m==='task_idle';}
+// 阶段 3：商品门槛专用指标（累计获得 / 领域活跃度 / 里程碑 / 连续打卡 / 预算剩余）
+const COND_GATE_METRICS=['lifetime_achievement','domain_activity','milestone_unlocked','checkin_streak','budget_remaining'];
+function isGateMetric(m){return COND_GATE_METRICS.indexOf(m)>=0;}
 const COND_RANGES=[
   {v:'period',n:'本周期'},
   {v:'total',n:'累计'},
@@ -190,7 +164,7 @@ function normalizeCondItem(it){
   if(!it||!validRange(it.range)||COND_METRIC_KEYS.indexOf(it.metric)<0)return null;
   const o={range:it.range,metric:it.metric,op:normOp(it.op),value:Number(it.value)||0};
   if(it.range==='recent')o.days=Math.max(1,Math.round(Number(it.days)||7));
-  o.targetType=(it.targetType==='task'||it.targetType==='domain')?it.targetType:'all';
+  o.targetType=(it.targetType==='task'||it.targetType==='domain'||it.targetType==='milestone'||it.targetType==='budget')?it.targetType:'all';
   o.target=(o.targetType==='all')?'':(it.target||'');
   o.newFilter=(it.newFilter==='new_task'||it.newFilter==='new_domain')?it.newFilter:'none';
   o.aggregate=(it.aggregate==='any')?'any':'sum';
@@ -207,6 +181,10 @@ function normalizeCondition(c){
 }
 function normalizeRewardItem(it){
   if(!it)return null;
+  // 结构操作：不发放资产，只改实体状态（归档任务/项目/杂事）
+  if(it.type==='archive'){
+    return {type:'archive',entity:(it.entity==='affair'||it.entity==='chore')?it.entity:'task',idleDays:Math.max(1,Math.round(Number(it.idleDays)||1))};
+  }
   if(it.type==='card')return {type:'card',card:it.card||'exemption',amount:Math.max(0,Math.round(it.amount||0)),cap:Math.max(1,Math.round(it.cap||3))};
   if(it.type==='progress'){
     const r={type:'progress',amount:Number(it.amount)||0};
@@ -281,6 +259,8 @@ function migrateChore(c){
   c.createdAt=c.createdAt||now();
   c.settled=!!c.settled;
   c.decayKey=c.decayKey||null;
+  c.archived=!!c.archived;
+  c.archivedAt=c.archivedAt||null;
   if(c.freshDays===undefined||c.freshDays===null||c.freshDays===''||isNaN(Number(c.freshDays)))c.freshDays=null;
   else c.freshDays=Math.max(0,Math.round(Number(c.freshDays)));
   return c;
@@ -290,7 +270,7 @@ function migrateChore(c){
 function defaultWatermark(){return {best:0,at:null};}
 function newExtState(){
   return{
-    stats:{totalAchievement:0,lifetimeVitalityIn:0,lifetimeVitalityOut:0,totalCheckins:0,lifetimeAchievementEarned:0,updatedAt:null},
+    stats:{lifetimeVitalityIn:0,lifetimeVitalityOut:0,lifetimeProgressIn:0,lifetimeProgressOut:0,lifetimeAchievementIn:0,lifetimeAchievementOut:0,totalCheckins:0,totalPurchases:0,lifetimeAchievementEarned:0,version:STATS_VERSION,lastDay:null,daily:{},invisible:{vitality:0,achievement:0,progress:{},cards:{}},evicted:{vitality:0,achievement:0,progress:{},cards:{}},updatedAt:null},
     watermarks:{vitality:defaultWatermark(),achievement:defaultWatermark(),totalProgress:defaultWatermark(),progress:{}},
     budgets:defaultBudgetsState(),
     investment:{window:30},
@@ -298,6 +278,9 @@ function newExtState(){
     audit:[],
     activity:{},
     achievementCounted:{},
+    shadow:[],
+    // 代谢规则是否已播种：一旦为 true，用户删除默认规则后不再自动补回
+    metabolismSeeded:false,
     features:{audit:true}
   };
 }
@@ -329,6 +312,9 @@ function defaults(){
   };
 }
 let loadIssue=null;
+// 读档未成功（超时 / 读取失败）时暂停写盘：避免用空白默认库覆盖真实存档
+let _persistBlocked=false;
+let _saveErrAt=0;
 // 尽力修复被截断/轻微损坏的 JSON（常见于 IndexedDB 写入中断）
 function salvageJSON(raw){
   if(!raw||typeof raw!=='string')return null;
@@ -409,6 +395,8 @@ function normalizeProductGate(g,ctx){
   out.activity.times=Math.max(0,Math.round(toNum(a.times)));
   const mid=String(g.milestoneId||'');
   out.milestoneId=(!ctx||!ctx.achIds||ctx.achIds.has(mid))?mid:'';
+  // 通用条件树：新商品直接存这里；老商品为空时由三段式字段即时合成（见 gateConditionOf）
+  out.condition=normalizeCondition(g.condition);
   return out;
 }
 function normalizeProduct(p,ctx){
@@ -445,6 +433,43 @@ function normalizeActivityIndex(raw){
   });
   return out;
 }
+// 统计日桶：只保留合法日期键与有限数值，超出保留期的桶直接丢弃
+function normalizeStatsDaily(raw){
+  const out={};
+  if(!raw||typeof raw!=='object'||Array.isArray(raw))return out;
+  const cutoff=dateKeyOffset(STATS_KEEP_DAYS);
+  Object.keys(raw).forEach(function(key){
+    if(!/^\d{4}-\d{2}-\d{2}$/.test(key)||key<cutoff)return;
+    const src=raw[key];
+    if(!src||typeof src!=='object'||Array.isArray(src))return;
+    const b={};
+    STATS_SCALARS.forEach(function(k){const v=toNum(src[k]);if(v)b[k]=v;});
+    STATS_ENTITY_MAPS.forEach(function(mk){
+      const map=src[mk];
+      if(!map||typeof map!=='object'||Array.isArray(map))return;
+      const m={};
+      Object.keys(map).forEach(function(id){const v=toNum(map[id]);if(v)m[id]=v;});
+      if(Object.keys(m).length)b[mk]=m;
+    });
+    out[key]=b;
+  });
+  return out;
+}
+function normalizeAccountSums(raw){
+  const out=emptyAccountSums();
+  if(!raw||typeof raw!=='object'||Array.isArray(raw))return out;
+  out.vitality=toNum(raw.vitality);
+  out.achievement=toNum(raw.achievement);
+  ['progress','cards'].forEach(function(k){
+    const src=raw[k];
+    if(!src||typeof src!=='object'||Array.isArray(src))return;
+    Object.keys(src).forEach(function(id){
+      const v=toNum(src[id]);
+      if(v)out[k][id]=v;
+    });
+  });
+  return out;
+}
 function normalizeAchievementCounted(raw){
   const out={};
   if(!raw||typeof raw!=='object'||Array.isArray(raw))return out;
@@ -469,6 +494,7 @@ function normalizeLoanNums(l){
   l.amount=toNum(l.amount);
   l.debtRate=toNum(l.debtRate);
   if(l.date!==undefined)l.date=toTs(l.date);
+  if(l.lastInterestAt!==undefined)l.lastInterestAt=toTs(l.lastInterestAt);
   return l;
 }
 function normalizeLogNums(l){
@@ -492,13 +518,20 @@ function normalizeWatermark(w){
 function normalizeBudgetSettings(s){
   s=s&&typeof s==='object'&&!Array.isArray(s)?s:{};
   const pk=(s.periodKeep&&typeof s.periodKeep==='object'&&!Array.isArray(s.periodKeep))?s.periodKeep:{};
+  const an=(s.anchorNotice&&typeof s.anchorNotice==='object'&&!Array.isArray(s.anchorNotice))?s.anchorNotice:null;
   return{
     ledgerMax:Math.max(1,Math.round(toNum(s.ledgerMax,BUDGET_LEDGER_MAX))),
     periodKeep:{
       week:Math.max(1,Math.round(toNum(pk.week,BUDGET_PERIOD_KEEP.week))),
       month:Math.max(1,Math.round(toNum(pk.month,BUDGET_PERIOD_KEEP.month)))
     },
-    quickRecordDefaultCategoryId:String(s.quickRecordDefaultCategoryId||'')
+    anchorNotice:an?{
+      categoryId:String(an.categoryId||''),
+      name:String(an.name||''),
+      from:Math.min(7,Math.max(1,Math.round(toNum(an.from,1)))),
+      to:Math.min(7,Math.max(1,Math.round(toNum(an.to,1)))),
+      at:toTs(an.at)||0
+    }:null
   };
 }
 function normalizeBudgetRule(r,ctx){
@@ -509,7 +542,6 @@ function normalizeBudgetRule(r,ctx){
   let domainId=String(t.domainId||'');
   if(!ctx||!ctx.domainIds||!ctx.domainIds.has(domainId))domainId='';
   const p=(r.params&&typeof r.params==='object'&&!Array.isArray(r.params))?r.params:{};
-  const baseDefault=kind==='penalty'?'overspendDelta':(kind==='reward'?'periodSurplus':'entryAmount');
   return{
     id:String(r.id||uid()),
     kind:kind,
@@ -521,7 +553,6 @@ function normalizeBudgetRule(r,ctx){
       mode:p.mode==='ratio'?'ratio':'fixed',
       value:Math.max(0,toNum(p.value,0)),
       rate:Math.max(0,toNum(p.rate,0)),
-      base:['overspendDelta','entryAmount','periodSurplus'].indexOf(p.base)>=0?p.base:baseDefault,
       capPerPeriod:(p.capPerPeriod===null||p.capPerPeriod===undefined||p.capPerPeriod==='')?null:Math.max(0,toNum(p.capPerPeriod,0)),
       minAmount:Math.max(0,toNum(p.minAmount,0)),
       per:p.per==='entry'?'entry':'episode'
@@ -542,6 +573,7 @@ function normalizeBudgetCategory(c,ctx){
     enabled:c.enabled!==false,
     archived:!!c.archived,
     cycle:cycle,
+    anchor:Math.min(7,Math.max(1,Math.round(toNum(c.anchor,1)))),
     limit:Math.max(0,toNum(c.limit,0)),
     defaultProgressDomainId:did,
     rules:rules,
@@ -556,9 +588,9 @@ function normalizeBudgetCategory(c,ctx){
     updatedAt:toTs(c.updatedAt)||null
   };
 }
-function normalizeBudgetPeriod(p,key,cycle){
+function normalizeBudgetPeriod(p,key,cycle,anchor){
   if(!p||typeof p!=='object'||Array.isArray(p))return null;
-  const b=budgetBounds(cycle,toNum(p.start,now()));
+  const b=budgetBounds(cycle,toNum(p.start,now()),anchor);
   const totals={};
   if(p.ruleTotals&&typeof p.ruleTotals==='object'&&!Array.isArray(p.ruleTotals)){
     Object.keys(p.ruleTotals).forEach(function(k){totals[k]=Math.max(0,toNum(p.ruleTotals[k],0));});
@@ -633,7 +665,7 @@ function normalizeBudgets(x,ctx){
     if(!src||typeof src!=='object'||Array.isArray(src))return;
     const dst={};
     Object.keys(src).forEach(function(k){
-      const p=normalizeBudgetPeriod(src[k],k,byId[cid].cycle);
+      const p=normalizeBudgetPeriod(src[k],k,byId[cid].cycle,byId[cid].anchor);
       if(p)dst[k]=p;
     });
     out.periods[cid]=dst;
@@ -644,7 +676,6 @@ function normalizeBudgets(x,ctx){
   });
   if(ctx&&ctx.catIds)ctx.catIds=ids;
   out.ledger=asArray(x.ledger).map(function(e){return normalizeBudgetLedgerEntry(e,{catIds:ids});}).filter(Boolean);
-  if(x.legacy)out.legacy=x.legacy;
   return out;
 }
 function normalizeProductBudget(b,ctx){
@@ -659,11 +690,20 @@ function normalizeExt(x,ctx){
   const wm=x.watermarks&&typeof x.watermarks==='object'?x.watermarks:{};
   const out={
     stats:{
-      totalAchievement:toNum(s.totalAchievement),
       lifetimeVitalityIn:toNum(s.lifetimeVitalityIn),
       lifetimeVitalityOut:toNum(s.lifetimeVitalityOut),
+      lifetimeProgressIn:toNum(s.lifetimeProgressIn),
+      lifetimeProgressOut:toNum(s.lifetimeProgressOut),
+      lifetimeAchievementIn:toNum(s.lifetimeAchievementIn),
+      lifetimeAchievementOut:toNum(s.lifetimeAchievementOut),
       totalCheckins:Math.max(0,Math.round(toNum(s.totalCheckins))),
+      totalPurchases:Math.max(0,Math.round(toNum(s.totalPurchases))),
       lifetimeAchievementEarned:Math.max(0,toNum(s.lifetimeAchievementEarned)),
+      version:Math.max(0,Math.round(toNum(s.version))),
+      lastDay:(typeof s.lastDay==='string'&&s.lastDay)?s.lastDay:null,
+      daily:normalizeStatsDaily(s.daily),
+      invisible:normalizeAccountSums(s.invisible),
+      evicted:normalizeAccountSums(s.evicted),
       updatedAt:toTs(s.updatedAt)
     },
     watermarks:{
@@ -678,25 +718,20 @@ function normalizeExt(x,ctx){
     audit:asArray(x.audit).filter(Boolean).slice(-AUDIT_MAX),
     activity:normalizeActivityIndex(x.activity),
     achievementCounted:normalizeAchievementCounted(x.achievementCounted),
+    shadow:asArray(x.shadow).filter(Boolean).slice(0,SHADOW_MAX),
+    metabolismSeeded:x.metabolismSeeded===true,
     features:{audit:(x.features&&x.features.audit!==false)}
   };
   const pr=wm.progress&&typeof wm.progress==='object'?wm.progress:{};
   Object.keys(pr).forEach(function(k){out.watermarks.progress[k]=normalizeWatermark(pr[k]);});
   return out;
 }
-// 版本迁移：v1 为原点，MIGRATIONS 表留给后续版本；不推进版本号即表示迁移失败（下次启动重试）
+// 只接受当前 schema：低版本存档不再逐版本迁移，统一交给 normalizeXxx 的形状守卫补默认值；
+// 高于当前版本视为不可信（可能来自更新版本），走 salvage 保留原始内容。
 function applyMigrations(p){
   const from=(p.schema&&typeof p.schema.v==='number')?p.schema.v:0;
   if(from>SCHEMA_VERSION){loadIssue={type:'salvaged'};return;}
-  for(let v=from;v<SCHEMA_VERSION;v++){
-    const step=MIGRATIONS[v+1];
-    if(!step)continue;
-    try{step(p);}
-    catch(e){loadIssue={type:'salvaged'};return;}
-    p.schema={v:v+1,migratedAt:now()};
-  }
-  if(!p.schema||typeof p.schema!=='object')p.schema={v:SCHEMA_VERSION,migratedAt:null};
-  else p.schema.v=SCHEMA_VERSION;
+  p.schema={v:SCHEMA_VERSION,migratedAt:now()};
 }
 function parseState(raw){
   if(!raw)return defaults();
@@ -783,13 +818,13 @@ function openIDB(){
   return _idbPromise;
 }
 // 仅保留主数据键；其余历史 key 见 migrateLegacy()
-// 读盘超时保护：IndexedDB 在部分环境下会长时间不回调，避免启动白屏
-function withTimeout(p,ms,fallback){
+// 读盘超时保护：把三种结果显式区分开 —— ok（拿到值）/ timeout（未回调）/ error（读失败）
+function withTimeout(p,ms){
   return new Promise(function(resolve){
     let done=false;
-    const timer=setTimeout(function(){if(done)return;done=true;resolve(fallback);},ms);
-    p.then(function(v){if(done)return;done=true;clearTimeout(timer);resolve(v);})
-     .catch(function(){if(done)return;done=true;clearTimeout(timer);resolve(fallback);});
+    const timer=setTimeout(function(){if(done)return;done=true;resolve({status:'timeout'});},ms);
+    p.then(function(v){if(done)return;done=true;clearTimeout(timer);resolve({status:'ok',value:v});})
+     .catch(function(e){if(done)return;done=true;clearTimeout(timer);resolve({status:'error',error:e});});
   });
 }
 function idbGet(key){
@@ -836,10 +871,18 @@ const Persist=(function(){
     if(timer){clearTimeout(timer);timer=null;}
     if(!pending)return _saveChain;
     pending=false;
+    // 读档未成功期间禁止落盘：否则空默认库会覆盖真实存档
+    if(_persistBlocked)return _saveChain;
     let json;
     try{json=serialize();}catch(e){console.warn('serialize failed',e);return _saveChain;}
     _saveChain=_saveChain.then(function(){return idbPut(KEY,json);})
-      .catch(function(e){console.warn('IndexedDB save failed',e);/* 写失败不阻塞 UI */});
+      .catch(function(e){
+        console.warn('IndexedDB save failed',e);
+        // 写失败必须有用户可见路径（配额/权限/存储被禁用），10 秒内只提示一次
+        if(Date.now()-_saveErrAt<10000)return;
+        _saveErrAt=Date.now();
+        try{toast('本地保存失败：浏览器拒绝写入，请检查存储空间或权限','err');}catch(err){}
+      });
     return _saveChain;
   }
   function schedule(delay){
@@ -849,7 +892,7 @@ const Persist=(function(){
   }
   return {schedule:schedule,flush:flush,serialize:serialize,delay:SAVE_DELAY,isPending:function(){return pending;}};
 })();
-function save(){Persist.schedule();}
+function save(){if(_persistBlocked)return;Persist.schedule();}
 try{
   document.addEventListener('visibilitychange',function(){if(document.hidden)Persist.flush();});
   window.addEventListener('pagehide',function(){Persist.flush();});
@@ -881,6 +924,12 @@ function fmt(n){
 function now(){return Date.now()}
 function daysSince(ts){return ts?(Date.now()-ts)/864e5:0}
 function effectiveLastTs(task){return Math.max(task.lastCheckIn||0,task.lastExempt||0)}
+// 今日是否已打卡：打卡守卫、打卡按钮状态、豁免候选列表共用同一判断（本地自然日 00:00 起算）
+function taskCheckedToday(task){
+  if(!task||!task.lastCheckIn)return false;
+  const start=new Date();start.setHours(0,0,0,0);
+  return new Date(task.lastCheckIn)>=start;
+}
 function fmtTime(ts){
   if(!ts)return '从未';
   const d=new Date(ts),n=new Date(),diff=(n-d)/864e5;
@@ -946,6 +995,7 @@ function applyCheckinGain(log,mult){
 const LOG_MAX=300;
 // 银行页最多渲染的流水条数
 const LOG_DISPLAY=100;
+// 统计计数器常量见文件头（STATS_VERSION / STATS_KEEP_DAYS）
 // 深拷贝（优先原生 structuredClone，旧环境回退 JSON 往返）
 function clone(o){
   if(typeof structuredClone==='function'){
@@ -966,6 +1016,255 @@ function splitCents(amount,n){
   return out;
 }
 
+// ===== 账户差额累计（让“余额 vs 流水”可精确对账）=====
+// invisible：所有 visible:false 的账户增减累计；evicted：被 LOG_MAX 截断掉的历史可见流水累计。
+// 两者都按账户键折叠，口径与账面完全一致，因此 余额 == 可见流水 + invisible + evicted 恒成立。
+function emptyAccountSums(){return {vitality:0,achievement:0,progress:{},cards:{}};}
+function accountSumsAdd(sums,account,delta){
+  delta=Number(delta)||0;
+  if(!sums||!account||!delta)return;
+  if(account==='vitality'||account==='achievement')sums[account]=(Number(sums[account])||0)+delta;
+  else if(account.indexOf('progress:')===0){const id=account.slice(9);sums.progress[id]=(Number(sums.progress[id])||0)+delta;}
+  else if(account.indexOf('card:')===0){const id=account.slice(5);sums.cards[id]=(Number(sums.cards[id])||0)+delta;}
+}
+function statsDiffs(){
+  const s=state.ext&&state.ext.stats;
+  if(!s)return null;
+  if(!s.invisible||typeof s.invisible!=='object')s.invisible=emptyAccountSums();
+  if(!s.evicted||typeof s.evicted!=='object')s.evicted=emptyAccountSums();
+  ['vitality','achievement'].forEach(function(k){s.invisible[k]=Number(s.invisible[k])||0;s.evicted[k]=Number(s.evicted[k])||0;});
+  if(!s.invisible.progress||typeof s.invisible.progress!=='object')s.invisible.progress={};
+  if(!s.evicted.progress||typeof s.evicted.progress!=='object')s.evicted.progress={};
+  if(!s.invisible.cards||typeof s.invisible.cards!=='object')s.invisible.cards={};
+  if(!s.evicted.cards||typeof s.evicted.cards!=='object')s.evicted.cards={};
+  return s;
+}
+// 隐形账户增减：只累计、不写日志；真正的“可追溯痕迹”由 shadowPush 记录
+function noteInvisible(account,delta){
+  const s=statsDiffs();
+  if(s)accountSumsAdd(s.invisible,account,delta);
+}
+// 被 pushLog 截断掉的可见流水：把它的账户贡献挪进 evicted，保证余额等式不因裁剪而失真
+function noteEvicted(entry){
+  const s=statsDiffs();
+  if(!s||!entry)return;
+  const vis=entry.st==='achievement'?(Number(entry.amt)||0):0;
+  const v=logHasType(entry,'vitality')?(Number(logAmt(entry,'vitality'))||0):0;
+  const p=logHasType(entry,'progress')?(Number(logAmt(entry,'progress'))||0):0;
+  if(v)accountSumsAdd(s.evicted,'vitality',v);
+  if(vis)accountSumsAdd(s.evicted,'achievement',vis);
+  if(p){
+    if(entry.splits&&entry.splits.length){
+      entry.splits.forEach(function(sp){accountSumsAdd(s.evicted,'progress:'+(sp.dom||'d_default'),Number(sp.amt)||0);});
+    }else{
+      const dids=(entry.dom||'').split(',').filter(Boolean);
+      (dids.length?dids:['d_default']).forEach(function(d){accountSumsAdd(s.evicted,'progress:'+d,p/(dids.length||1));});
+    }
+  }
+}
+// ===== 隐形操作的可追溯痕迹（余额调整记录）=====
+const SHADOW_SRC_NAMES={
+  'loan-draw':'贷款放款','checkin-replay':'打卡流水重放','recalc':'历史重算','recalc-cost':'历史重算退款',
+  'delete-domain':'删除领域搬运','undo-delete-domain':'撤销删除领域','delete-task':'删除任务搬运',
+  'undo-delete-task':'撤销删除任务','task-domain-migrate':'任务领域迁移','activity-revoke':'活动奖励回收',
+  'exempt-use':'使用断更豁免卡','undo-exempt':'撤销豁免卡使用','undo-card-grant':'撤销卡券发放',
+  'undo-cost':'撤销成本','undo-purchase':'撤销购买','undo-achievement':'撤销里程碑解锁',
+  'undo-loan-repay':'撤销还贷','undo-manual-adjust':'撤销手动修正','undo-unlock':'撤销解锁',
+  'undo-budget-penalty':'撤销预算惩罚','undo-budget-feedback':'撤销预算反哺','undo-budget-reward':'撤销结余奖励',
+  'budget-topup':'预算扩容','budget-overdraft':'预算透支','calibrate':'历史隐形变动校准'
+};
+function shadowLabel(src,desc){
+  if(desc)return desc;
+  return SHADOW_SRC_NAMES[src]||src||'余额调整';
+}
+function shadowPush(rec){
+  if(!state.ext)return;
+  if(!Array.isArray(state.ext.shadow))state.ext.shadow=[];
+  state.ext.shadow.unshift(rec);
+  if(state.ext.shadow.length>SHADOW_MAX)state.ext.shadow.length=SHADOW_MAX;
+}
+// 旧存档没有 invisible 明细：按账户残差补一条“历史隐形变动校准”记录，让痕迹从升级那一刻起可读
+function seedCalibrationShadow(){
+  const inv=(state.ext&&state.ext.stats&&state.ext.stats.invisible)||{};
+  const recs=[];
+  const push=function(acct,v){
+    v=Number(v)||0;
+    if(Math.abs(v)<0.005)return;
+    recs.push({id:uid(),ts:now(),acct:acct,delta:v,before:null,after:null,src:'calibrate',label:SHADOW_SRC_NAMES.calibrate});
+  };
+  push('vitality',inv.vitality);
+  push('achievement',inv.achievement);
+  Object.keys(inv.progress||{}).forEach(function(id){push('progress:'+id,inv.progress[id]);});
+  Object.keys(inv.cards||{}).forEach(function(id){push('card:'+id,inv.cards[id]);});
+  recs.forEach(function(r){shadowPush(r);});
+}
+function accountLabel(acct){
+  if(acct==='vitality')return '活力点';
+  if(acct==='achievement')return '成果点';
+  if(acct.indexOf('progress:')===0)return '进度·'+domainName(acct.slice(9));
+  if(acct.indexOf('card:')===0)return cardName(acct.slice(5));
+  return acct;
+}
+
+// ===== 统计聚合（唯一累加点）=====
+// 口径：可见流水写入时把“对统计的贡献”折叠进 ext.stats（生命周期计数）与 ext.stats.daily（日桶），
+// 撤销/移除流水时按同一份贡献反向扣减；LOG_MAX 截断不扣减，因此计数器等价于“假如日志不裁剪”。
+function statsDailyEnsure(key){
+  const s=state.ext.stats;
+  if(!s.daily||typeof s.daily!=='object')s.daily={};
+  let b=s.daily[key];
+  if(!b||typeof b!=='object')b=s.daily[key]={};
+  STATS_SCALARS.forEach(function(k){b[k]=Number(b[k])||0;});
+  STATS_ENTITY_MAPS.forEach(function(k){if(!b[k]||typeof b[k]!=='object')b[k]={};});
+  return b;
+}
+function statsPrune(){
+  const s=state.ext&&state.ext.stats;
+  if(!s||!s.daily)return;
+  const cutoff=dayKey(Date.now()-STATS_KEEP_DAYS*864e5);
+  Object.keys(s.daily).forEach(function(k){if(k<cutoff)delete s.daily[k];});
+}
+// 从一条可见流水推导它对统计的贡献；不依赖写入时的上下文，撤销旧流水也能重算
+function computeEntryAgg(entry){
+  const agg={key:'',v:0,p:0,a:0,ck:0,buy:0,inv:0,cons:0,prod:0,vd:{},pd:{},vt:{},pt:{},ct:{},cd:{}};
+  if(!entry)return agg;
+  agg.key=dayKey(Number(entry.time)||Date.now());
+  const st=entry.st;
+  const v=logHasType(entry,'vitality')?(Number(logAmt(entry,'vitality'))||0):0;
+  const p=logHasType(entry,'progress')?(Number(logAmt(entry,'progress'))||0):0;
+  const a=(st==='achievement')?(Number(entry.amt)||0):0;
+  agg.v=v;agg.p=p;agg.a=a;
+  if(entry.src==='checkin')agg.ck=1;
+  if(entry.src==='purchase')agg.buy=1;
+  if(entry.src==='cost'&&Number(entry.amt)<0)agg.inv=-Number(entry.amt)||0;
+  if(entry.src==='purchase'&&st==='vitality'&&Number(entry.amt)<0)agg.cons=-Number(entry.amt)||0;
+  if(entry.src==='checkin'&&v>0)agg.prod=v;
+  // 归属领域：优先流水自身 dom，其次任务领域（与 logDomainsOf 一致）
+  let dids=(entry.dom||'').split(',').filter(Boolean);
+  if(!dids.length&&entry.taskId){
+    const t=(state.tasks||[]).find(function(x){return x.id===entry.taskId;});
+    if(t)dids=getTaskDomainIds(t);
+  }
+  if(v!==0)dids.forEach(function(d){agg.vd[d]=(agg.vd[d]||0)+v;});
+  if(agg.ck)dids.forEach(function(d){agg.cd[d]=(agg.cd[d]||0)+1;});
+  if(p!==0){
+    if(Array.isArray(entry.splits)&&entry.splits.length){
+      entry.splits.forEach(function(sp){
+        const d=sp.dom||'d_default';
+        agg.pd[d]=(agg.pd[d]||0)+(Number(sp.amt)||0);
+      });
+    }else{
+      const list=dids.length?dids:['d_default'];
+      const share=p/list.length;
+      list.forEach(function(d){agg.pd[d]=(agg.pd[d]||0)+share;});
+    }
+  }
+  if(entry.taskId){
+    if(v!==0)agg.vt[entry.taskId]=v;
+    if(p!==0)agg.pt[entry.taskId]=p;
+    if(agg.ck)agg.ct[entry.taskId]=1;
+  }
+  return agg;
+}
+function applyAgg(agg,sign){
+  if(!agg)return;
+  const s=state.ext&&state.ext.stats;
+  if(!s)return;
+  const add=function(k,v){s[k]=Math.max(0,round2((Number(s[k])||0)+sign*(Number(v)||0)));};
+  if(agg.v>0)add('lifetimeVitalityIn',agg.v);
+  else if(agg.v<0)add('lifetimeVitalityOut',-agg.v);
+  if(agg.p>0)add('lifetimeProgressIn',agg.p);
+  else if(agg.p<0)add('lifetimeProgressOut',-agg.p);
+  if(agg.a>0)add('lifetimeAchievementIn',agg.a);
+  else if(agg.a<0)add('lifetimeAchievementOut',-agg.a);
+  s.totalCheckins=Math.max(0,Math.round((Number(s.totalCheckins)||0)+sign*agg.ck));
+  s.totalPurchases=Math.max(0,Math.round((Number(s.totalPurchases)||0)+sign*agg.buy));
+  const b=statsDailyEnsure(agg.key||dayKey(Date.now()));
+  STATS_SCALARS.forEach(function(k){
+    const v=Number(agg[k])||0;
+    if(!v)return;
+    b[k]=round2((Number(b[k])||0)+sign*v);
+  });
+  STATS_ENTITY_MAPS.forEach(function(mk){
+    const map=agg[mk]||{};
+    Object.keys(map).forEach(function(id){
+      const v=Number(map[id])||0;
+      if(!v)return;
+      b[mk][id]=round2((Number(b[mk][id])||0)+sign*v);
+      if(!b[mk][id])delete b[mk][id];
+    });
+  });
+  s.version=STATS_VERSION;
+  s.updatedAt=now();
+  if(s.lastDay!==agg.key){s.lastDay=agg.key;statsPrune();}
+}
+function attachAgg(entry){
+  if(!entry)return;
+  const agg=computeEntryAgg(entry);
+  entry.agg=agg;
+  applyAgg(agg,1);
+}
+function detachAgg(entry){
+  if(!entry)return;
+  const agg=entry.agg&&entry.agg.key?entry.agg:computeEntryAgg(entry);
+  applyAgg(agg,-1);
+  entry.agg=null;
+}
+function reaggEntry(entry){
+  if(!entry)return;
+  // 改写前的旧贡献必须取流水上已记录的 agg：调用方通常先把字段改掉再 reagg，
+  // 此时从字段反推只会得到新值，统计会少扣一次。
+  const oldAgg=(entry.agg&&entry.agg.key)?entry.agg:computeEntryAgg(entry);
+  const oldV=Number(oldAgg.v)||0,oldA=Number(oldAgg.a)||0;
+  const oldPd=Object.assign({},oldAgg.pd||{});
+  detachAgg(entry);
+  attachAgg(entry);
+  const newAgg=entry.agg||computeEntryAgg(entry);
+  // 可见流水被原地改写时，余额的同一变化已由随后的隐形补账记录；
+  // 这里把“可见归属”的变化从 invisible 里抵消，避免同一笔钱在自检里被两边各记一次。
+  const cmp=function(acct,ov,nv){
+    const d=(Number(nv)||0)-(Number(ov)||0);
+    if(d)noteInvisible(acct,-d);
+  };
+  cmp('vitality',oldV,newAgg.v);
+  cmp('achievement',oldA,newAgg.a);
+  const dids=new Set(Object.keys(oldPd).concat(Object.keys(newAgg.pd||{})));
+  dids.forEach(function(d){cmp('progress:'+d,oldPd[d],(newAgg.pd||{})[d]);});
+}
+// 从当前日志重建计数器（兜底入口，只恢复现有日志能覆盖的部分）
+// 同时重算 invisible/evicted：重建后 evicted 归零，invisible 取“余额 − 可见流水”的残差，
+// 保证“余额 == 可见流水 + invisible + evicted”在重建后依然成立。
+function rebuildStats(){
+  if(!state.ext)return;
+  const s=state.ext.stats;
+  ['lifetimeVitalityIn','lifetimeVitalityOut','lifetimeProgressIn','lifetimeProgressOut',
+   'lifetimeAchievementIn','lifetimeAchievementOut','totalCheckins','totalPurchases'
+  ].forEach(function(k){s[k]=0;});
+  s.daily={};
+  s.lastDay=null;
+  s.evicted=emptyAccountSums();
+  const vis=emptyAccountSums();
+  (state.logs||[]).forEach(function(l){
+    const agg=computeEntryAgg(l);
+    l.agg=agg;
+    applyAgg(agg,1);
+    accountSumsAdd(vis,'vitality',agg.v);
+    accountSumsAdd(vis,'achievement',agg.a);
+    Object.keys(agg.pd||{}).forEach(function(d){accountSumsAdd(vis,'progress:'+d,agg.pd[d]);});
+  });
+  s.invisible=emptyAccountSums();
+  const residual=function(account,bal){return (Number(bal)||0)-(Number(account)||0);};
+  s.invisible.vitality=round2(residual(vis.vitality,state.scores.vitality));
+  s.invisible.achievement=round2(residual(vis.achievement,state.scores.achievement));
+  Object.keys(state.scores.progress||{}).forEach(function(id){
+    s.invisible.progress[id]=round2(residual(vis.progress[id],state.scores.progress[id]));
+  });
+  s.version=STATS_VERSION;
+  s.updatedAt=now();
+  return s;
+}
+
+
 // ===== 账务引擎（唯一资产写入入口）=====
 // 约定：账户键是运行时映射，不落盘；可见流水字段与事件流水完全一致。
 // 精度口径由调用方决定，引擎不做 round2。
@@ -974,9 +1273,13 @@ const Ledger=(function(){
   const policies={beforeSpend:[],beforePurchase:[],afterPost:[],onTxnEnd:[]};
 
   // 记录统一入栈（全文件唯一写入口）：最新的在最前，超过上限原地截断（不复制整表）
+  // 截断掉的旧流水其账户贡献转入 ext.stats.evicted，保证“余额 vs 流水”在裁剪后仍可精确对账
   function pushLog(entry){
     state.logs.unshift(entry);
-    if(state.logs.length>LOG_MAX)state.logs.length=LOG_MAX;
+    if(state.logs.length>LOG_MAX){
+      for(let i=LOG_MAX;i<state.logs.length;i++)noteEvicted(state.logs[i]);
+      state.logs.length=LOG_MAX;
+    }
     return entry;
   }
   // 业务事件（0 元）：业务层不再直接拼装流水
@@ -985,10 +1288,19 @@ const Ledger=(function(){
     if(extra)Object.assign(entry,extra);
     return pushLog(entry);
   }
-  // 追加到末尾：历史重放需要保持时间顺序时不走 unshift
-  function append(entry){state.logs.push(entry);return entry;}
-  // 移除流水（撤销/回收统一入口）
-  function removeLogs(pred){state.logs=state.logs.filter(pred);return state.logs;}
+  // 追加到末尾：历史重放需要保持时间顺序时不走 unshift。
+  // 注意：append 不做 LOG_MAX 裁剪（重放期间必须保留完整历史），允许临时超出上限，
+  // 下一次 pushLog 会统一截断到 LOG_MAX。
+  function append(entry){state.logs.push(entry);attachAgg(entry);return entry;}
+  // 移除流水（撤销/回收统一入口）：先按流水贡献反向扣减统计计数，再移出日志
+  // 移除可见流水：既要从统计里扣回贡献，也要把该条对账户的贡献转入 ext.stats.evicted
+  // （撤销时是先按隐形反向补账、再删流水，残差必须先记入 evicted，否则“余额 vs 流水”会对不上）
+  function removeLogs(pred){
+    const kept=[];
+    state.logs.forEach(function(l){if(pred(l))kept.push(l);else{detachAgg(l);noteEvicted(l);}});
+    state.logs=kept;
+    return state.logs;
+  }
   // 事务快照：排除 ext.audit（审计只追加、不参与回滚）
   // 回滚时把原审计数组接回，并保留失败事务产生的审计记录（尝试痕迹）
   function snapshotState(){
@@ -1068,6 +1380,14 @@ const Ledger=(function(){
       a.set(beforeA-amt);b.set(beforeB+amt);
       tx.accounts.add(op.from);tx.accounts.add(op.to);
       const entry=writeEntry(op,b,amt,reason);
+      if(op.visible===false){
+        // 隐形转账同样要留下可追溯痕迹，并计入 invisible 累计用于自检对账
+        noteInvisible(op.from,-amt);
+        noteInvisible(op.to,amt);
+        const lb=shadowLabel(reason.src,reason.desc);
+        shadowPush({id:uid(),ts:now(),acct:op.from,delta:-amt,before:beforeA,after:beforeA-amt,src:reason.src||'',label:lb});
+        shadowPush({id:uid(),ts:now(),acct:op.to,delta:amt,before:beforeB,after:beforeB+amt,src:reason.src||'',label:lb});
+      }
       audit({id:entry?entry.id:uid(),ts:now(),txn:tx.label,op:'transfer',from:op.from,to:op.to,delta:amt,src:reason.src||''});
       noteWatermark(op.to,beforeB+amt);
       return {ok:true,entryId:entry?entry.id:null,before:beforeA,after:beforeA-amt};
@@ -1086,7 +1406,13 @@ const Ledger=(function(){
     acct.set(after);
     tx.accounts.add(op.account);
     if(acct.dom)tx.domains[acct.dom]=true;
+    if(op.visible===false){
+      // 隐形增减：计入差额累计，并写一条余额调整记录（银行页可见）
+      noteInvisible(op.account,delta);
+      shadowPush({id:uid(),ts:now(),acct:op.account,delta:delta,before:before,after:after,src:reason.src||'',label:shadowLabel(reason.src,reason.desc)});
+    }
     const entry=writeEntry(op,acct,delta,reason);
+    attachAgg(entry);
     audit({id:entry?entry.id:uid(),ts:now(),txn:tx.label,op:op.op,acct:op.account,delta:delta,before:before,after:after,visible:op.visible!==false,src:reason.src||''});
     noteWatermark(op.account,after);
     if(policies.afterPost.length){
@@ -1106,6 +1432,7 @@ const Ledger=(function(){
     const splits=op.splits||[];
     const beforeOf={};
     const domainSplits=[];
+    const shadowRecs=[];
     let total=0;
     splits.forEach(function(s){
       if(s.account){
@@ -1115,6 +1442,7 @@ const Ledger=(function(){
         a.set(beforeOf[s.account]+d);
         tx.accounts.add(s.account);
         if(a.dom)tx.domains[a.dom]=true;
+        if(op.visible===false)shadowRecs.push({acct:s.account,delta:d,before:beforeOf[s.account],after:beforeOf[s.account]+d});
         total+=d;
       }else if(s.domainIds&&s.domainIds.length){
         // 精确到分的平均分摊：各领域之和与原额逐分相等（尾差按顺序归前几个领域）
@@ -1128,17 +1456,29 @@ const Ledger=(function(){
           tx.accounts.add(key);
           tx.domains[did]=true;
           domainSplits.push({dom:did,amt:d});
+          if(op.visible===false)shadowRecs.push({acct:key,delta:d,before:beforeOf[key],after:beforeOf[key]+d});
         });
         total+=Number(s.delta)||0;
       }
     });
+    if(op.visible===false&&shadowRecs.length){
+      const lb=shadowLabel(reason.src,reason.desc);
+      shadowRecs.forEach(function(r){
+        noteInvisible(r.acct,r.delta);
+        shadowPush({id:uid(),ts:now(),acct:r.acct,delta:r.delta,before:r.before,after:r.after,src:reason.src||'',label:lb});
+      });
+    }
     const entry=writeEntry(op,{st:op.st||'vitality',dom:''},total,reason);
     // 分配明细落盘在流水自身，撤销时按原比例逐领域退回（不依赖 ext.audit）
     if(entry&&domainSplits.length)entry.splits=domainSplits;
+    // 统计计数在分配明细落盘后再折叠，保证按领域分摊口径与流水一致
+    attachAgg(entry);
     audit({id:entry?entry.id:uid(),ts:now(),txn:tx.label,op:'splits',accounts:Object.keys(beforeOf),delta:total,visible:op.visible!==false,src:reason.src||''});
     Object.keys(beforeOf).forEach(function(k){noteWatermark(k,Number(accountInfo(k).get())||0);});
     return {ok:true,entryId:entry?entry.id:null,accounts:Object.keys(beforeOf)};
   }
+  // txn 选项：save==='none' 跳过落盘，其它值（含 undefined）统一走 save()（200ms 防抖写盘）；
+  // render===false 跳过全量渲染。不要新增第三种 save 语义。
   function txn(fn,opts){
     opts=opts||{};
     if(tx){return {ok:true,value:fn(tx),nested:true};}
@@ -1192,7 +1532,7 @@ const Ledger=(function(){
   const liability={
     open:function(o){
       o=o||{};
-      const loan={id:o.id||uid(),amount:Number(o.amount)||0,debtRate:Number(o.debtRate)||0,currency:o.currency||'vitality',productId:o.productId||'',productName:o.productName||'',date:o.date||now()};
+      const loan={id:o.id||uid(),amount:Number(o.amount)||0,debtRate:Number(o.debtRate)||0,currency:o.currency||'vitality',productId:o.productId||'',productName:o.productName||'',date:o.date||now(),lastInterestAt:o.lastInterestAt||o.date||now()};
       state.loans.push(loan);
       audit({id:uid(),ts:now(),txn:tx?tx.label:'',op:'liability-open',liability:loan.id,delta:loan.amount,src:(o.reason&&o.reason.src)||''});
       return loan;
@@ -1226,7 +1566,14 @@ const Ledger=(function(){
       const p=list[i];
       let r;
       try{r=p.fn(ctx);}
-      catch(e){console.warn('policy failed',p.name,e);continue;}
+      catch(e){
+        console.warn('policy failed',p.name,e);
+        // 购买前门槛 fail-closed：策略本身异常时不能放行，否则等于门槛失效。
+        if(phase==='beforePurchase'){
+          return{deny:true,code:'POLICY_ERROR',reason:'购买校验异常，已阻止本次购买'};
+        }
+        continue;
+      }
       if(r&&r.deny)return r;
     }
     return null;
@@ -1240,6 +1587,8 @@ const Ledger=(function(){
     txn:txn,post:post,postSplits:postSplits,grant:grant,spend:spend,transfer:transfer,adjust:adjust,
     liability:liability,registerPolicy:registerPolicy,accountInfo:accountInfo,
     event:event,append:append,removeLogs:removeLogs,checkPurchase:checkPurchase,
+    // 流水被原地改写（领域迁移/历史重算）后重算它对统计计数的贡献
+    reagg:reaggEntry,rebuildStats:rebuildStats,
     inTxn:function(){return !!tx;},
     balance:function(key){return Number(accountInfo(key).get())||0;},
     entries:function(){return state.logs;},
@@ -1310,59 +1659,61 @@ function activityCountForDomain(did,days){
 // 只读 ext.stats / ext.activity / 领域与里程碑定义，不遍历 state.logs。
 function validProductTier(tier){return PROD_TIERS.indexOf(tier)>=0?tier:'daily';}
 function isArchivedEntity(o){return !!(o&&(o.archived||o.archivedAt));}
+// ===== 商品门槛：通用条件树 =====
+// 老商品没有 condition 时，把三段式字段无损翻译成等价的叶子条件；
+// 这样“升级前能买”等价于“升级后同一棵树求值为真”。
+function legacyGateCondition(gate,tier){
+  const g=gate||defaultProductGate();
+  const items=[];
+  if(tier==='quality'){
+    const need=Math.max(0,Math.round(toNum(g.minLifetime)));
+    if(need>0)items.push({range:'total',metric:'lifetime_achievement',op:'>=',value:need,targetType:'all',target:'',newFilter:'none',aggregate:'sum'});
+    const act=(g.activity&&typeof g.activity==='object')?g.activity:{};
+    const did=String(act.domainId||'');
+    const days=Math.max(0,Math.min(ACTIVITY_MAX_DAYS,Math.round(toNum(act.days))));
+    const times=Math.max(0,Math.round(toNum(act.times)));
+    if(did&&days>0&&times>0)items.push({range:'recent',days:days,metric:'domain_activity',op:'>=',value:times,targetType:'domain',target:did,newFilter:'none',aggregate:'sum'});
+  }else if(tier==='exclusive'){
+    // 空 milestoneId 也要保留一条叶子：老逻辑在未绑定里程碑时明确拒绝
+    items.push({range:'total',metric:'milestone_unlocked',op:'>=',value:1,targetType:'milestone',target:String(g.milestoneId||''),newFilter:'none',aggregate:'sum'});
+  }
+  return {mode:'all',items:items};
+}
+function gateConditionOf(gate,tier){
+  const g=gate||defaultProductGate();
+  const c=normalizeCondition(g.condition);
+  if(c.items.length)return c;
+  return normalizeCondition(legacyGateCondition(g,tier));
+}
+// 失败原因：all 组列出所有失败叶子；any 组整组失败时合并为一条“满足任一”
+function gateFailReasons(node,act,ts){
+  if(!node)return [];
+  if(node.group||Array.isArray(node.items)){
+    const items=node.items||[];
+    if(!items.length)return [];
+    if(node.mode==='any'){
+      if(evalNode({group:true,mode:'any',items:items},act,ts))return [];
+      return ['满足任一：'+items.map(function(n){return condNLNode(n,act);}).join(' 或 ')];
+    }
+    let out=[];
+    items.forEach(function(n){out=out.concat(gateFailReasons(n,act,ts));});
+    return out;
+  }
+  return evalCondItem(node,act,ts)?[]:[condNLLeaf(node,act)];
+}
 function evaluateProductGate(p){
   const tier=validProductTier(p&&p.tier);
   const out={ok:true,deny:false,tier:tier,code:null,reasons:[],reason:''};
   if(tier==='daily')return out;
   const gate=(p&&p.gate)||defaultProductGate();
-  if(tier==='quality'){
-    const need=Math.max(0,Math.round(toNum(gate.minLifetime)));
-    const earned=Math.max(0,toNum(state.ext&&state.ext.stats&&state.ext.stats.lifetimeAchievementEarned));
-    if(earned<need){
-      out.ok=false;out.code=out.code||'GATE_LIFETIME';
-      out.reasons.push('差 '+fmt(need-earned)+' 累计成果点');
-    }
-    const act=(gate.activity&&typeof gate.activity==='object')?gate.activity:{};
-    const did=String(act.domainId||'');
-    const days=Math.max(0,Math.min(ACTIVITY_MAX_DAYS,Math.round(toNum(act.days))));
-    const times=Math.max(0,Math.round(toNum(act.times)));
-    if(did&&days>0&&times>0){
-      const d=state.domains.find(function(x){return x.id===did;});
-      if(!d){
-        out.ok=false;out.code=out.code||'GATE_DOMAIN';
-        out.reasons.push('关联领域不存在');
-      }else if(isArchivedEntity(d)){
-        out.ok=false;out.code=out.code||'GATE_DOMAIN_ARCHIVED';
-        out.reasons.push('关联领域已归档');
-      }else{
-        const cnt=activityCountForDomain(did,days);
-        if(cnt<times){
-          out.ok=false;out.code=out.code||'GATE_ACTIVITY';
-          out.reasons.push('最近 '+days+' 天需打卡 '+times+' 次，当前 '+cnt+' 次');
-        }
-      }
-    }
-  }else{
-    const mid=String(gate.milestoneId||'');
-    const a=mid?state.achievements.find(function(x){return x.id===mid;}):null;
-    if(!mid){
-      out.ok=false;out.code='GATE_MILESTONE';
-      out.reasons.push('未绑定里程碑');
-    }else if(!a){
-      out.ok=false;out.code='GATE_MILESTONE_MISSING';
-      out.reasons.push('绑定的里程碑不存在');
-    }else if(isArchivedEntity(a)){
-      out.ok=false;out.code='GATE_MILESTONE_ARCHIVED';
-      out.reasons.push('里程碑已归档');
-    }else if(!a.unlocked){
-      out.ok=false;out.code='GATE_MILESTONE_LOCKED';
-      out.reasons.push('里程碑未解锁');
-    }
-  }
-  if(!out.ok){
-    out.deny=true;
-    out.reason=out.reasons.join('；');
-  }
+  const cond=gateConditionOf(gate,tier);
+  const act={period:'week'};
+  const ts=now();
+  if(evalNode({group:true,mode:cond.mode,items:cond.items},act,ts))return out;
+  out.ok=false;out.deny=true;out.code='GATE_CONDITION';
+  out.reasons=gateFailReasons({group:true,mode:cond.mode,items:cond.items},act,ts);
+  if(!out.reasons.length)out.reasons.push('门槛条件未满足');
+  out.reason=out.reasons.join('；');
   return out;
 }
 // 唯一门槛调用点由 buyProduct 触发；策略拒绝 → txn 回滚
@@ -1371,8 +1722,8 @@ Ledger.registerPolicy({phase:'beforePurchase',priority:10,name:'product-tier-gat
 });
 
 // ===== 现实预算规则引擎 =====
-// 周/月按本地自然日切：周一开始 00:00，每月 1 日 00:00。
-function budgetBounds(cycle,ts){
+// 周/月按本地自然日切：周起始日可配（1=周一 … 7=周日），每月 1 日 00:00。
+function budgetBounds(cycle,ts,anchor){
   ts=Number(ts)||now();
   const d=new Date(ts);
   if(cycle==='month'){
@@ -1380,11 +1731,17 @@ function budgetBounds(cycle,ts){
     return{key:'M:'+y+'-'+String(m+1).padStart(2,'0'),start:new Date(y,m,1).getTime(),end:new Date(y,m+1,1).getTime()};
   }
   const s=new Date(d.getFullYear(),d.getMonth(),d.getDate());
-  const dow=(s.getDay()+6)%7; // 0=周一
-  const start=new Date(s.getFullYear(),s.getMonth(),s.getDate()-dow).getTime();
-  const end=new Date(s.getFullYear(),s.getMonth(),s.getDate()-dow+7).getTime();
+  const dow=(s.getDay()+6)%7+1; // 1=周一 … 7=周日
+  const a=Math.min(7,Math.max(1,Math.round(Number(anchor)||1)));
+  let diff=dow-a;
+  if(diff<0)diff+=7;
+  const start=new Date(s.getFullYear(),s.getMonth(),s.getDate()-diff).getTime();
+  const end=new Date(s.getFullYear(),s.getMonth(),s.getDate()-diff+7).getTime();
   return{key:'W:'+dayKey(start),start:start,end:end};
 }
+// 周起始日文案（与周期活动同一套 1=周一 约定）
+const WEEK_ANCHOR_NAMES={1:'周一',2:'周二',3:'周三',4:'周四',5:'周五',6:'周六',7:'周日'};
+function weekAnchorName(a){return WEEK_ANCHOR_NAMES[Math.min(7,Math.max(1,Math.round(Number(a)||1)))];}
 function round4(v){return Math.round((Number(v)||0)*10000)/10000;}
 const BudgetEngine=(function(){
   // 规则处理器注册表：新增规则类型只加一个 handler + UI 描述，主判定流程不变
@@ -1426,12 +1783,37 @@ const BudgetEngine=(function(){
     };
   }
   function readPeriod(cat,ts){
-    const b=budgetBounds(cat.cycle,ts);
+    const b=budgetBounds(cat.cycle,ts,cat.anchor);
     const map=budgets().periods[cat.id]||{};
     return{b:b,period:map[b.key]||null};
   }
+  // 周期活动的预算上下文：活动没有“当前这一笔”的账目语境，
+  // 因此按启用分类的当前周期做全局聚合；entryAmount 取当前周期最近一条有效账目金额。
+  function activityContext(ts){
+    ts=Number(ts)||now();
+    const out={entryAmount:0,spent:0,overspend:0,entryCount:0};
+    categories().forEach(function(cat){
+      if(!cat||cat.archived||cat.enabled===false)return;
+      const got=readPeriod(cat,ts);
+      const p=got&&got.period;
+      if(!p)return;
+      out.spent=round4(out.spent+(Number(p.spent)||0));
+      out.overspend=round4(out.overspend+overspendOf(cat,p));
+      out.entryCount+=Math.max(0,Math.round(Number(p.entryCount)||0));
+    });
+    let latestTs=-1;
+    (budgets().ledger||[]).forEach(function(e){
+      if(!e||e.status!=='active')return;
+      const cat=category(e.categoryId);
+      if(!cat||cat.archived||cat.enabled===false)return;
+      if(e.periodKey!==budgetBounds(cat.cycle,ts,cat.anchor).key)return;
+      const t=Number(e.ts)||0;
+      if(t>latestTs){latestTs=t;out.entryAmount=round4(Number(e.amount)||0);}
+    });
+    return out;
+  }
   function getPeriod(cat,ts,create){
-    const b=budgetBounds(cat.cycle,ts);
+    const b=budgetBounds(cat.cycle,ts,cat.anchor);
     const bd=budgets();
     if(!bd.periods[cat.id])bd.periods[cat.id]={};
     const map=bd.periods[cat.id];
@@ -1529,7 +1911,7 @@ const BudgetEngine=(function(){
     if(cat.archived)return{ok:false,code:'BUDGET_CATEGORY_ARCHIVED',reason:'预算分类已归档'};
     if(!cat.enabled)return{ok:false,code:'BUDGET_CATEGORY_DISABLED',reason:'预算分类已停用'};
     const bd=budgets();
-    const b=budgetBounds(cat.cycle,ts);
+    const b=budgetBounds(cat.cycle,ts,cat.anchor);
     const map=bd.periods[cat.id]||{};
     const live=map[b.key]||null;
     const p=live||blankPeriod(b);
@@ -1548,7 +1930,8 @@ const BudgetEngine=(function(){
     const spentBefore=round4(Number(p.spent)||0);
     const spentAfter=round4(spentBefore+amount);
     const overspendBefore=Math.max(0,round4(spentBefore-limitAfter));
-    const waterBefore=Math.min(round4(Number(p.penalizedOverspend)||0),overspendBefore);
+    // 水位语义 = 已惩罚过的超支金额，单调不减：扩容会让当前超支变小，但水位不得跟着回落
+    const waterBefore=round4(Number(p.penalizedOverspend)||0);
     const overspendAfter=Math.max(0,round4(spentAfter-limitAfter));
     const deltaOverspend=Math.max(0,round4(overspendAfter-waterBefore));
     const entryCountAfter=(Number(p.entryCount)||0)+1;
@@ -1645,7 +2028,7 @@ const BudgetEngine=(function(){
       topupLogId=res.entryId||'';
       p.topupAmount=round4(p.topupAmount+plan.topup.amount);
       p.topupCost=round4(p.topupCost+plan.topup.cost);
-      p.penalizedOverspend=Math.min(p.penalizedOverspend,Math.max(0,round4(p.spent-effectiveLimit(cat,p))));
+      // 注意：扩容只抬有效限额，不动 penalizedOverspend（水位只增不减，撤销才降）
     }
     // 2) 惩罚/反哺
     const penaltyLogIds=[],feedbackLogIds=[];
@@ -1675,7 +2058,8 @@ const BudgetEngine=(function(){
     // 3) 现实账目 + 周期聚合
     p.spent=round4(p.spent+plan.amount);
     p.entryCount=(Number(p.entryCount)||0)+1;
-    p.penalizedOverspend=plan.overspendAfter;
+    // 只升不降：即使扩容/改额度让当前超支变小，也不回退已惩罚水位
+    p.penalizedOverspend=Math.max(round4(Number(p.penalizedOverspend)||0),round4(Number(plan.overspendAfter)||0));
     p.closedAt=null;
     const entry={
       id:entryId,ts:plan.ts,txnId:(tx&&tx.label)||'',categoryId:cat.id,amount:plan.amount,
@@ -1701,7 +2085,8 @@ const BudgetEngine=(function(){
       if(!p.closedAt)p.closedAt=p.end;
       return false;
     }
-    const b=budgetBounds(cat.cycle,p.start);
+    // 周期实例自带边界：结期只认它自己的 start/end，不受之后 anchor 变更影响
+    const b={key:p.key,start:p.start,end:p.end};
     const spent=round4(Number(p.spent)||0);
     const eff=effectiveLimit(cat,p);
     const overspend=Math.max(0,round4(spent-eff));
@@ -1825,6 +2210,8 @@ const BudgetEngine=(function(){
       if(log.budRuleId)p.ruleTotals[log.budRuleId]=Math.max(0,round4((Number(p.ruleTotals[log.budRuleId])||0)-amt));
     }else if(log.src==='budget-reward'){
       p.rewardAmount=Math.max(0,round4(p.rewardAmount-amt));
+      // 结余奖励同样占用规则累计额度；不回退的话同一条规则在本周期内会被少发一次
+      if(log.budRuleId)p.ruleTotals[log.budRuleId]=Math.max(0,round4((Number(p.ruleTotals[log.budRuleId])||0)-amt));
     }
   }
   function tryRefundTopup(cat,p,entry){
@@ -1853,6 +2240,7 @@ const BudgetEngine=(function(){
   }
   // 撤销一笔现实账目：只允许当期；按原始惩罚/反哺流水精确退回，水位只降不升
   function reverseEntry(entryId){
+    const nested=Ledger.inTxn();
     const r=Ledger.txn(function(){
       const bd=budgets();
       const e=bd.ledger.find(function(x){return x.id===entryId;});
@@ -1863,7 +2251,7 @@ const BudgetEngine=(function(){
       const map=bd.periods[cat.id];
       const p=map&&map[e.periodKey];
       if(!p)return failB('BUDGET_PERIOD_MISSING',{reason:'周期实例不存在'});
-      const nowKey=budgetBounds(cat.cycle,now()).key;
+      const nowKey=budgetBounds(cat.cycle,now(),cat.anchor).key;
       if(e.periodKey!==nowKey||p.end<=now())
         return failB('BUDGET_CROSS_PERIOD',{reason:'跨期账目不可撤销'});
       tryRefundTopup(cat,p,e);
@@ -1874,9 +2262,7 @@ const BudgetEngine=(function(){
       const spentNew=Math.max(0,round4(p.spent-e.amount));
       p.spent=spentNew;
       p.entryCount=Math.max(0,(Number(p.entryCount)||0)-1);
-      const eff=effectiveLimit(cat,p);
-      const over=Math.max(0,round4(spentNew-eff));
-      p.penalizedOverspend=Math.max(0,Math.min(over,round4((Number(p.penalizedOverspend)||0)-(Number(e.penaltyOverspendDelta)||0))));
+      p.penalizedOverspend=Math.max(0,round4((Number(p.penalizedOverspend)||0)-(Number(e.penaltyOverspendDelta)||0)));
       e.status='reversed';
       e.reversedAt=now();
       e.links.penaltyLogIds=[];
@@ -1888,6 +2274,8 @@ const BudgetEngine=(function(){
       toast(info.reason||'撤销失败','err');
       return false;
     }
+    // 嵌套在别的撤销事务里时，由最外层统一 save/render/toast，避免事务中途刷新
+    if(nested)return true;
     save();render();
     toast('已撤销预算账目');
     return true;
@@ -1909,7 +2297,7 @@ const BudgetEngine=(function(){
   }
   return{
     bounds:budgetBounds,categories:categories,category:category,settings:settings,
-    readPeriod:readPeriod,effectiveLimit:effectiveLimit,overspendOf:overspendOf,
+    readPeriod:readPeriod,activityContext:activityContext,effectiveLimit:effectiveLimit,overspendOf:overspendOf,
     preview:preview,prepareEntry:prepareEntry,commitEntry:commitEntry,
     settlePeriod:settlePeriod,reconcileDue:reconcileDue,reconcileAll:reconcileAll,
     reverseEntry:reverseEntry,noteEffectReversed:noteEffectReversed,validateRule:validateRule,
@@ -1955,15 +2343,13 @@ function weekStartTs(anchor,ts){
 }
 function weekScore(start,end){
   let vit=0,prog=0,ach=0,checkins=0,invest=0,consume=0;
-  state.logs.forEach(l=>{
-    if(l.time<start||l.time>=end)return;
-    if(l.st==='both'){vit+=logAmt(l,'vitality');prog+=logAmt(l,'progress');}
-    else if(l.st==='vitality')vit+=logAmt(l,'vitality');
-    else if(l.st==='progress')prog+=logAmt(l,'progress');
-    else if(l.st==='achievement')ach+=l.amt;
-    if(l.src==='checkin')checkins++;
-    if(l.src==='cost'&&l.amt<0)invest+=(-l.amt);
-    else if(l.src==='purchase'&&l.st==='vitality'&&l.amt<0)consume+=(-l.amt);
+  eachStatsBucket(start,end,function(b){
+    vit+=Number(b.v)||0;
+    prog+=Number(b.p)||0;
+    ach+=Number(b.a)||0;
+    checkins+=Number(b.ck)||0;
+    invest+=Number(b.inv)||0;
+    consume+=Number(b.cons)||0;
   });
   const spend=invest+consume;
   const investRate=spend>0?invest/spend*100:0;
@@ -2020,28 +2406,42 @@ function domainMatchesTarget(d,targetType,target){
   if(targetType==='domain')return d.id===target;
   return true;
 }
+// 遍历 [start,end) 命中的统计日桶（按自然日粒度；end 独占，取 end-1 的日期键）
+function eachStatsBucket(start,end,fn){
+  const s=state.ext&&state.ext.stats;
+  if(!s||!s.daily)return;
+  const sk=dayKey(start),ek=dayKey(end-1);
+  Object.keys(s.daily).forEach(function(k){
+    if(k<sk||k>ek)return;
+    const b=s.daily[k];
+    if(b)fn(b,k);
+  });
+}
 function rangeStats(start,end,targetType,target){
   let vitality=0,achievement=0,progressTotal=0,checkins=0,newTasks=0,newDomains=0;
   const progressByDomain={};
   const progressByTask={};
-  state.logs.forEach(l=>{
-    if(l.time<start||l.time>=end)return;
-    if(!logMatchesTarget(l,targetType,target))return;
-    if(logHasType(l,'vitality'))vitality+=logAmt(l,'vitality');
-    if(logHasType(l,'progress')){
-      const pAmt=logAmt(l,'progress');
-      progressTotal+=pAmt;
-      const dids=logDomainsOf(l);
-      if(dids.length){
-        const share=pAmt/dids.length;
-        dids.forEach(d=>{progressByDomain[d]=(progressByDomain[d]||0)+share;});
-      }else{
-        progressByDomain['d_default']=(progressByDomain['d_default']||0)+pAmt;
-      }
-      if(l.taskId)progressByTask[l.taskId]=(progressByTask[l.taskId]||0)+pAmt;
+  eachStatsBucket(start,end,function(b){
+    if(targetType==='task'&&target){
+      vitality+=Number(b.vt&&b.vt[target])||0;
+      const p=Number(b.pt&&b.pt[target])||0;
+      progressTotal+=p;progressByTask[target]=(progressByTask[target]||0)+p;
+      checkins+=Number(b.ct&&b.ct[target])||0;
+      return;
     }
-    if(l.st==='achievement')achievement+=l.amt;
-    if(l.src==='checkin')checkins++;
+    if(targetType==='domain'&&target){
+      vitality+=Number(b.vd&&b.vd[target])||0;
+      const p=Number(b.pd&&b.pd[target])||0;
+      progressTotal+=p;progressByDomain[target]=(progressByDomain[target]||0)+p;
+      checkins+=Number(b.cd&&b.cd[target])||0;
+      return;
+    }
+    vitality+=Number(b.v)||0;
+    achievement+=Number(b.a)||0;
+    progressTotal+=Number(b.p)||0;
+    checkins+=Number(b.ck)||0;
+    Object.keys(b.pd||{}).forEach(function(d){progressByDomain[d]=(progressByDomain[d]||0)+b.pd[d];});
+    Object.keys(b.pt||{}).forEach(function(t){progressByTask[t]=(progressByTask[t]||0)+b.pt[t];});
   });
   state.tasks.forEach(t=>{
     if(t.createdAt&&t.createdAt>=start&&t.createdAt<end&&taskMatchesTarget(t,targetType,target))newTasks++;
@@ -2110,6 +2510,156 @@ function entityMetricValue(metric,entity,w,range){
   if(entity.kind==='domain')return domainMetricValue(metric,entity.id,w,range);
   return 0;
 }
+// ===== 阶段 1：项目 / 杂事 / 不活跃指标 =====
+// 不活跃天数按自然日计算；从未活跃（无基准时间）返回 null，由调用方决定是否跳过
+function idleDaysSince(baseTs,refTs){
+  if(!baseTs)return null;
+  const ref=dayStartTs(refTs||now());
+  const base=dayStartTs(baseTs);
+  const d=Math.round((ref-base)/864e5);
+  return d>0?d:0;
+}
+function affairActive(a){return !!a&&!a.doneAt&&!a.archived;}
+// 点态指标：只看“此刻”的实体状态，与时间范围无关（配置时强制 range='today'）
+function pointMetricValue(metric,it,ts){
+  const tt=it.targetType||'all';
+  const target=it.target||'';
+  if(metric==='task_idle'){
+    let tasks=(state.tasks||[]).filter(t=>!t.archived);
+    if(tt==='task'&&target)tasks=tasks.filter(t=>t.id===target);
+    else if(tt==='domain'&&target)tasks=tasks.filter(t=>getTaskDomainIds(t).indexOf(target)>=0);
+    let max=0;
+    tasks.forEach(t=>{
+      const d=idleDaysSince(effectiveLastTs(t),ts);
+      if(d!==null&&d>max)max=d;
+    });
+    return max;
+  }
+  if(metric==='affair_stall'){
+    let list=(state.affairs||[]).filter(affairActive);
+    if(tt==='domain'&&target)list=list.filter(a=>a.domainId===target);
+    let max=0;
+    list.forEach(a=>{
+      const d=idleDaysSince(affairLastAdvance(a)||a.createdAt,ts);
+      if(d!==null&&d>max)max=d;
+    });
+    return max;
+  }
+  if(metric==='chore_overdue'){
+    return (state.chores||[]).filter(c=>!c.done&&!c.archived&&choreOverdueDays(c,ts)>0).length;
+  }
+  if(metric==='chore_idle'){
+    let max=0;
+    (state.chores||[]).filter(c=>!c.archived).forEach(c=>{
+      const d=idleDaysSince(c.doneAt||c.plannedAt||c.createdAt,ts);
+      if(d!==null&&d>max)max=d;
+    });
+    return max;
+  }
+  // ===== 阶段 3：门槛条件用点态指标 =====
+  if(metric==='lifetime_achievement'){
+    return Math.max(0,Number(state.ext&&state.ext.stats&&state.ext.stats.lifetimeAchievementEarned)||0);
+  }
+  if(metric==='checkin_streak'){
+    let list=(state.tasks||[]).filter(t=>!t.archived);
+    if(tt==='task'&&target)list=list.filter(t=>t.id===target);
+    else if(tt==='domain'&&target)list=list.filter(t=>getTaskDomainIds(t).indexOf(target)>=0);
+    let max=0;
+    list.forEach(t=>{const v=Math.max(0,Math.round(Number(t.streak)||0));if(v>max)max=v;});
+    return max;
+  }
+  if(metric==='milestone_unlocked'){
+    if(!target)return 0;
+    const a=(state.achievements||[]).find(x=>x.id===target);
+    return (a&&!isArchivedEntity(a)&&a.unlocked)?1:0;
+  }
+  if(metric==='budget_remaining'){
+    if(!target)return 0;
+    const cat=BudgetEngine.category(target);
+    if(!cat||!cat.enabled||cat.archived)return 0;
+    const p=BudgetEngine.readPeriod(cat,ts).period;
+    // 剩余额度按“基础限额 + 本期扩容”计算，与超支惩罚同一口径
+    return round4(BudgetEngine.effectiveLimit(cat,p)-(Number(p&&p.spent)||0));
+  }
+  return 0;
+}
+// 窗口求和：遍历可见流水；日志被截断后旧记录不再参与（窗口取最近时影响可控）
+function sumLogsInWindow(w,pred,useAbs){
+  let sum=0;
+  (state.logs||[]).forEach(function(l){
+    const t=Number(l.time)||0;
+    if(t<w.start||t>=w.end)return;
+    if(!pred(l))return;
+    const v=Number(l.amt)||0;
+    sum+=useAbs?Math.abs(v):v;
+  });
+  return round2(sum);
+}
+function countLogsInWindow(w,pred){
+  let n=0;
+  (state.logs||[]).forEach(function(l){
+    const t=Number(l.time)||0;
+    if(t<w.start||t>=w.end)return;
+    if(pred(l))n++;
+  });
+  return n;
+}
+// 项目流水的领域归属：优先领域字段，缺失时经 affairId 反查项目
+function logAffairDomain(l){
+  const dids=logDomainsOf(l);
+  if(dids.length)return dids[0];
+  if(l.affairId){
+    const a=(state.affairs||[]).find(function(x){return x.id===l.affairId;});
+    if(a&&a.domainId)return a.domainId;
+  }
+  return '';
+}
+function affairWindowValue(metric,it,w,range){
+  const tt=it.targetType||'all';
+  const target=it.target||'';
+  const domainOk=function(a){return tt!=='domain'||!target||a.domainId===target;};
+  const inWin=function(ts){return ts&&ts>=w.start&&ts<w.end;};
+  if(metric==='affair_completed'){
+    return (state.affairs||[]).filter(function(a){
+      return domainOk(a)&&(range==='total'?!!a.doneAt:inWin(a.doneAt));
+    }).length;
+  }
+  if(metric==='affair_steps'){
+    let n=0;
+    (state.affairs||[]).filter(domainOk).forEach(function(a){
+      (a.steps||[]).forEach(function(s){
+        if(!s||!s.text)return;
+        if(range==='total'?!!s.doneAt:inWin(s.doneAt))n++;
+      });
+    });
+    return n;
+  }
+  const logDomainOk=function(l){return tt!=='domain'||!target||logAffairDomain(l)===target;};
+  if(metric==='affair_progress'){
+    // 累计口径读实体字段（不受日志截断影响）；窗口口径只能读流水
+    if(range==='total'){
+      return round2((state.affairs||[]).filter(function(a){return domainOk(a)&&a.domainId;}).reduce(function(s,a){return s+(Number(a.alreadyGiven)||0);},0));
+    }
+    return sumLogsInWindow(w,function(l){return l.src==='affair'&&l.st==='progress'&&logDomainOk(l);},true);
+  }
+  if(metric==='affair_achievement'){
+    if(range==='total'){
+      return round2((state.affairs||[]).filter(function(a){return domainOk(a)&&a.doneAt&&a.ach&&a.ach.enabled;}).reduce(function(s,a){return s+(Number(a.ach.amount)||0);},0));
+    }
+    return sumLogsInWindow(w,function(l){return l.src==='affair'&&l.st==='achievement'&&logDomainOk(l);},true);
+  }
+  return 0;
+}
+function choreWindowValue(metric,w,range){
+  if(metric==='chore_completed'){
+    return (state.chores||[]).filter(function(c){
+      return c.doneAt&&(range==='total'?true:(c.doneAt>=w.start&&c.doneAt<w.end));
+    }).length;
+  }
+  if(metric==='chore_decay')return sumLogsInWindow(w,function(l){return l.src==='chore-decay';},true);
+  if(metric==='chore_batches')return countLogsInWindow(w,function(l){return l.src==='chore-batch';});
+  return 0;
+}
 // 计数类指标：新增任务/新增领域数量（主体 all/domain）
 function evalCountMetric(it,w){
   const v=Number(it.value)||0;
@@ -2129,7 +2679,8 @@ function evalCondItem(it,act,ts){
   const v=Number(it.value)||0;
   const range=validRange(it.range)?it.range:'period';
   // 预算指标：只读当前预算周期上下文（由 BudgetEngine 注入 act.budgetCtx）
-  if(it.metric.indexOf('budget_')===0){
+  // budget_remaining 是点态指标（读分类剩余额度），不走预算规则上下文
+  if(it.metric.indexOf('budget_')===0&&it.metric!=='budget_remaining'){
     const bc=(act&&act.budgetCtx)||{};
     let val=0;
     if(it.metric==='budget_entry_amount')val=Number(bc.entryAmount)||0;
@@ -2139,6 +2690,17 @@ function evalCondItem(it,act,ts){
     return opSatisfied(val,it.op,v);
   }
   const w=range==='total'?{start:0,end:ts+1}:condWindowByRange(range,act,ts,it.days);
+  // 阶段 3：领域活跃度读活跃度索引（不遍历日志，不受日志截断影响）
+  if(it.metric==='domain_activity'){
+    const did=(it.targetType==='domain')?(it.target||''):'';
+    if(!did)return false;
+    const days=range==='recent'?Math.max(1,Math.round(Number(it.days)||7)):Math.max(1,Math.round((w.end-w.start)/864e5));
+    return opSatisfied(activityCountForDomain(did,days),it.op,v);
+  }
+  // 阶段 1：点态指标（不活跃天数/超期件数）与项目、杂事指标
+  if(isPointMetric(it.metric))return opSatisfied(pointMetricValue(it.metric,it,ts),it.op,v);
+  if(isAffairMetric(it.metric))return opSatisfied(affairWindowValue(it.metric,it,w,range),it.op,v);
+  if(isChoreMetric(it.metric))return opSatisfied(choreWindowValue(it.metric,w,range),it.op,v);
   // 成果点：全局累计，无主体/新增/聚合概念
   if(it.metric==='achievement'){
     const val=range==='total'?(state.scores.achievement||0):rangeStats(w.start,w.end).achievement;
@@ -2166,50 +2728,102 @@ function evalCondItem(it,act,ts){
   if(it.aggregate==='any')return vals.some(mv=>opSatisfied(mv,it.op,v));
   return opSatisfied(vals.reduce((s,x)=>s+x,0),it.op,v);
 }
+// ===== 结构操作：按“不活跃天数”归档实体 =====
+// 动作自身携带阈值：条件只决定“何时执行”，动作决定“归档谁”。
+// 从未活跃过的任务保持原样（与旧 processMetabolism 语义一致，交还用户处理）。
+function archiveIdleEntities(entity,idleDays,ts,actName,dryRun){
+  const days=Math.max(1,Math.round(Number(idleDays)||1));
+  const label=actName||'周期活动';
+  let n=0;
+  function hit(d){return d!==null&&d>=days;}
+  if(entity==='affair'){
+    (state.affairs||[]).forEach(function(a){
+      if(!affairActive(a))return;
+      const d=idleDaysSince(affairLastAdvance(a)||a.createdAt,ts);
+      if(!hit(d))return;
+      n++;
+      if(dryRun)return;
+      a.archived=true;a.archivedAt=now();
+      Ledger.event('项目「'+a.name+'」停滞 '+d+' 天，已由「'+label+'」归档','affair-archive',{affairId:a.id});
+    });
+    return n;
+  }
+  if(entity==='chore'){
+    (state.chores||[]).forEach(function(c){
+      if(c.archived)return;
+      // 已完成但未结算的杂事不归档：否则会吞掉批量结算奖励
+      if(c.done&&!c.settled)return;
+      const d=idleDaysSince(c.doneAt||c.plannedAt||c.createdAt,ts);
+      if(!hit(d))return;
+      n++;
+      if(dryRun)return;
+      c.archived=true;c.archivedAt=now();
+      Ledger.event('杂事「'+c.name+'」不活跃 '+d+' 天，已由「'+label+'」归档','chore-archive',{choreId:c.id});
+    });
+    return n;
+  }
+  (state.tasks||[]).forEach(function(t){
+    if(t.archived)return;
+    const d=idleDaysSince(effectiveLastTs(t),ts);
+    if(!hit(d))return;
+    n++;
+    if(dryRun)return;
+    t.archived=true;t.archivedAt=now();
+    Ledger.event('任务「'+t.name+'」不活跃 '+d+' 天，已由「'+label+'」归档','archive',{taskId:t.id});
+  });
+  return n;
+}
+// 周期活动的动作分发：奖励类发放资产，结构类修改实体状态；两者共用同一事务与回滚边界
+const RESULT_ACTION_HANDLERS={
+  card:function(act,it){
+    const card=it.card||'exemption';
+    const cap=Math.max(1,Math.round(it.cap||1));
+    const amount=Math.max(0,Math.round(it.amount||0));
+    const before=state.cards[card]||0;
+    if(!(amount>0&&before<cap))return false;
+    const granted=Math.min(cap,before+amount)-before;
+    if(granted<=0)return false;
+    Ledger.post({op:'grant',account:'card:'+card,delta:granted,entry:{st:'card',amt:granted,desc:'周期活动「'+act.name+'」发放 '+granted+' 张'+cardName(card),src:'card-grant',dom:'',card:card,actId:act.id,granted:granted},reason:{src:'card-grant'}});
+    return true;
+  },
+  progress:function(act,it){
+    const amt=Number(it.amount)||0;
+    if(amt<=0)return false;
+    if(it.domainId){
+      Ledger.post({op:'grant',account:'progress:'+it.domainId,delta:amt,entry:{st:'progress',amt:amt,desc:'「'+act.name+'」奖励 '+domainName(it.domainId)+' 进度',src:'reward',dom:it.domainId,actId:act.id},reason:{src:'reward'}});
+    }else{
+      const dids=state.domains.map(d=>d.id);
+      Ledger.postSplits({splits:[{domainIds:dids,delta:amt}],entry:{st:'progress',amt:amt,desc:'「'+act.name+'」奖励 进度（全领域）',src:'reward',dom:'',actId:act.id},reason:{src:'reward'}});
+    }
+    return true;
+  },
+  vitality:function(act,it){
+    const amt=Number(it.amount)||0;
+    if(amt<=0)return false;
+    const tName=it.taskId?(state.tasks.find(t=>t.id===it.taskId)||{}).name:'';
+    const lbl=tName?('「'+tName+'」活力'):'活力';
+    Ledger.post({op:'grant',account:'vitality',delta:amt,entry:{st:'vitality',amt:amt,desc:'「'+act.name+'」奖励 '+lbl+' +'+fmt(amt),src:'reward',dom:'',actId:act.id,taskId:it.taskId||''},reason:{src:'reward'}});
+    return true;
+  },
+  achievement:function(act,it){
+    const amt=Number(it.amount)||0;
+    if(amt<=0)return false;
+    Ledger.post({op:'grant',account:'achievement',delta:amt,entry:{st:'achievement',amt:amt,desc:'「'+act.name+'」奖励 成果 +'+fmt(amt),src:'reward',dom:'',actId:act.id},reason:{src:'reward'}});
+    return true;
+  },
+  archive:function(act,it,ts){
+    return archiveIdleEntities(it.entity,it.idleDays,ts,act.name,false)>0;
+  }
+};
 function applyResult(act,ts){
   const items=(act.result&&act.result.items)||[];
   let grantedAny=false;
   const txr=Ledger.txn(function(){
     items.forEach(it=>{
       if(!it)return;
-      if(it.type==='card'){
-        const card=it.card||'exemption';
-        const cap=Math.max(1,Math.round(it.cap||1));
-        const amount=Math.max(0,Math.round(it.amount||0));
-        const before=state.cards[card]||0;
-        if(amount>0&&before<cap){
-          const granted=Math.min(cap,before+amount)-before;
-          if(granted>0){
-            Ledger.post({op:'grant',account:'card:'+card,delta:granted,entry:{st:'',amt:0,desc:'周期活动「'+act.name+'」发放 '+granted+' 张'+cardName(card),src:'card-grant',dom:'',actId:act.id,granted:granted},reason:{src:'card-grant'}});
-            grantedAny=true;
-          }
-        }
-      }else if(it.type==='progress'){
-        const amt=Number(it.amount)||0;
-        if(amt>0){
-          if(it.domainId){
-            Ledger.post({op:'grant',account:'progress:'+it.domainId,delta:amt,entry:{st:'progress',amt:amt,desc:'「'+act.name+'」奖励 '+domainName(it.domainId)+' 进度',src:'reward',dom:it.domainId,actId:act.id},reason:{src:'reward'}});
-          }else{
-            const dids=state.domains.map(d=>d.id);
-            Ledger.postSplits({splits:[{domainIds:dids,delta:amt}],entry:{st:'progress',amt:amt,desc:'「'+act.name+'」奖励 进度（全领域）',src:'reward',dom:'',actId:act.id},reason:{src:'reward'}});
-          }
-          grantedAny=true;
-        }
-      }else if(it.type==='vitality'){
-        const amt=Number(it.amount)||0;
-        if(amt>0){
-          const tName=it.taskId?(state.tasks.find(t=>t.id===it.taskId)||{}).name:'';
-          const lbl=tName?('「'+tName+'」活力'):'活力';
-          Ledger.post({op:'grant',account:'vitality',delta:amt,entry:{st:'vitality',amt:amt,desc:'「'+act.name+'」奖励 '+lbl+' +'+fmt(amt),src:'reward',dom:'',actId:act.id,taskId:it.taskId||''},reason:{src:'reward'}});
-          grantedAny=true;
-        }
-      }else if(it.type==='achievement'){
-        const amt=Number(it.amount)||0;
-        if(amt>0){
-          Ledger.post({op:'grant',account:'achievement',delta:amt,entry:{st:'achievement',amt:amt,desc:'「'+act.name+'」奖励 成果 +'+fmt(amt),src:'reward',dom:'',actId:act.id},reason:{src:'reward'}});
-          grantedAny=true;
-        }
-      }
+      const fn=RESULT_ACTION_HANDLERS[it.type];
+      if(!fn)return;
+      if(fn(act,it,ts)&&it.type!=='archive')grantedAny=true;
     });
     if(grantedAny)checkAchievements();
   },{label:'activity-reward',save:'none',render:false});
@@ -2218,12 +2832,19 @@ function applyResult(act,ts){
 function processActivities(silent=false){
   if(!state.activities)state.activities=[];
   const ts=Date.now();
+  // 预算类指标（budget_*）与预算规则共用同一套条件语法：
+  // 活动侧同样注入预算上下文，避免“能配但永远为 0”的静默失效。
+  const budgetCtx=BudgetEngine.activityContext(ts);
   let changed=false;
   state.activities.forEach(act=>{
     if(!act.enabled)return;
     const key=periodKey(act,ts);
     if(act.lastRun===key)return;
-    if(evalCondition(act,ts))applyResult(act,ts);
+    if(evalCondition(Object.assign({},act,{budgetCtx:budgetCtx}),ts)){
+      // 发放失败（事务回滚）时不推进 lastRun：否则本期奖励被永久吞掉，且无任何提示
+      const ok=applyResult(act,ts);
+      if(!ok)return;
+    }
     act.lastRun=key;
     changed=true;
   });
@@ -2235,10 +2856,11 @@ function schedulerTick(){
   if(_lastTickDay===null){_lastTickDay=d;return;}
   if(d===_lastTickDay)return;
   _lastTickDay=d;
+  // 代谢规则只播种一次；真正的归档由 processActivities 按规则执行
+  ensureMetabolismRule();
   // 统一以 silent 模式执行各处理器，最后只写盘一次
   processActivities(true);
   processDailyTaskDebts(true);
-  processMetabolism(true);
   processLoansWithDecayReserve();
   processChoreDecay(true);
   // 预算结算兜底：周期结束后惰性结算（记一笔/购买/打开预算页之外的最后防线）
@@ -2328,6 +2950,8 @@ function checkIn(taskId,stageIdx){
   const t=state.tasks.find(x=>x.id===taskId);
   if(!t)return;
   if(t.archived){toast('该任务已归档，请先解锁','err');return}
+  // 同日重复打卡直接拒绝：在任何写入/计算之前返回，余额、次数、连胜、待扣债均不变
+  if(taskCheckedToday(t)){toast('「'+t.name+'」今日已打卡，明天再来','warn');return}
   const types=taskScoreTypes(t);
   const hasV=types.indexOf('vitality')>=0;
   const hasP=types.indexOf('progress')>=0;
@@ -2545,39 +3169,92 @@ function delDomain(id){
   if(!confirm('删除领域「'+d.name+'」？\n（进度值将合并至默认领域，可在银行流水撤销此操作）'))return;
   const domIndex=state.domains.indexOf(d);
   const domCopy=clone(d);
+  const prevUnlocked={};
+  state.achievements.forEach(a=>{prevUnlocked[a.id]=!!a.unlocked;});
 
-  // Save affected tasks for undo
-  const affectedTasks=[];
-  state.tasks.forEach(t=>{
-    const dids=getTaskDomainIds(t);
-    if(dids.includes(id)){
-      affectedTasks.push({id:t.id,prevDomainIds:clone(t.domainIds||[]),prevDomainId:t.domainId||null});
-      const newDids=dids.filter(x=>x!==id);
-      if(newDids.length===0)newDids.push('d_default');
-      t.domainIds=newDids;
-      delete t.domainId;
+  // 领域删除是一个整体动作：任务/里程碑改挂、进度合并、活跃度清理、预算引用清理、
+  // 成果点复核必须同事务提交，否则中途失败会留下“领域没了但进度没合并”的错账。
+  const txr=Ledger.txn(function(){
+    // Save affected tasks for undo
+    const affectedTasks=[];
+    state.tasks.forEach(t=>{
+      const dids=getTaskDomainIds(t);
+      if(dids.includes(id)){
+        affectedTasks.push({id:t.id,prevDomainIds:clone(t.domainIds||[]),prevDomainId:t.domainId||null});
+        const newDids=dids.filter(x=>x!==id);
+        if(newDids.length===0)newDids.push('d_default');
+        t.domainIds=newDids;
+        delete t.domainId;
+      }
+    });
+
+    // Save affected achievements for undo
+    const affectedAchs=[];
+    state.achievements.forEach(a=>{
+      if(a.domainId===id){
+        affectedAchs.push({id:a.id,prevDomainId:id});
+        a.domainId='d_default';
+      }
+    });
+
+    // merge progress into default
+    const progressVal=state.scores.progress[id]||0;
+    Ledger.post({op:'grant',account:'progress:d_default',delta:progressVal,visible:false,reason:{src:'delete-domain'}});
+    // 账户按 0 归零后移除键，等价于原来的 delete
+    if(id in state.scores.progress)Ledger.post({op:'adjust',account:'progress:'+id,target:0,visible:false,reason:{src:'delete-domain'}});
+    delete state.scores.progress[id];
+
+    // 幽灵活跃度：领域没了但 ext.activity 还留着按日计数，会污染同 id 重建后的门槛统计
+    let activityCopy=null;
+    if(state.ext&&state.ext.activity&&state.ext.activity[id]){
+      activityCopy=clone(state.ext.activity[id]);
+      delete state.ext.activity[id];
     }
-  });
 
-  // Save affected achievements for undo
-  const affectedAchs=[];
-  state.achievements.forEach(a=>{
-    if(a.domainId===id){
-      affectedAchs.push({id:a.id,prevDomainId:id});
-      a.domainId='d_default';
+    // 预算引用清理：目标领域被删后规则会永远发不出奖励，统一改挂默认领域（撤销时还原）
+    const budgetFixes=[];
+    const bd=state.ext&&state.ext.budgets;
+    if(bd&&Array.isArray(bd.categories)){
+      bd.categories.forEach(function(cat){
+        if(!cat)return;
+        let changed=false;
+        if(cat.defaultProgressDomainId===id){
+          budgetFixes.push({catId:cat.id,type:'default',prev:id});
+          cat.defaultProgressDomainId='d_default';changed=true;
+        }
+        (Array.isArray(cat.rules)?cat.rules:[]).forEach(function(r){
+          if(r&&r.target&&r.target.domainId===id){
+            budgetFixes.push({catId:cat.id,ruleId:r.id,type:'rule',prev:id});
+            r.target.domainId='d_default';changed=true;
+          }
+        });
+        if(changed)cat.updatedAt=now();
+      });
     }
-  });
 
-  // merge progress into default
-  const progressVal=state.scores.progress[id]||0;
-  Ledger.post({op:'grant',account:'progress:d_default',delta:progressVal,visible:false,reason:{src:'delete-domain'}});
-  // 账户按 0 归零后移除键，等价于原来的 delete
-  if(id in state.scores.progress)Ledger.post({op:'adjust',account:'progress:'+id,target:0,visible:false,reason:{src:'delete-domain'}});
-  delete state.scores.progress[id];
+    state.domains=state.domains.filter(x=>x.id!==id);
+    Ledger.event('删除领域「'+d.name+'」','delete-domain',{
+      domCopy:domCopy,domIndex:domIndex,progressVal:progressVal,
+      affectedTasks:affectedTasks,affectedAchs:affectedAchs,
+      activityCopy:activityCopy,budgetFixes:budgetFixes
+    });
+    checkAchievements();
 
-  state.domains=state.domains.filter(x=>x.id!==id);
-  Ledger.event('删除领域「'+d.name+'」','delete-domain',{domCopy:domCopy,domIndex:domIndex,progressVal:progressVal,affectedTasks:affectedTasks,affectedAchs:affectedAchs});
-  checkAchievements();
+    // 删除动作本身可能因进度合并触发其他领域里程碑解锁；记录这些“副作用成果点”，
+    // 撤销删除时一并回收，否则撤销后凭空多出一笔解锁。
+    const triggeredAchs=[];
+    const achLogIds=[];
+    state.achievements.forEach(function(a){
+      if(a.unlocked&&!prevUnlocked[a.id]){
+        triggeredAchs.push({id:a.id,points:Number(a.points)||0});
+        const lg=state.logs.find(function(l){return l.src==='achievement'&&l.achId===a.id;});
+        if(lg)achLogIds.push(lg.id);
+      }
+    });
+    const ev=state.logs.find(function(l){return l.src==='delete-domain'&&l.time&&l.domCopy&&l.domCopy.id===id;});
+    if(ev){ev.triggeredAchs=triggeredAchs;ev.achLogIds=achLogIds;}
+  },{label:'delete-domain',save:'none',render:false});
+  if(!txr.ok)return;
   save();
   toast('领域已删除，进度已合并至默认');
   render();
@@ -2663,23 +3340,43 @@ function finalizeTaskSave(t,data,opts){
     recalcTaskHistory(t,data);
   }else if(opts.domainMode==='migrate'){
     // 1) 该任务的全部打卡流水改到新领域
-    state.logs.forEach(l=>{
-      if(l.src==='checkin'&&l.taskId===t.id)l.dom=opts.newDids.join(',');
-    });
-    // 2) 累计进度值从旧领域搬到新领域（按原分摊方式等分）
-    if(taskHasType(t,'progress')&&(data.scoreTypes||[]).indexOf('progress')>=0){
-      const earned=t.totalEarned||0;
-      if(earned!==0&&opts.oldDids.length&&opts.newDids.length){
-        const oldShare=earned/opts.oldDids.length;
-        opts.oldDids.forEach(did=>{
-          Ledger.post({op:'grant',account:'progress:'+did,delta:-oldShare,visible:false,reason:{src:'task-domain-migrate'}});
-        });
-        const newShare=earned/opts.newDids.length;
-        opts.newDids.forEach(did=>{
-          Ledger.post({op:'grant',account:'progress:'+did,delta:newShare,visible:false,reason:{src:'task-domain-migrate'}});
-        });
+    // 同时把流水自身的 splits 与活跃度索引一起搬走：撤销是按流水自带的分配明细
+    // 精确反向的，只改 dom 会让撤销从旧领域扣钱、并把活跃度记在旧领域。
+    // 流水改写与进度搬运必须同事务：中途失败不能留下“日志改了但账没搬”的半成品。
+    const txr=Ledger.txn(function(){
+      const migNew=(opts.newDids&&opts.newDids.length)?opts.newDids:['d_default'];
+      state.logs.forEach(l=>{
+        if(l.src!=='checkin'||l.taskId!==t.id)return;
+        const prevDids=String(l.dom||'').split(',').filter(Boolean);
+        noteCheckinActivity(prevDids.length?prevDids:(opts.oldDids||[]),-1,l.time);
+        l.dom=migNew.join(',');
+        noteCheckinActivity(migNew,1,l.time);
+        if(Array.isArray(l.splits)&&l.splits.length){
+          const amt=Number(logAmt(l,'progress'))||0;
+          // 按分精确分摊：各领域之和逐分等于原额，撤销回放时不会出现 3.3333… 的浮点尾巴
+          const parts=splitCents(amt,migNew.length);
+          l.splits=migNew.map(function(did,i){return{dom:did,amt:parts[i]};});
+        }
+        // 流水被原地改写：同步重算它对统计日桶/生命周期的贡献
+        Ledger.reagg(l);
+      });
+      // 2) 累计进度值从旧领域搬到新领域（按原分摊方式等分）
+      if(taskHasType(t,'progress')&&(data.scoreTypes||[]).indexOf('progress')>=0){
+        const earned=t.totalEarned||0;
+        if(earned!==0&&opts.oldDids.length&&opts.newDids.length){
+          // 与流水 splits 同一口径：按分均摊，扣/加两侧各自逐分等于 earned
+          const oldParts=splitCents(-earned,opts.oldDids.length);
+          opts.oldDids.forEach((did,i)=>{
+            Ledger.post({op:'grant',account:'progress:'+did,delta:oldParts[i],visible:false,reason:{src:'task-domain-migrate'}});
+          });
+          const newParts=splitCents(earned,opts.newDids.length);
+          opts.newDids.forEach((did,i)=>{
+            Ledger.post({op:'grant',account:'progress:'+did,delta:newParts[i],visible:false,reason:{src:'task-domain-migrate'}});
+          });
+        }
       }
-    }
+    },{label:'task-domain-migrate',save:'none',render:false});
+    if(!txr.ok)return;
   }
 
   Object.assign(t,data);
@@ -2702,13 +3399,15 @@ function recalcTaskHistory(t, newData){
   if(checkinLogs.length===0)return;
   
   // Step 1: Undo all old amounts from scores
-  const oldCost=t.vitalityCost||0;
   checkinLogs.forEach(log=>{
     // Undo old net amount (including 'both' check-ins)
     applyCheckinGain(log,-1);
-    // Undo old vitality cost
-    if(oldCost>0){
-      Ledger.post({op:'grant',account:'vitality',delta:oldCost,visible:false,reason:{src:'recalc-cost'}});
+    // 退款必须读这条打卡实际关联的成本流水，而不是用任务当前的 vitalityCost 反算：
+    // 历史上没扣过成本的打卡不能因为后来加了成本就被凭空退款。
+    const linkedCost=state.logs.find(l=>l.src==='cost'&&(l.link||'')===log.id);
+    const actualCost=linkedCost?Math.abs(Number(linkedCost.amt)||0):0;
+    if(actualCost>0){
+      Ledger.post({op:'grant',account:'vitality',delta:actualCost,visible:false,reason:{src:'recalc-cost'}});
     }
   });
   
@@ -2774,6 +3473,8 @@ function recalcTaskHistory(t, newData){
     // 重放后刷新分配明细，保证后续撤销仍能逐领域精确反向
     if(newParts)log.splits=newDids.map((did,i)=>({dom:did,amt:newParts[i]}));
     else delete log.splits;
+    // 打卡流水字段被重写：同步刷新统计贡献（旧 agg 先扣、新值再加）
+    Ledger.reagg(log);
     let desc='「'+newData.name+'」打卡';
     if(bonus>0)desc+=' (连胜'+newStreak+'天 +'+fmt(bonus)+')';
     if(newCost>0)desc+=' (消耗活力-'+fmt(newCost)+')';
@@ -2782,16 +3483,17 @@ function recalcTaskHistory(t, newData){
     log.prevLastCheckIn=runningLastCheckIn;
     
     // Update linked cost log if exists
-    if(oldCost>0||newCost>0){
-      const costLog=state.logs.find(l=>(l.link||'')===log.id);
+    const costLog=state.logs.find(l=>l.src==='cost'&&(l.link||'')===log.id);
+    if(costLog||newCost>0){
       if(costLog){
         if(newCost>0){
           costLog.amt=-newCost;
           costLog.desc='「'+newData.name+'」消耗活力点';
+          Ledger.reagg(costLog);
         }else{
           Ledger.removeLogs(l=>l.id!==costLog.id);
         }
-      }else if(newCost>0&&oldCost===0){
+      }else if(newCost>0){
         Ledger.append({id:uid(),time:logTime,st:'vitality',amt:-newCost,desc:'「'+newData.name+'」消耗活力点',src:'cost',dom:'',taskId:t.id,link:log.id});
       }
     }
@@ -2821,24 +3523,28 @@ function delTask(id){
   const taskIndex=state.tasks.indexOf(t);
   const taskCopy=clone(t);
 
-  // Move earned progress to default domain so it isn't orphaned
-  let progressMoved=null;
-  if(taskHasType(t,'progress')&&(t.totalEarned||0)!==0){
-    const dids=getTaskDomainIds(t);
-    const share=t.totalEarned/dids.length;
-    const fromDomains=dids.map(did=>({did:did,amount:share}));
-    dids.forEach(did=>{
-      Ledger.post({op:'grant',account:'progress:'+did,delta:-share,visible:false,reason:{src:'delete-task'}});
-    });
-    Ledger.post({op:'grant',account:'progress:d_default',delta:t.totalEarned,visible:false,reason:{src:'delete-task'}});
-    progressMoved={fromDomains:fromDomains,totalMoved:t.totalEarned};
-  }
+  // 删除任务涉及的进度搬运、任务移除、成果点复核必须整体提交或整体回滚
+  const txr=Ledger.txn(function(){
+    // Move earned progress to default domain so it isn't orphaned
+    let progressMoved=null;
+    if(taskHasType(t,'progress')&&(t.totalEarned||0)!==0){
+      const dids=getTaskDomainIds(t);
+      const share=t.totalEarned/dids.length;
+      const fromDomains=dids.map(did=>({did:did,amount:share}));
+      dids.forEach(did=>{
+        Ledger.post({op:'grant',account:'progress:'+did,delta:-share,visible:false,reason:{src:'delete-task'}});
+      });
+      Ledger.post({op:'grant',account:'progress:d_default',delta:t.totalEarned,visible:false,reason:{src:'delete-task'}});
+      progressMoved={fromDomains:fromDomains,totalMoved:t.totalEarned};
+    }
 
-  state.tasks=state.tasks.filter(x=>x.id!==id);
-  Ledger.event('删除任务「'+t.name+'」','delete-task',{taskCopy:taskCopy,taskIndex:taskIndex,progressMoved:progressMoved});
-  checkAchievements();
-  processDailyTaskDebts(true);
-  processLoansWithDecayReserve();
+    state.tasks=state.tasks.filter(x=>x.id!==id);
+    Ledger.event('删除任务「'+t.name+'」','delete-task',{taskCopy:taskCopy,taskIndex:taskIndex,progressMoved:progressMoved});
+    checkAchievements();
+    processDailyTaskDebts(true);
+    processLoansWithDecayReserve();
+  },{label:'delete-task',save:'none',render:false});
+  if(!txr.ok)return;
   save();
 }
 
@@ -3000,9 +3706,10 @@ function buyProduct(id){
   const tier=validProductTier(p.tier);
   const cur=tierCurrency(tier);
   const cn=cur==='vitality'?'活力点':'成果点';
-  const balance=state.scores[cur];
-  const willLoan=balance<p.price;
-  const loanAmt=willLoan?(p.price-balance):0;
+  // 贷款决策必须等事务内的预算结算完成后再判断：reconcileDue 可能先发放结余奖励，
+  // 让余额在购买前变得够用；按事务外的旧余额借贷会凭空多开一笔贷。
+  let willLoan=false;
+  let loanAmt=0;
   const loanId=uid();
 
   let budgetMsg='';
@@ -3018,7 +3725,10 @@ function buyProduct(id){
         note:'购买「'+p.name+'」'
       });
     }
-    if(willLoan)Ledger.post({op:'grant',account:cur,delta:loanAmt,visible:false,reason:{src:'loan-draw'}});
+    const balance=Number(state.scores[cur])||0;
+    willLoan=balance<p.price;
+    loanAmt=willLoan?round2(p.price-balance):0;
+    if(willLoan&&loanAmt>0)Ledger.post({op:'grant',account:cur,delta:loanAmt,visible:false,reason:{src:'loan-draw'}});
     if(p.stock>0)p.stock--;
     p.sold=(p.sold||0)+1;
 
@@ -3090,42 +3800,26 @@ function processDailyTaskDebts(silent=false){
   if(!silent)save();
 }
 
-// ===== Metabolism (auto-archive / auto-delete) =====
-// Tasks not checked in for 2+ weeks get archived; never-checked tasks get deleted after 2 weeks.
-function processMetabolism(silent=false){
-  const today=new Date();today.setHours(0,0,0,0);
-  const twoWeeks=14*864e5;
-  let changed=false;
-  const toDelete=[];
-  state.tasks.forEach(task=>{
-    if(task.archived)return; // already archived
-    const lastTs=effectiveLastTs(task);
-    if(!lastTs){
-      // Never checked in and never exempted: check createdAt
-      const created=task.createdAt||now();
-      if(today.getTime()-created>=twoWeeks){
-        toDelete.push(task);
-      }
-      return;
-    }
-    const last=new Date(lastTs);last.setHours(0,0,0,0);
-    if(today.getTime()-last.getTime()>=twoWeeks){
-      // Has been checked in before, now inactive 2+ weeks → archive
-      task.archived=true;
-      task.archivedAt=now();
-      changed=true;
-      Ledger.event('任务「'+task.name+'」连续两周未打卡，已归档','archive',{taskId:task.id});
-    }
-  });
-  if(toDelete.length){
-    toDelete.forEach(t=>{
-      Ledger.event('任务「'+t.name+'」从未打卡且超两周，已自动删除','auto-delete',{taskName:t.name});
-    });
-    const ids=new Set(toDelete.map(t=>t.id));
-    state.tasks=state.tasks.filter(t=>!ids.has(t.id));
-    changed=true;
-  }
-  if(changed&&!silent)save();
+// ===== Metabolism（已迁移为周期活动）=====
+// 自动归档不再有硬编码逻辑：首次载入/升级时播种一条可编辑、可停用、可删除的周期活动。
+// 之后是否归档、归档阈值多少，全部由活动规则决定；本函数只负责播种。
+function ensureMetabolismRule(){
+  if(!state.ext||typeof state.ext!=='object')state.ext={};
+  if(state.ext.metabolismSeeded)return false;
+  state.ext.metabolismSeeded=true;
+  if(!Array.isArray(state.activities))state.activities=[];
+  if(state.activities.some(function(a){return a.id==='act_metabolism';}))return false;
+  state.activities.push(normalizeActivity({
+    id:'act_metabolism',
+    name:'任务自动归档',
+    enabled:true,
+    period:'day',
+    anchor:1,
+    condition:{mode:'all',items:[{range:'today',metric:'task_idle',op:'>=',value:14,targetType:'all',target:'',newFilter:'none',aggregate:'sum'}]},
+    result:{items:[{type:'archive',entity:'task',idleDays:14}]},
+    lastRun:null
+  }));
+  return true;
 }
 function unlockTask(taskId){
   const t=state.tasks.find(x=>x.id===taskId);
@@ -3149,34 +3843,42 @@ function unlockTask(taskId){
 // ===== Loan processing (daily interest) =====
 // silent：不单独写盘（由调用方统一 commit）
 // reserveVitality：还贷前先预留「当天已腐化但尚未入账」的活力点，避免用这笔钱还贷
+// 一次性跳过自动还款：撤销「贷款还款」时使用，只影响当前这次处理，不改变长期行为
+let _loanAutoPaySkipOnce=false;
+// 单笔贷款的计息起点：优先用贷款自带的 lastInterestAt；
+// 旧贷款没有该字段时回退到全局 lastDebtDate，再回退到贷款开立日。
+function loanInterestStart(loan){
+  if(loan&&typeof loan.lastInterestAt==='number'&&isFinite(loan.lastInterestAt)&&loan.lastInterestAt>0)return loan.lastInterestAt;
+  if(state.lastDebtDate)return state.lastDebtDate;
+  return Number(loan&&loan.date)||now();
+}
 function processLoans(silent=false,reserveVitality=0){
+  const skipAutoPay=_loanAutoPaySkipOnce;
+  _loanAutoPaySkipOnce=false;
   Ledger.txn(function(){
     if(!state.loans)state.loans=[];
 
-    // Process daily interest if days have passed
+    // 逐笔按自己的计息起点算天数：新借的贷款不会被全局 lastDebtDate 追溯计息
     if(state.loans.length>0){
       const today=new Date();today.setHours(0,0,0,0);
-      let lastDate;
-      if(state.lastDebtDate){
-        lastDate=new Date(state.lastDebtDate);lastDate.setHours(0,0,0,0);
-      }else{
-        lastDate=today;
-      }
-      const days=Math.round((today-lastDate)/864e5);
-      if(days>0){
-        state.loans.slice().forEach(function(loan){
-          if(loan.debtRate<=0)return;
+      state.loans.slice().forEach(function(loan){
+        const startDay=new Date(loanInterestStart(loan));
+        startDay.setHours(0,0,0,0);
+        const days=Math.round((today-startDay)/864e5);
+        if(days>0&&loan.debtRate>0){
           // 复利按天换算为一次幂运算，避免按天循环
           Ledger.liability.mutate(loan.id,function(before){return before*Math.pow(1+loan.debtRate/100,days);},{src:'loan-interest'});
-        });
-        state.lastDebtDate=today.getTime();
-      }
+        }
+        // 每笔贷款各自推进起点；日息为 0 的贷款也推进，避免恢复计息时补算历史天数
+        loan.lastInterestAt=today.getTime();
+      });
+      state.lastDebtDate=today.getTime();
     }else{
       state.lastDebtDate=now();
     }
 
     // Auto-pay loans when balance is sufficient (always check)
-    if(state.loans.length>0){
+    if(state.loans.length>0&&!skipAutoPay){
       const reserve=(typeof reserveVitality==='number'&&isFinite(reserveVitality))?Math.max(0,reserveVitality):0;
       state.loans.slice().forEach(function(loan){
         const avail=(state.scores[loan.currency]||0)-(loan.currency==='vitality'?reserve:0);
@@ -3186,7 +3888,7 @@ function processLoans(silent=false,reserveVitality=0){
         }
       });
     }
-  },{label:'loans',save:silent?'none':'debounce',render:false});
+  },{label:'loans',save:silent?'none':undefined,render:false});
 }
 // 还贷前统一按当天腐化总额预留（不改变 processLoans 与 processChoreDecay 的先后顺序）
 function processLoansWithDecayReserve(){
@@ -3241,21 +3943,24 @@ function clearDataResults(){
   state.ext.budgets.periods={};
   state.ext.budgets.ledger=[];
   state.ext.audit=[];
+  state.ext.shadow=[];
   // 结果型扩展数据随清空归零；商品门槛等配置类字段保留
   state.ext.activity={};
   state.ext.achievementCounted={};
 
+  // 任务：清零所有运行时状态，让卡片等价于“刚创建但打过 0 次卡”；
+  // 任务定义（名称/分值/领域/集合/利率等）与 id/createdAt/archived/archivedAt 一律保留。
+  // lastCheckIn=null 本次是有意放开：自动归档已迁移为周期活动规则，
+  // 归档动作遇到“从未活跃”的任务会跳过（不归档、不删除）。
   state.tasks.forEach(t=>{
+    t.lastCheckIn=null;
+    delete t.lastExempt;
     t.checkInCount=0;
     t.streak=0;
-    t.lastCheckIn=null;
     t.totalEarned=0;
     t.pendingDebt=0;
-    t.archived=false;
-    delete t.archivedAt;
     delete t.lastDebtDate;
-    // 保留阶段奖励数值（v/p），只把当前档位归零
-    if(t.stageRewards&&typeof t.stageRewards.last==='number')t.stageRewards.last=0;
+    if(t.stageRewards&&typeof t.stageRewards==='object')t.stageRewards.last=0;
   });
 
   state.affairs.forEach(a=>{
@@ -3300,6 +4005,8 @@ function clearEverything(){
   affairDoneOpen=false;
   choreDoneOpen=false;
   loadIssue=null;
+  // 用户显式选择“彻底重置”，视为放弃原存档：解除写入暂停
+  _persistBlocked=false;
   // 清掉 localStorage 残留：保留损坏备份（事故恢复用），清理阶段预设与备份提醒时间
   try{localStorage.removeItem(STAGE_PRESET_KEY);}catch(e){}
   try{localStorage.removeItem(BACKUP_KEY);}catch(e){}
@@ -3525,6 +4232,8 @@ function migrateAffair(a){
   if(!a.ach||typeof a.ach!=='object')a.ach={enabled:false,amount:0};
   if(a.ach.enabled===undefined)a.ach.enabled=false;
   if(typeof a.ach.amount!=='number'||isNaN(a.ach.amount))a.ach.amount=0;
+  a.archived=!!a.archived;
+  a.archivedAt=a.archivedAt||null;
   return a;
 }
 
@@ -3661,14 +4370,16 @@ function renderAffairs(){
   const panel=document.getElementById('affairPanel');
   if(!panel)return;
   const affairs=state.affairs||[];
+  const active=affairs.filter(function(a){return !a.archived;});
+  const archived=affairs.filter(function(a){return a.archived;});
   const meta=document.getElementById('affairMeta');
   if(meta){
-    const open=affairs.filter(function(a){return !a.doneAt;}).length;
-    meta.textContent=affairs.length?('共'+affairs.length+' · 未完成'+open):'';
+    const open=active.filter(function(a){return !a.doneAt;}).length;
+    meta.textContent=affairs.length?('共'+affairs.length+' · 未完成'+open+(archived.length?' · 已归档'+archived.length:'')):'';
   }
   let html=renderAffairPresetsHTML();
   // 1. 进行中区（有步骤未全完成，或已开始推进的无步骤事务）
-  const inProg=affairs.filter(function(a){return !a.doneAt&&(affairTotalSteps(a)>0||(a.currentCell||0)>0);})
+  const inProg=active.filter(function(a){return !a.doneAt&&(affairTotalSteps(a)>0||(a.currentCell||0)>0);})
     .sort(function(a,b){return (b.totalReward||0)-(a.totalReward||0)||affairLastAdvance(a)-affairLastAdvance(b);});
   html+=affairZoneStart('inprog','进行中',inProg.length,'');
   html+=inProg.length?inProg.map(affairInProgressCardHTML).join(''):'<div class="affair-empty">暂无进行中的项目</div>';
@@ -3679,14 +4390,29 @@ function renderAffairs(){
   html+=(affairView==='cal')?renderAffairCalendar():renderAffairSchedule();
   html+=AFFAIR_ZONE_END;
   // 3. 草稿区（无步骤、未安排、尚未推进）
-  const drafts=affairs.filter(function(a){return !a.doneAt&&!a.plannedAt&&affairTotalSteps(a)===0&&(a.currentCell||0)===0;})
+  const drafts=active.filter(function(a){return !a.doneAt&&!a.plannedAt&&affairTotalSteps(a)===0&&(a.currentCell||0)===0;})
     .sort(function(a,b){return (b.createdAt||0)-(a.createdAt||0);});
   html+=affairZoneStart('draft','草稿',drafts.length,'');
   html+=drafts.length?drafts.map(affairDraftCardHTML).join(''):'<div class="affair-empty">没有草稿</div>';
   html+=AFFAIR_ZONE_END;
   // 4. 已完成（折叠组，默认收起，置于最底部）
-  const done=affairs.filter(function(a){return affairIsDone(a);});
+  const done=active.filter(function(a){return affairIsDone(a);});
   html+=doneZoneHTML(done);
+  // 5. 已归档（规则归档的项目集中在此，可单独恢复）
+  if(archived.length){
+    html+='<div class="affair-zone collapsed" id="affair-zone-archived">'
+      +'<div class="affair-zone-title" onclick="toggleAffairZone(\'archived\')">'
+      +'<span class="coll-toggle">▼</span>已归档 <span class="affair-zone-count">'+archived.length+'</span></div>'
+      +'<div class="affair-zone-body">'
+      +archived.map(function(a){
+        return '<div class="card affair-card" style="opacity:.7">'
+          +'<div class="affair-row"><div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span></div>'
+          +'<div class="affair-actions"><span class="affair-time">归档于 '+(a.archivedAt?fmtTime(a.archivedAt):'—')+'</span>'
+          +'<button class="btn btn-sm" onclick="restoreAffair(\''+a.id+'\')">恢复</button></div></div>'
+          +'</div>';
+      }).join('')
+      +'</div></div>';
+  }
   panel.innerHTML=html;
 }
 
@@ -3837,7 +4563,7 @@ function affairDoneCardHTML(a){
 function affairUnits(){
   const out=[];
   (state.affairs||[]).forEach(function(a){
-    if(a.doneAt)return;
+    if(a.doneAt||a.archived)return;
     const steps=affairSteps(a);
     const timed=[];
     steps.forEach(function(s,i){if(!s.doneAt&&s.plannedAt)timed.push({kind:'step',affair:a,step:s,index:i,ts:s.plannedAt});});
@@ -4008,7 +4734,12 @@ function affairCanUndo(a){const s=(state.affairUndo&&state.affairUndo[a.id]);ret
 function affairPushUndo(a){
   if(!state.affairUndo)state.affairUndo={};
   const stack=state.affairUndo[a.id]||(state.affairUndo[a.id]=[]);
-  stack.push({cell:a.currentCell||0,given:a.alreadyGiven||0,doneAt:a.doneAt||null,startedAt:a.startedAt||null});
+  // 步骤完成态也要进快照：只存 currentCell/alreadyGiven 无法回退 s.doneAt，
+  // 撤销后步骤仍显示已完成，与项目进度不一致。
+  stack.push({
+    cell:a.currentCell||0,given:a.alreadyGiven||0,doneAt:a.doneAt||null,startedAt:a.startedAt||null,
+    steps:(a.steps||[]).map(function(s){return s?{doneAt:s.doneAt||null}:null;})
+  });
   if(stack.length>AFFAIR_UNDO_LIMIT)stack.shift();
 }
 function affairUndoAction(id){
@@ -4024,32 +4755,45 @@ function affairUndoAction(id){
       Ledger.grant('achievement',-a.ach.amount,{src:'affair',desc:'撤销项目「'+a.name+'」成果点',affairId:a.id});
     }
     a.currentCell=snap.cell;a.alreadyGiven=snap.given;a.doneAt=snap.doneAt;a.startedAt=snap.startedAt;
+    if(Array.isArray(snap.steps)&&Array.isArray(a.steps)){
+      a.steps.forEach(function(s,i){if(s&&snap.steps[i])s.doneAt=snap.steps[i].doneAt;});
+    }
   },{label:'affair-undo',save:'none',render:false});
   if(!txr.ok)return;
   commit('已撤销「'+a.name+'」');
 }
 
 function _completeAffairStep(a,s){
-  affairPushUndo(a);
-  s.doneAt=now();
-  const steps=affairSteps(a);
-  const allDone=steps.every(function(x){return x.doneAt;});
-  affairApplyProgress(a,allDone?9:Math.min(8,(a.currentCell||0)+1));
+  // 步骤完成态与进度结算必须同生共死：任何一笔发放失败时，s.doneAt 也不能留下
+  const txr=Ledger.txn(function(){
+    affairPushUndo(a);
+    s.doneAt=now();
+    const steps=affairSteps(a);
+    const allDone=steps.every(function(x){return x.doneAt;});
+    affairApplyProgress(a,allDone?9:Math.min(8,(a.currentCell||0)+1));
+  },{label:'affair-step',save:'none',render:false});
+  if(!txr.ok)return;
   commit();
 }
 function advanceAffairStep(id){
   const a=state.affairs.find(function(x){return x.id===id;});
   if(!a||a.doneAt)return;
   const next=affairSteps(a).find(function(s){return !s.doneAt;});
-  if(!next){affairPushUndo(a);affairApplyProgress(a,9);commit();return;}
+  if(!next){
+    // 快照必须在事务内压栈：发放失败回滚时连 undo 栈一起还原，避免留下无效快照
+    const txr=Ledger.txn(function(){affairPushUndo(a);affairApplyProgress(a,9);},{label:'affair-complete',save:'none',render:false});
+    if(!txr.ok)return;
+    commit();
+    return;
+  }
   _completeAffairStep(a,next);
 }
 function completeAffair(id){
   const a=state.affairs.find(function(x){return x.id===id;});
   if(!a)return;
   if(a.doneAt){toast('该项目已完成','warn');return;}
-  affairPushUndo(a);
-  affairApplyProgress(a,9);
+  const txr=Ledger.txn(function(){affairPushUndo(a);affairApplyProgress(a,9);},{label:'affair-complete',save:'none',render:false});
+  if(!txr.ok)return;
   commit();
 }
 function completeAffairStep(id,idx){
@@ -4223,6 +4967,14 @@ function delAffair(id){
   toast('项目已删除');
   render();
 }
+// 恢复被规则归档的项目（归档是可逆状态，不消耗资产）
+function restoreAffair(id){
+  const a=state.affairs.find(function(x){return x.id===id;});
+  if(!a||!a.archived)return;
+  a.archived=false;delete a.archivedAt;
+  Ledger.event('恢复项目「'+a.name+'」','affair-restore',{affairId:a.id});
+  commit('已恢复项目「'+a.name+'」');
+}
 
 function renderAffairSteps(){
   const cont=document.getElementById('affairSteps');
@@ -4343,7 +5095,7 @@ function choreTierRate(count,cfg){
 }
 function choreDailyDecay(count,cfg){return round2(count*choreTierRate(count,cfg));}
 function choreUnsettled(){
-  return (state.chores||[]).filter(function(c){return c.done&&!c.settled;});
+  return (state.chores||[]).filter(function(c){return c.done&&!c.settled&&!c.archived;});
 }
 // 批量结算：每 N 件已完成且未结算的杂事发放 Y 活力点（可一次结算多批）
 function settleChoreBatches(silent=false){
@@ -4353,9 +5105,10 @@ function settleChoreBatches(silent=false){
   const batches=Math.floor(pool.length/need);
   if(batches<=0)return 0;
   const used=pool.slice(0,batches*need);
-  used.forEach(function(c){c.settled=true;});
   const gain=round2(batches*cfg.batchY);
   const txr=Ledger.txn(function(){
+    // 标记已结算必须与发放入账同一事务：发放失败时不能把杂事吞成“已结算”
+    used.forEach(function(c){c.settled=true;});
     if(gain>0){
       const target=round2((state.scores.vitality||0)+gain);
       Ledger.post({op:'adjust',account:'vitality',target:target,entry:{st:'vitality',amt:gain,desc:'杂事批量结算：'+used.length+' 件',src:'chore-batch',dom:''},reason:{src:'chore-batch'}});
@@ -4373,7 +5126,7 @@ function computeChoreDecay(){
   if(!chores.length)return {total:0,charged:0,dueDays:0,overdue:[],today:dayStartTs(now())};
   const cfg=choreCfg();
   const today=dayStartTs(now());
-  const overdue=chores.filter(function(c){return !c.done&&choreOverdueDays(c)>0;});
+  const overdue=chores.filter(function(c){return !c.done&&!c.archived&&choreOverdueDays(c)>0;});
   if(!overdue.length)return {total:0,charged:0,dueDays:0,overdue:[],today:today};
   const rate=choreTierRate(overdue.length,cfg);
   let total=0,dueDays=0,charged=0;
@@ -4400,7 +5153,7 @@ function processChoreDecay(silent=false){
     const target=round2((state.scores.vitality||0)-r.total);
     Ledger.post({op:'adjust',account:'vitality',target:target,entry:{st:'vitality',amt:-r.total,desc:'杂事腐化债：'+r.charged+' 件超期，累计 '+r.dueDays+' 天',src:'chore-decay',dom:''},reason:{src:'chore-decay'}});
     r.overdue.forEach(function(c){c.decayKey=dayKey(r.today);});
-  },{label:'chore-decay',save:silent?'none':'debounce',render:false});
+  },{label:'chore-decay',save:silent?'none':undefined,render:false});
   return txr.ok?r.total:0;
 }
 function addChoreFromInput(){
@@ -4454,18 +5207,20 @@ function renderChores(){
   if(!panel)return;
   const chores=state.chores||[];
   const cfg=choreCfg();
-  const todo=chores.filter(function(c){return !c.done;}).sort(function(a,b){
+  const visible=chores.filter(function(c){return !c.archived;});
+  const archived=chores.filter(function(c){return c.archived;});
+  const todo=visible.filter(function(c){return !c.done;}).sort(function(a,b){
     const ap=a.plannedAt||9e15,bp=b.plannedAt||9e15;
     return ap-bp||((b.createdAt||0)-(a.createdAt||0));
   });
-  const done=chores.filter(function(c){return c.done;}).sort(function(a,b){return (b.doneAt||0)-(a.doneAt||0);});
+  const done=visible.filter(function(c){return c.done;}).sort(function(a,b){return (b.doneAt||0)-(a.doneAt||0);});
   const unsettled=choreUnsettled().length;
   const need=Math.max(1,Math.round(cfg.batchN));
   const rem=unsettled%need;
   const next=rem===0?need:need-rem;
   const readyBatches=Math.floor(unsettled/need);
   const meta=document.getElementById('choreMeta');
-  if(meta)meta.textContent=chores.length?('待办 '+todo.length+' · 已完成 '+done.length):'';
+  if(meta)meta.textContent=chores.length?('待办 '+todo.length+' · 已完成 '+done.length+(archived.length?' · 已归档 '+archived.length:'')):'';
   let html='<div class="chore-econ-bar">'
     +'<span>单件不发放活力 · 每完成 <b>'+need+'</b> 件 → <b>+'+fmt(cfg.batchY)+'</b> 活力</span>'
     +'<span>'+(readyBatches>0
@@ -4481,7 +5236,30 @@ function renderChores(){
       +'<div class="affair-zone-body">'+done.map(choreCardHTML).join('')+'</div>'
       +'</div>';
   }
+  if(archived.length){
+    const collapsed=!choreArchivedOpen;
+    html+='<div class="affair-zone'+(collapsed?' collapsed':'')+'" id="chore-zone-archived">'
+      +'<div class="affair-zone-title" onclick="toggleChoreArchivedZone()">'
+      +'<span class="coll-toggle">▼</span>已归档 <span class="affair-zone-count">'+archived.length+'</span></div>'
+      +'<div class="affair-zone-body">'
+      +archived.map(function(c){
+        return '<div class="card chore-card" style="opacity:.7">'
+          +'<div class="chore-row"><div class="chore-main"><span class="chore-name">'+esc(c.name)+'</span></div>'
+          +'<div class="chore-actions"><span class="chore-time">归档于 '+(c.archivedAt?fmtTime(c.archivedAt):'—')+'</span>'
+          +'<button class="btn btn-sm" onclick="restoreChore(\''+c.id+'\')">恢复</button></div></div>'
+          +'</div>';
+      }).join('')
+      +'</div></div>';
+  }
   panel.innerHTML=html;
+}
+function toggleChoreArchivedZone(){choreArchivedOpen=!choreArchivedOpen;renderChores();}
+function restoreChore(id){
+  const c=(state.chores||[]).find(function(x){return x.id===id;});
+  if(!c||!c.archived)return;
+  c.archived=false;delete c.archivedAt;
+  Ledger.event('恢复杂事「'+c.name+'」','chore-restore',{choreId:c.id});
+  commit('已恢复杂事「'+c.name+'」');
 }
 // 杂事编辑：名称、可选日期、可选覆盖保鲜期
 function toDateInputValue(ts){
@@ -4663,7 +5441,7 @@ function taskCardHTML(t,collId){
 
   // Exemption card eligibility
   const todayStart=new Date();todayStart.setHours(0,0,0,0);
-  const checkedToday=!!(t.lastCheckIn&&new Date(t.lastCheckIn)>=todayStart);
+  const checkedToday=taskCheckedToday(t);
   const exemptToday=!!(t.lastExempt&&new Date(t.lastExempt)>=todayStart);
   const cards=(state.cards&&state.cards.exemption)||0;
   const exAct=exemptionActivity();
@@ -4674,7 +5452,9 @@ function taskCardHTML(t,collId){
     ?'<button class="btn btn-sm btn-exempt" title="剩余豁免卡 '+cards+' 张" onclick="useExemption(\''+t.id+'\')">豁免·'+exemptLabel+'</button>'
     :'';
 
-  const checkinBtn='<button class="btn btn-sm btn-checkin" onclick="checkIn(\''+t.id+'\')" '+(cost>0&&state.scores.vitality<cost?'title="活力点不足，将进入负值（贷款）"':'')+'>打卡</button>';
+  const checkinBtn=checkedToday
+    ?'<button class="btn btn-sm btn-checkin" disabled title="今日已打卡，明天再来">今日已打卡</button>'
+    :'<button class="btn btn-sm btn-checkin" onclick="checkIn(\''+t.id+'\')" '+(cost>0&&state.scores.vitality<cost?'title="活力点不足，将进入负值（贷款）"':'')+'>打卡</button>';
   return '<div class="card task-card" data-task-id="'+t.id+'" data-coll-id="'+(collId||'')+'">'
     +'<div class="task-row">'
     +'<div class="task-title-wrap">'
@@ -4864,13 +5644,14 @@ function renderBank(){
     lb.style.display='none';
   }
 
-  // Stats
-  const vIn=sumLog('vitality',true),vOut=sumLog('vitality',false);
-  const pIn=sumLog('progress',true);
-  const aIn=sumLog('achievement',true),aOut=sumLog('achievement',false);
-  const totalCI=state.tasks.reduce((s,t)=>s+(t.checkInCount||0),0);
+  // Stats：全部读 ext.stats 生命周期计数器（不再扫 state.logs，日志截断后仍稳定）
+  const stat=state.ext.stats;
+  const vIn=Number(stat.lifetimeVitalityIn)||0,vOut=-(Number(stat.lifetimeVitalityOut)||0);
+  const pIn=Number(stat.lifetimeProgressIn)||0;
+  const aIn=Number(stat.lifetimeAchievementIn)||0,aOut=-(Number(stat.lifetimeAchievementOut)||0);
+  const totalCI=Number(stat.totalCheckins)||0;
   const unlocked=state.achievements.filter(a=>a.unlocked).length;
-  const purchases=state.logs.filter(l=>l.src==='purchase').length;
+  const purchases=Number(stat.totalPurchases)||0;
 
   const vIncomeEl=document.getElementById('vIncome');
   vIncomeEl.textContent=fmt(vIn);
@@ -4942,9 +5723,16 @@ function renderBank(){
       const isBoth=l.st==='both';
       const cls=l.amt>0?'pos'+(isBoth||l.st==='progress'?' p':l.st==='achievement'?' a':''):l.amt<0?'neg':'zero';
       const dotCls=isBoth?'p':l.st==='vitality'?'v':l.st==='progress'?'p':l.st==='achievement'?'a':'s';
-      const sign=l.amt>0?'+':'';
-      const amtTxt=l.amt!==0?sign+fmt(l.amt):'—';
-      const unit=isBoth?' 活力+进度':l.st==='vitality'?' 活力':l.st==='progress'?' 进度':l.st==='achievement'?' 成果':'';
+      let amtTxt='',unit='';
+      if(isBoth){
+        // both 型打卡两个分值可能不同：分别显示，避免只看净活力误解进度收入
+        const av=logAmt(l,'vitality'),ap=logAmt(l,'progress');
+        amtTxt=(av>0?'+':'')+fmt(av)+' 活力 / '+(ap>0?'+':'')+fmt(ap)+' 进度';
+      }else{
+        const sign=l.amt>0?'+':'';
+        amtTxt=l.amt!==0?sign+fmt(l.amt):'—';
+        unit=l.st==='vitality'?' 活力':l.st==='progress'?' 进度':l.st==='achievement'?' 成果':l.st==='card'?' 张':'';
+      }
       const canUndo=undoableSrc.includes(l.src);
       return '<div class="log-item">'
         +'<div class="log-dot '+dotCls+'"></div>'
@@ -4955,10 +5743,38 @@ function renderBank(){
         +'</div>';
     }).join('');
   }
-}
 
-function sumLog(st,pos){
-  return state.logs.filter(l=>logHasType(l,st)&&(pos?logAmt(l,st)>0:logAmt(l,st)<0)).reduce((s,l)=>s+logAmt(l,st),0);
+  renderShadowList();
+}
+// 余额调整记录：visible:false 的账户增减在这里留痕（贷款放款、撤销、活动回收、删除搬运、重算等）
+function toggleShadowList(){
+  const el=document.getElementById('shadowList');
+  if(!el)return;
+  el.style.display=el.style.display==='none'?'block':'none';
+}
+function renderShadowList(){
+  const el=document.getElementById('shadowList');
+  const meta=document.getElementById('shadowMeta');
+  if(!el)return;
+  const list=(state.ext&&Array.isArray(state.ext.shadow))?state.ext.shadow:[];
+  if(meta)meta.textContent=list.length?(list.length+' 条'):'暂无';
+  if(!list.length){
+    el.innerHTML='<div class="empty" style="padding:16px"><p style="margin:0">暂无余额调整（贷款、撤销、活动回收等会记录在这里）</p></div>';
+    return;
+  }
+  el.innerHTML=list.map(function(r){
+    const d=Number(r.delta)||0;
+    const unit=r.acct==='vitality'?' 活力':r.acct==='achievement'?' 成果':r.acct.indexOf('progress:')===0?' 进度':r.acct.indexOf('card:')===0?' 张':'';
+    const amt=(d>0?'+':'')+fmt(d)+unit;
+    const cls=d>0?'pos':d<0?'neg':'zero';
+    const range=(r.before!==null&&r.before!==undefined)?(' · '+fmt(r.before)+' → '+fmt(r.after)):'';
+    return '<div class="log-item">'
+      +'<div class="log-dot s"></div>'
+      +'<div class="log-desc">'+esc(r.label||shadowLabel(r.src,''))+'<span style="color:var(--text-3);font-size:11px"> · '+esc(accountLabel(r.acct||''))+range+'</span></div>'
+      +'<div class="log-amt '+cls+'">'+amt+'</div>'
+      +'<div class="log-time">'+fmtTime(r.ts)+'</div>'
+      +'</div>';
+  }).join('');
 }
 
 // ===== Chart state & interactivity =====
@@ -5016,26 +5832,30 @@ function drawChart(){
   const gridColor=cssVar('--border','#e0e0e0');
   const labelColor=cssVar('--text-3','#aaa');
   const zeroColor=cssVar('--border-2','#ccc');
-  // 一次遍历日志按天分桶（每类每天净额）；累计模式再做前缀和，避免 O(3×7×logs) 反复扫描
+  // 统计日桶一次遍历（每类每天净额）；累计模式再做前缀和，不再扫描 state.logs
   const windowStart=dayStart[0];
   const windowEnd=dayEnd[days-1];
   const before={};
   const daily={};
   types.forEach(type=>{before[type]=0;daily[type]=new Array(days).fill(0);});
-  state.logs.forEach(l=>{
-    const t=l.time;
-    if(t>=windowEnd)return;
-    if(t<windowStart){
-      types.forEach(type=>{if(logHasType(l,type))before[type]+=logAmt(l,type);});
-      return;
-    }
-    for(let i=days-1;i>=0;i--){
-      if(t>=dayStart[i]){
-        types.forEach(type=>{if(logHasType(l,type))daily[type][i]+=logAmt(l,type);});
+  const dayIndex={};
+  dayStart.forEach(function(ts,i){dayIndex[dayKey(ts)]=i;});
+  const typeKey={vitality:'v',progress:'p',achievement:'a'};
+  const st=state.ext&&state.ext.stats;
+  if(st&&st.daily){
+    const startKey=dayKey(windowStart);
+    Object.keys(st.daily).forEach(function(k){
+      const b=st.daily[k];
+      if(!b)return;
+      if(k<startKey){
+        types.forEach(type=>{before[type]+=Number(b[typeKey[type]])||0;});
         return;
       }
-    }
-  });
+      const i=dayIndex[k];
+      if(i===undefined)return;
+      types.forEach(type=>{daily[type][i]+=Number(b[typeKey[type]])||0;});
+    });
+  }
   const series={};
   types.forEach(type=>{
     series[type]=[];
@@ -5124,12 +5944,10 @@ function drawVitalityFlowChart(){
   const produceData=[],investData=[],consumeData=[];
   weekRanges.forEach(wr=>{
     let prod=0,inv=0,cons=0;
-    state.logs.forEach(l=>{
-      if(l.time>=wr.start&&l.time<wr.end){
-        if(l.src==='checkin'&&(l.st==='vitality'||l.st==='both')&&logAmt(l,'vitality')>0)prod+=logAmt(l,'vitality');
-        else if(l.src==='cost'&&l.amt<0)inv+=Math.abs(l.amt);
-        else if(l.src==='purchase'&&l.st==='vitality'&&l.amt<0)cons+=Math.abs(l.amt);
-      }
+    eachStatsBucket(wr.start,wr.end,function(b){
+      prod+=Number(b.prod)||0;
+      inv+=Number(b.inv)||0;
+      cons+=Number(b.cons)||0;
     });
     produceData.push(prod);
     investData.push(inv);
@@ -5507,9 +6325,6 @@ function budgetPeriodLabel(cat,b){
   if(cat.cycle==='month')return (d1.getMonth()+1)+'月（'+d1.getFullYear()+'）';
   return (d1.getMonth()+1)+'/'+d1.getDate()+' - '+(d2.getMonth()+1)+'/'+d2.getDate();
 }
-function budgetRuleCount(cat,kind){
-  return (cat.rules||[]).filter(function(r){return r.kind===kind;}).length;
-}
 function budgetCatCardHTML(cat,ts){
   const r=BudgetEngine.readPeriod(cat,ts);
   const p=r.period||{spent:0,entryCount:0,topupAmount:0,topupCost:0,penalizedOverspend:0,rewardSettled:false};
@@ -5527,7 +6342,7 @@ function budgetCatCardHTML(cat,ts){
   html+='<button class="btn btn-sm" onclick="openBudgetCatModal(\''+escAttr(cat.id)+'\')">编辑</button>';
   html+='<button class="btn btn-sm" onclick="confirmDelBudgetCategory(\''+escAttr(cat.id)+'\')">删除</button>';
   html+='</div></div>';
-  html+='<div class="bg-sub">'+(cat.cycle==='week'?'每周':'每月')+' · '+budgetPeriodLabel(cat,r.b)+' · '+rules.length+' 条规则'+(reward?' · 含结余奖励':'')+'</div>';
+  html+='<div class="bg-sub">'+(cat.cycle==='week'?('每周（'+weekAnchorName(cat.anchor)+'起）'):'每月')+' · '+budgetPeriodLabel(cat,r.b)+' · '+rules.length+' 条规则'+(reward?' · 含结余奖励':'')+'</div>';
   html+='<div class="bg-nums"><span>已花 <b>'+fmt(spent)+'</b></span><span>额度 <b>'+fmt(eff)+'</b>'+(p.topupAmount?'（基础 '+fmt(cat.limit)+' + 扩容 '+fmt(p.topupAmount)+'）':'')+'</span><span>剩余 <b>'+fmt(remain)+'</b></span><span>本期 '+fmt(p.entryCount||0)+' 笔</span></div>';
   html+='<div class="bg-bar"><div class="bg-bar-fill'+(over?' danger':'')+'" style="width:'+pct+'%"></div></div>';
   html+='<div class="bg-foot">';
@@ -5573,10 +6388,15 @@ function budgetLedgerHTML(){
   }).join('');
 }
 function renderBudget(){
-  setScoreCell('bVitality',state.scores.vitality);
-  setScoreCell('bAchievement',state.scores.achievement);
   const cats=BudgetEngine.categories();
   const ts=now();
+  const notice=document.getElementById('budgetAnchorNotice');
+  if(notice){
+    const n=BudgetEngine.settings().anchorNotice;
+    notice.innerHTML=(n&&n.name)
+      ?'<div class="card" style="margin-bottom:10px;padding:10px 12px;display:flex;gap:10px;align-items:center;justify-content:space-between"><div style="font-size:13px;line-height:1.5">「'+esc(n.name)+'」的周起始日已从 <b>'+weekAnchorName(n.from)+'</b> 改为 <b>'+weekAnchorName(n.to)+'</b>：旧账期已保留（已花金额不丢失），新账期从 0 开始。</div><button class="btn btn-sm" onclick="dismissBudgetAnchorNotice()">知道了</button></div>'
+      :'';
+  }
   let totalLimit=0,totalSpent=0;
   cats.forEach(function(c){
     const r=BudgetEngine.readPeriod(c,ts);
@@ -5608,12 +6428,11 @@ function fillBudgetDomainSelect(selected){
   }).join('');
 }
 function budgetRuleDefault(kind){
-  const base=kind==='penalty'?'overspendDelta':(kind==='reward'?'periodSurplus':'entryAmount');
   const rule={
     id:uid(),kind:kind,enabled:true,priority:budDraftRules.length+1,
     when:{mode:'all',items:[]},
     target:{account:kind==='feedback'?'progress':(kind==='penalty'?'vitality':'achievement'),domainId:''},
-    params:{mode:kind==='penalty'?'ratio':'ratio',value:10,rate:kind==='penalty'?1:(kind==='reward'?0.1:1),base:base,capPerPeriod:null,minAmount:0,per:'episode'}
+    params:{mode:'ratio',value:10,rate:kind==='penalty'?1:(kind==='reward'?0.1:1),capPerPeriod:null,minAmount:0,per:'episode'}
   };
   if(kind==='penalty'){
     rule.when.items=[{range:'period',metric:'budget_period_overspend',op:'>',value:0,targetType:'all',target:'',newFilter:'none',aggregate:'sum'}];
@@ -5765,7 +6584,6 @@ function budRuleKindChanged(idx,kind){
   if(!r)return;
   const def=budgetRuleDefault(kind);
   r.kind=kind;
-  r.params.base=def.params.base;
   r.params.per=def.params.per;
   if(r.params.mode==='ratio'&&r.params.rate<=0)r.params.rate=def.params.rate;
   if(kind==='reward')r.params.mode='ratio';
@@ -5809,6 +6627,8 @@ function openBudgetCatModal(id){
   if(title)title.textContent=cat?'编辑预算分类':'新建预算分类';
   document.getElementById('budgetCatName').value=cat?cat.name:'';
   document.getElementById('budgetCatCycle').value=cat?cat.cycle:'week';
+  document.getElementById('budgetCatAnchor').value=String(cat?(cat.anchor||1):1);
+  syncBudgetAnchorVisibility();
   document.getElementById('budgetCatLimit').value=cat?cat.limit:300;
   document.getElementById('budgetCatEnabled').checked=cat?cat.enabled!==false:true;
   fillBudgetDomainSelect(cat?cat.defaultProgressDomainId:'');
@@ -5822,10 +6642,23 @@ function openBudgetCatModal(id){
   openModal('budgetCatModal');
   setTimeout(function(){document.getElementById('budgetCatName').focus();},50);
 }
+function syncBudgetAnchorVisibility(){
+  const cycleEl=document.getElementById('budgetCatCycle');
+  const wrap=document.getElementById('budgetCatAnchorWrap');
+  if(!cycleEl||!wrap)return;
+  wrap.style.display=cycleEl.value==='week'?'':'none';
+}
+function dismissBudgetAnchorNotice(){
+  const s=BudgetEngine.settings();
+  s.anchorNotice=null;
+  save();
+  renderBudget();
+}
 function saveBudgetCategory(){
   collectBudgetRulesFromDOM();
   const name=document.getElementById('budgetCatName').value.trim();
   const cycle=document.getElementById('budgetCatCycle').value==='month'?'month':'week';
+  const anchor=Math.min(7,Math.max(1,Math.round(Number(document.getElementById('budgetCatAnchor').value)||1)));
   const limit=Number(document.getElementById('budgetCatLimit').value);
   const enabled=document.getElementById('budgetCatEnabled').checked;
   const did=document.getElementById('budgetCatDefaultDomain').value;
@@ -5849,18 +6682,52 @@ function saveBudgetCategory(){
   }
   const bd=state.ext.budgets;
   const old=budEditingId?BudgetEngine.category(budEditingId):null;
+  // 周期从周切到月（或反向）时，周期键前缀不同（W: / M:），已花金额无法无损换算；
+  // 周起始日变化会让“当前周”的键变化，同样无法把旧账期无损映射到新账期。
+  // 两种变更都采用「显式开启新账期」：先结清已经自然结束的旧周期，再把剩余旧周期只读归档，
+  // 新周期从 0 开始。旧账期本身不删除，已花金额完整保留在历史周期里。
+  const cycleChanged=!!(old&&old.cycle!==cycle);
+  const anchorChanged=!!(old&&!cycleChanged&&old.cycle==='week'&&Number(old.anchor||1)!==anchor);
+  if(anchorChanged){
+    const ok=confirm('将「'+old.name+'」的周起始日从 '+weekAnchorName(old.anchor)+' 改为 '+weekAnchorName(anchor)+'？\n\n旧账期会完整保留（已花金额不丢失）；新账期从 0 开始。');
+    if(!ok)return;
+  }
+  if(cycleChanged||anchorChanged){
+    BudgetEngine.reconcileDue(old.id,now());
+    const map=bd.periods[old.id]||{};
+    Object.keys(map).forEach(function(k){
+      const p=map[k];
+      if(!p)return;
+      if(!p.rewardSettled){
+        p.rewardSettled=true;
+        p.settlementSnapshot=Object.assign({},p.settlementSnapshot||{},{
+          reason:cycleChanged?'cycle-change':'anchor-change',cycle:old.cycle,anchor:old.anchor||1,
+          spent:round4(Number(p.spent)||0),overspend:BudgetEngine.overspendOf(old,p)
+        });
+      }
+      p.closedAt=p.end;
+    });
+    delete bd.current[old.id];
+  }
   const cat={
     id:budEditingId||uid(),name:name.slice(0,40),enabled:enabled,archived:old?!!old.archived:false,
-    cycle:cycle,limit:round4(limit),defaultProgressDomainId:did,
+    cycle:cycle,anchor:anchor,limit:round4(limit),defaultProgressDomainId:did,
     rules:JSON.parse(JSON.stringify(budDraftRules)).sort(function(a,b){return (a.priority||0)-(b.priority||0);}),
     overdraft:{enabled:odEnabled,currency:odCurrency,rate:Math.max(0.0001,odRate),maxRealityPerPeriod:Math.max(0,round4(odMaxReality)),maxCostPerPeriod:Math.max(0,round4(odMaxCost))},
     createdAt:old?old.createdAt:now(),updatedAt:now()
   };
   const idx=bd.categories.findIndex(function(c){return c.id===cat.id;});
   if(idx>=0)bd.categories[idx]=cat;else bd.categories.push(cat);
+  if(anchorChanged){
+    bd.settings.anchorNotice={categoryId:cat.id,name:cat.name,from:Number(old.anchor||1),to:anchor,at:now()};
+    Ledger.event('预算分类「'+cat.name+'」周起始日 '+weekAnchorName(old.anchor)+' → '+weekAnchorName(anchor)+'，旧账期已归档','budget-anchor',{categoryId:cat.id});
+  }else if(cycleChanged){
+    bd.settings.anchorNotice=null;
+  }
   save();render();
   closeModal('budgetCatModal');
-  toast(old?'预算分类已更新':'预算分类已创建');
+  toast(old?(cycleChanged?'预算分类已更新：旧账期已归档，新账期从 0 开始'
+    :(anchorChanged?'周起始日已改为'+weekAnchorName(anchor)+'：旧账期保留，新账期从 0 开始':'预算分类已更新')):'预算分类已创建');
 }
 function confirmDelBudgetCategory(id){
   const cat=BudgetEngine.category(id);
@@ -5886,8 +6753,8 @@ function openQuickRecordModal(catId){
   sel.innerHTML=cats.map(function(c){
     return '<option value="'+escAttr(c.id)+'">'+esc(c.name)+'</option>';
   }).join('');
-  const def=cats.some(function(c){return c.id===catId;})?catId:(BudgetEngine.settings().quickRecordDefaultCategoryId||cats[0].id);
-  sel.value=cats.some(function(c){return c.id===def;})?def:cats[0].id;
+  const def=(catId&&cats.some(function(c){return c.id===catId;}))?catId:cats[0].id;
+  sel.value=def;
   document.getElementById('qrAmount').value='';
   document.getElementById('qrNote').value='';
   qrUseTopup=false;
@@ -6050,15 +6917,38 @@ const COND_METRICS=[
   {v:'budget_entry_amount',n:'本笔金额'},
   {v:'budget_period_spent',n:'本周期已花'},
   {v:'budget_period_overspend',n:'本周期超支'},
-  {v:'budget_entry_count',n:'本周期笔数'}
+  {v:'budget_entry_count',n:'本周期笔数'},
+  {v:'task_idle',n:'任务不活跃天数'},
+  {v:'affair_completed',n:'项目完成数'},
+  {v:'affair_steps',n:'项目推进步数'},
+  {v:'affair_stall',n:'项目停滞天数'},
+  {v:'affair_progress',n:'项目进度值'},
+  {v:'affair_achievement',n:'项目成果点'},
+  {v:'chore_completed',n:'杂事完成数'},
+  {v:'chore_overdue',n:'杂事超期件数'},
+  {v:'chore_decay',n:'杂事腐化值'},
+  {v:'chore_batches',n:'杂事结算次数'},
+  {v:'chore_idle',n:'杂事不活跃天数'},
+  {v:'lifetime_achievement',n:'累计获得成果点'},
+  {v:'domain_activity',n:'领域活跃次数'},
+  {v:'milestone_unlocked',n:'里程碑已解锁'},
+  {v:'checkin_streak',n:'连续打卡天数'},
+  {v:'budget_remaining',n:'预算剩余'}
 ];
-const COND_TARGET_TYPES=[{v:'all',n:'全部'},{v:'domain',n:'按领域'},{v:'task',n:'按任务'}];
+const COND_TARGET_TYPES=[{v:'all',n:'全部'},{v:'domain',n:'按领域'},{v:'task',n:'按任务'},{v:'milestone',n:'按里程碑'},{v:'budget',n:'按预算分类'}];
 const COND_NEW_FILTERS=[{v:'none',n:'当前'},{v:'new_task',n:'本周期新增任务'},{v:'new_domain',n:'本周期新增领域'}];
 const COND_AGGREGATES=[{v:'sum',n:'总计'},{v:'any',n:'任意单个'}];
 // 主体类型：成果点仅全部；计数类(新增任务/新增领域)支持全部+领域；值类(打卡/活力/进度)支持全部+领域+任务
+// 阶段 1：项目类支持全部+领域；杂事类仅全部；任务不活跃支持全部+领域+任务
 function condTargetTypesFor(metric){
-  if(metric==='achievement'||metric.indexOf('budget_')===0)return ['all'];
+  if(metric==='achievement'||metric==='lifetime_achievement')return ['all'];
+  if(metric==='milestone_unlocked')return ['milestone'];
+  if(metric==='budget_remaining')return ['budget'];
+  if(metric==='domain_activity')return ['domain'];
+  if(metric.indexOf('budget_')===0)return ['all'];
   if(metric==='new_tasks'||metric==='new_domains')return ['all','domain'];
+  if(isChoreMetric(metric))return ['all'];
+  if(isAffairMetric(metric))return ['all','domain'];
   return ['all','domain','task'];
 }
 // 新增筛选选项（仅值类指标；按主体限制可用项）
@@ -6094,6 +6984,14 @@ function condScopePhrase(it){
   if(it.newFilter==='new_domain')return '新增领域';
   if(it.targetType==='domain'&&t)return domainName(t);
   if(it.targetType==='task'&&t)return taskNameLabel(t);
+  if(it.targetType==='milestone'&&t){
+    const a=(state.achievements||[]).find(x=>x.id===t);
+    return a?a.name:'（里程碑已删除）';
+  }
+  if(it.targetType==='budget'&&t){
+    const c=BudgetEngine.category(t);
+    return c?c.name:'（预算分类已删除）';
+  }
   return '';
 }
 function metricLabel(it){
@@ -6114,6 +7012,7 @@ function rangeTimeWord(it,act){
 }
 function condItemLabel(it){
   if(!it)return '';
+  if(isPointMetric(it.metric))return metricLabel(it)+' '+opLabel(it.op)+' '+fmt(it.value);
   return rangeLabel(it.range,it.days)+' · '+metricLabel(it)+' '+opLabel(it.op)+' '+fmt(it.value);
 }
 function condNodeLabel(node){
@@ -6124,6 +7023,8 @@ function condNLLeaf(it,act){
   const rw=rangeTimeWord(it,act);
   const mn=metricNameLabel(it);
   const tail=' '+opLabel(it.op)+' '+fmt(it.value);
+  // 点态指标没有时间窗口：直接“主体·指标 ≥ N”
+  if(isPointMetric(it.metric))return (condScopePhrase(it)?condScopePhrase(it)+'·':'')+mn+tail;
   if(it.metric==='achievement')return rw+mn+tail;
   const scope=condScopePhrase(it);
   const ew=condEntityWord(it);
@@ -6145,6 +7046,10 @@ function condNLNode(node,act){
 }
 function rewardItemLabel(it){
   if(!it)return '';
+  if(it.type==='archive'){
+    const ent=it.entity==='affair'?'项目':it.entity==='chore'?'杂事':'任务';
+    return '归档不活跃≥'+(it.idleDays||14)+'天的'+ent;
+  }
   if(it.type==='card')return cardName(it.card||'exemption')+' ×'+(it.amount||0)+(it.cap?'（上限'+(it.cap||0)+'）':'');
   if(it.type==='progress'){
     if(it.domainId)return domainName(it.domainId)+'进度 +'+fmt(it.amount);
@@ -6169,6 +7074,16 @@ function readRewardItems(){
   const rewardItems=[];
   document.querySelectorAll('#activityResultDetails .reward-row').forEach(row=>{
     const type=row.querySelector('.rr-type').value;
+    if(type==='archive'){
+      const entSel=row.querySelector('.rr-entity');
+      const idleInp=row.querySelector('.rr-idle');
+      rewardItems.push({
+        type:'archive',
+        entity:entSel?entSel.value:'task',
+        idleDays:Math.max(1,Math.round(Number(idleInp&&idleInp.value)||14))
+      });
+      return;
+    }
     const amount=Math.max(0,Number(row.querySelector('.rr-amount').value)||0);
     if(amount<=0&&type!=='card')return;
     if(type==='card'){
@@ -6207,8 +7122,15 @@ function updateCondPreview(){
   if(!items.length)condTxt='无条件触发';
   else condTxt=items.map(n=>condNLNode(n,actLike)).join(mode==='any'?' 或 ':' 且 ');
   const rewards=readRewardItems();
-  const resTxt=rewards.length?rewards.map(rewardItemLabel).join('、'):'（未设置奖励）';
-  el.innerHTML='<span class="cp-badge">预览</span>'+esc(when)+'，若 '+esc(condTxt)+'，则发放 '+esc(resTxt)+'。';
+  let resTxt=rewards.length?rewards.map(rewardItemLabel).join('、'):'（未设置动作）';
+  // 结构操作在配置时就给出当前命中数量：让用户确认“触发会发生什么”
+  const arch=rewards.filter(r=>r.type==='archive');
+  if(arch.length){
+    let hit=0;
+    arch.forEach(r=>{hit+=archiveIdleEntities(r.entity,r.idleDays,Date.now(),'',true);});
+    resTxt+='（按当前状态将归档 '+hit+' 个）';
+  }
+  el.innerHTML='<span class="cp-badge">预览</span>'+esc(when)+'，若 '+esc(condTxt)+'，则 '+esc(resTxt)+'。';
 }
 function openActivityModal(id){
   const a=id?state.activities.find(x=>x.id===id):null;
@@ -6260,7 +7182,7 @@ function updateActivitySummary(){
   const resSum=document.getElementById('accResultSum');
   if(resSum&&resBox){
     const n=resBox.querySelectorAll('.reward-row').length;
-    resSum.textContent=n?(n+' 项奖励'):'未设置';
+    resSum.textContent=n?(n+' 项动作'):'未设置';
   }
 }
 // ===== 条件芯片编辑器（嵌套条件组 + 点选面板）=====
@@ -6461,6 +7383,18 @@ function renderCondPanel(){
       html+='<button class="cp-opt" onclick="pickCondTask(\''+t.id+'\')">'+esc(t.name)+'</button>';
     });
     html+='</div>';
+  }else if(p.step==='milestone'){
+    html='<div class="cp-title">选择里程碑</div><div class="cp-opts">';
+    (state.achievements||[]).forEach(a=>{
+      html+='<button class="cp-opt" onclick="pickCondMilestone(\''+a.id+'\')">'+esc(a.name)+(a.unlocked?'（已解锁）':'（未解锁）')+'</button>';
+    });
+    html+='</div>';
+  }else if(p.step==='budget'){
+    html='<div class="cp-title">选择预算分类</div><div class="cp-opts">';
+    BudgetEngine.categories().forEach(c=>{
+      html+='<button class="cp-opt" onclick="pickCondBudgetCat(\''+c.id+'\')">'+esc(c.name)+'</button>';
+    });
+    html+='</div>';
   }else if(p.step==='aggregate'){
     html='<div class="cp-title">聚合方式</div><div class="cp-opts">';
     COND_AGGREGATES.forEach(a=>{
@@ -6475,7 +7409,7 @@ function renderCondPanel(){
 }
 function openCondMetricPanel(path,anchor){
   const it=condNodeAt(path)||{range:'period',metric:'checkins',op:'>=',value:1,targetType:'all',newFilter:'none',target:'',aggregate:'sum'};
-  condPanel={visible:true,kind:'metric',path:path,anchor:anchor,step:'range',range:it.range||'period',days:it.days||7,metric:it.metric||'checkins',targetType:it.targetType||'all',newFilter:it.newFilter||'none',target:it.target||'',aggregate:it.aggregate||'sum'};
+  condPanel={visible:true,kind:'metric',path:path,anchor:anchor,step:isPointMetric(it.metric)?'metric':'range',range:it.range||'period',days:it.days||7,metric:it.metric||'checkins',targetType:it.targetType||'all',newFilter:it.newFilter||'none',target:it.target||'',aggregate:it.aggregate||'sum'};
   renderCondPanel();
   positionCondPanel(anchor);
 }
@@ -6499,10 +7433,31 @@ function confirmCondDays(){
 }
 function pickCondMetric(metric){
   condPanel.metric=metric;
-  // 成果点/预算指标仅支持「全部 + 本周期」，直接提交
-  if(metric==='achievement'||metric.indexOf('budget_')===0){
+  // 成果点/预算进账指标仅支持「全部 + 本周期」，直接提交
+  if(metric==='achievement'||(metric.indexOf('budget_')===0&&metric!=='budget_remaining')){
     if(metric.indexOf('budget_')===0)condPanel.range='period';
     commitCondValue('all','','none','sum');return;
+  }
+  // 阶段 3 门槛指标：点态无窗口；里程碑/预算分类需要先选实体
+  if(isGateMetric(metric)){
+    if(metric==='lifetime_achievement'){condPanel.range='total';commitCondValue('all','','none','sum');return;}
+    if(isPointMetric(metric))condPanel.range='today';
+    if(metric==='milestone_unlocked'){condPanel.step='milestone';renderCondPanel();positionCondPanel(condPanel.anchor);return;}
+    if(metric==='budget_remaining'){condPanel.step='budget';renderCondPanel();positionCondPanel(condPanel.anchor);return;}
+    if(metric==='domain_activity'){condPanel.step='domain';renderCondPanel();positionCondPanel(condPanel.anchor);return;}
+    condPanel.step='targetType';
+    renderCondPanel();
+    positionCondPanel(condPanel.anchor);
+    return;
+  }
+  // 阶段 1 指标没有「新增筛选 / 聚合」概念：按主体类型直达
+  if(isStage1Metric(metric)){
+    if(isPointMetric(metric))condPanel.range='today';
+    if(condTargetTypesFor(metric).length===1){commitCondValue('all','','none','sum');return;}
+    condPanel.step='targetType';
+    renderCondPanel();
+    positionCondPanel(condPanel.anchor);
+    return;
   }
   condPanel.step='targetType';
   renderCondPanel();
@@ -6510,6 +7465,22 @@ function pickCondMetric(metric){
 }
 function pickCondTargetType(tt){
   condPanel.targetType=tt;
+  // 阶段 3 门槛指标（仅连续打卡可细分主体）
+  if(isGateMetric(condPanel.metric)){
+    if(tt==='all'){commitCondValue('all','','none','sum');return;}
+    condPanel.step=(tt==='task')?'task':'domain';
+    renderCondPanel();
+    positionCondPanel(condPanel.anchor);
+    return;
+  }
+  // 阶段 1 指标：全部直接提交；领域/任务继续选具体实体
+  if(isStage1Metric(condPanel.metric)){
+    if(tt==='all'){commitCondValue('all','','none','sum');return;}
+    condPanel.step=(tt==='task')?'task':'domain';
+    renderCondPanel();
+    positionCondPanel(condPanel.anchor);
+    return;
+  }
   // 单任务：主体即锁定唯一实体，无需新增筛选与聚合
   if(tt==='task'){
     condPanel.newFilter='none';
@@ -6537,6 +7508,10 @@ function pickCondNewFilter(nf){
 }
 function pickCondDomain(id){
   condPanel.target=id;
+  // 阶段 3 门槛指标：领域活跃次数按领域读取
+  if(isGateMetric(condPanel.metric)){commitCondValue('domain',id,'none','sum');return;}
+  // 阶段 1 指标选完领域即完成
+  if(isStage1Metric(condPanel.metric)){commitCondValue('domain',id,'none','sum');return;}
   // 计数类指标选完领域即完成；值类指标继续选新增筛选
   if(condPanel.metric==='new_tasks'||condPanel.metric==='new_domains'){
     commitCondValue('domain',id,'none','sum');
@@ -6548,6 +7523,12 @@ function pickCondDomain(id){
 }
 function pickCondTask(id){
   commitCondValue('task',id,'none','sum');
+}
+function pickCondMilestone(id){
+  commitCondValue('milestone',id,'none','sum');
+}
+function pickCondBudgetCat(id){
+  commitCondValue('budget',id,'none','sum');
 }
 function pickCondAggregate(agg){
   commitCondValue(condPanel.targetType,condPanel.target,condPanel.newFilter,agg);
@@ -6615,19 +7596,27 @@ document.addEventListener('click',function(e){
 });
 function rewardRowHTML(item){
   item=item||{type:'vitality',amount:10};
-  const typeOpts=[['vitality','活力点'],['progress','进度值'],['achievement','成果点'],['card','断更豁免卡']]
+  const typeOpts=[['vitality','活力点'],['progress','进度值'],['achievement','成果点'],['card','断更豁免卡'],['archive','归档（结构操作）']]
     .reduce((s,o)=>s+'<option value="'+o[0]+'"'+((item.type||'vitality')===o[0]?' selected':'')+'>'+o[1]+'</option>','');
+  const entityOpts=[['task','任务'],['affair','项目'],['chore','杂事']]
+    .reduce((s,o)=>s+'<option value="'+o[0]+'"'+((item.entity||'task')===o[0]?' selected':'')+'>'+o[1]+'</option>','');
   const domOpts='<option value="">全部领域</option>'+state.domains.map(d=>'<option value="'+d.id+'"'+((item.domainId||'')===d.id?' selected':'')+'>'+esc(d.name)+'</option>').join('');
   const taskOpts='<option value="">不指定任务</option>'+state.tasks.map(t=>'<option value="'+t.id+'"'+((item.taskId||'')===t.id?' selected':'')+'>'+esc(t.name)+'</option>').join('');
   const isVit=(item.type==='vitality');
   const isProg=(item.type==='progress');
   const isCard=(item.type==='card');
+  const isArchive=(item.type==='archive');
+  const amtVal=(item.amount===undefined||item.amount===null||item.amount==='')?10:item.amount;
+  const capVal=(item.cap===undefined||item.cap===null||item.cap==='')?3:item.cap;
+  const idleVal=(item.idleDays===undefined||item.idleDays===null||item.idleDays==='')?14:item.idleDays;
   return '<div class="reward-row">'
     +'<select class="rr-type" onchange="rrTypeChanged(this)">'+typeOpts+'</select>'
+    +'<select class="rr-entity" onchange="updateCondPreview()" style="display:'+(isArchive?'':'none')+'" title="归档对象">'+entityOpts+'</select>'
     +'<select class="rr-task" onchange="updateCondPreview()" style="display:'+(isVit?'':'none')+'" title="关联任务（可选）">'+taskOpts+'</select>'
     +'<select class="rr-domain" onchange="updateCondPreview()" style="display:'+(isProg?'':'none')+'" title="关联领域（可选）">'+domOpts+'</select>'
-    +'<input type="number" class="rr-amount" oninput="updateCondPreview()" value="'+(item.amount||10)+'" min="0" step="0.1" title="数量">'
-    +'<input type="number" class="rr-cap" oninput="updateCondPreview()" value="'+(item.cap||3)+'" min="1" step="1" style="display:'+(isCard?'':'none')+'" title="豁免卡累计上限">'
+    +'<input type="number" class="rr-amount" oninput="updateCondPreview()" value="'+amtVal+'" min="0" step="0.1" title="数量" style="display:'+(isArchive?'none':'')+'">'
+    +'<input type="number" class="rr-idle" oninput="updateCondPreview()" value="'+idleVal+'" min="1" step="1" title="不活跃天数阈值" style="display:'+(isArchive?'':'none')+'">'
+    +'<input type="number" class="rr-cap" oninput="updateCondPreview()" value="'+capVal+'" min="1" step="1" style="display:'+(isCard?'':'none')+'" title="豁免卡累计上限">'
     +'<button class="rr-del" onclick="removeRewardRow(this)">×</button>'
     +'</div>';
 }
@@ -6655,10 +7644,17 @@ function rrTypeChanged(sel){
   const dom=row.querySelector('.rr-domain');
   const task=row.querySelector('.rr-task');
   const cap=row.querySelector('.rr-cap');
+  const amt=row.querySelector('.rr-amount');
+  const ent=row.querySelector('.rr-entity');
+  const idle=row.querySelector('.rr-idle');
   const m=sel.value;
+  const isArchive=(m==='archive');
   task.style.display=(m==='vitality')?'':'none';
   dom.style.display=(m==='progress')?'':'none';
   cap.style.display=(m==='card')?'':'none';
+  if(amt)amt.style.display=isArchive?'none':'';
+  if(ent)ent.style.display=isArchive?'':'none';
+  if(idle)idle.style.display=isArchive?'':'none';
   updateCondPreview();
 }
 function validateDomain(id){return state.domains.some(d=>d.id===id)?id:'d_default'}
@@ -6672,7 +7668,7 @@ function handleActivitySave(){
   const condition=condDraft;
   const rewardItems=readRewardItems();
   const result={items:rewardItems};
-  if(!rewardItems.length){toast('请至少添加一个有效的奖励项','err');return}
+  if(!rewardItems.length){toast('请至少添加一个有效的奖励或结构操作项','err');return}
   if(id){
     const idx=state.activities.findIndex(x=>x.id===id);
     if(idx<0){toast('活动不存在','err');return}
@@ -6761,7 +7757,7 @@ function renderExemptPanel(){
   const today=new Date();today.setHours(0,0,0,0);
   const eligible=state.tasks.filter(t=>{
     if(t.archived)return false;
-    const checkedToday=!!(t.lastCheckIn&&new Date(t.lastCheckIn)>=today);
+    const checkedToday=taskCheckedToday(t);
     const exemptToday=!!(t.lastExempt&&new Date(t.lastExempt)>=today);
     return !checkedToday&&!exemptToday;
   });
@@ -7340,6 +8336,22 @@ const UNDO_ADAPTERS={
     toast('已撤销');
   }},
   purchase:{reverse:function(log){
+    // 先联动撤销该购买产生的现实预算账目（只走 BudgetEngine 已有入口）。
+    // 跨期账目按预算既有口径不可撤销：此处只处理当期可撤销的账目，购买退款仍照常进行。
+    let budEntry=null;
+    if(state.ext&&state.ext.budgets&&Array.isArray(state.ext.budgets.ledger)){
+      budEntry=state.ext.budgets.ledger.find(function(e){
+        return e&&e.status!=='reversed'&&e.links&&e.links.purchaseLogId===log.id;
+      })||null;
+    }
+    if(budEntry){
+      const cat=BudgetEngine.category(budEntry.categoryId);
+      const rp=cat?BudgetEngine.readPeriod(cat,now()):null;
+      const curKey=cat?BudgetEngine.bounds(cat.cycle,now()).key:'';
+      if(cat&&rp&&rp.period&&rp.period.end>now()&&budEntry.periodKey===curKey){
+        BudgetEngine.reverseEntry(budEntry.id);
+      }
+    }
     // Refund and restore stock. 贷款购买时只退自付部分，避免把贷款额一起退回。
     const paidPart=Math.abs(log.amt)-(typeof log.loanAmt==='number'?log.loanAmt:0);
     Ledger.post({op:'grant',account:log.st,delta:paidPart,visible:false,reason:{src:'undo-purchase'}});
@@ -7370,6 +8382,17 @@ const UNDO_ADAPTERS={
     Ledger.post({op:'grant',account:'achievement',delta:-log.amt,visible:false,reason:{src:'undo-achievement'}});
     Ledger.removeLogs(l=>l.id!==log.id);
     toast('已撤销成就解锁');
+  }},
+  'card-grant':{reverse:function(log){
+    // 卡券发放撤销：按流水记录的实际张数退回卡券余额（已被消耗时最低归零）
+    const card=log.card||'exemption';
+    const granted=typeof log.granted==='number'?log.granted:parseCardGrantAmt(log.desc);
+    if(granted>0){
+      const cur=state.cards[card]||0;
+      if(cur>0)Ledger.post({op:'adjust',account:'card:'+card,target:Math.max(0,cur-granted),visible:false,reason:{src:'undo-card-grant'}});
+    }
+    Ledger.removeLogs(l=>l.id!==log.id);
+    toast('已撤销卡券发放');
   }},
   'loan-repay':{reverse:function(log){
     // Undo loan repayment: restore the repaid amount and re-create the loan
@@ -7435,6 +8458,33 @@ const UNDO_ADAPTERS={
     if(log.progressVal){
       Ledger.post({op:'grant',account:'progress:d_default',delta:-log.progressVal,visible:false,reason:{src:'undo-delete-domain'}});
       Ledger.post({op:'adjust',account:'progress:'+log.domCopy.id,target:log.progressVal,visible:false,reason:{src:'undo-delete-domain'}});
+    }
+    // 还原被清理的活跃度桶与预算引用，避免撤销后门槛/规则统计与删除前不一致
+    if(log.activityCopy){
+      if(!state.ext.activity)state.ext.activity={};
+      state.ext.activity[log.domCopy.id]=clone(log.activityCopy);
+    }
+    if(Array.isArray(log.budgetFixes)){
+      log.budgetFixes.forEach(function(f){
+        const cat=(state.ext.budgets.categories||[]).find(function(c){return c.id===f.catId;});
+        if(!cat)return;
+        if(f.type==='default')cat.defaultProgressDomainId=f.prev;
+        else if(f.type==='rule'){
+          const r=(cat.rules||[]).find(function(x){return x.id===f.ruleId;});
+          if(r&&r.target)r.target.domainId=f.prev;
+        }
+      });
+    }
+    // 回收删除领域副作用触发的里程碑：重新上锁、退回成果点、删除对应解锁流水
+    if(Array.isArray(log.achLogIds)&&log.achLogIds.length){
+      log.achLogIds.forEach(function(lid){Ledger.removeLogs(function(l){return l.id!==lid;});});
+    }
+    if(Array.isArray(log.triggeredAchs)){
+      log.triggeredAchs.forEach(function(x){
+        const a=state.achievements.find(function(y){return y.id===x.id;});
+        if(a){a.unlocked=false;a.unlockedAt=null;}
+        if(Number(x.points)>0)Ledger.post({op:'grant',account:'achievement',delta:-Number(x.points),visible:false,reason:{src:'undo-delete-domain'}});
+      });
     }
     // Restore tasks' domain assignments
     if(log.affectedTasks){
@@ -7547,9 +8597,12 @@ function undoLog(logId){
     // 撤销里程碑解锁本身不能再触发重新解锁（否则点数与日志会被立刻补回来）
     if(log.src!=='achievement')checkAchievements();
     processDailyTaskDebts(true);
+    // 撤销「贷款还款」后余额恢复，必须只禁用本次收尾的自动还款；
+    // 否则刚恢复的贷款会被立即再次还掉，撤销等于没发生。
+    if(log.src==='loan-repay')_loanAutoPaySkipOnce=true;
     processLoansWithDecayReserve();
   },{label:'undo',save:'none',render:false});
-  if(!txr.ok){console.warn('undo aborted',logId,txr.error);return;}
+  if(!txr.ok){toast('撤销失败：'+(txr.error&&txr.error.info&&txr.error.info.reason||txr.error&&txr.error.code||'未知原因'),'err');console.warn('undo aborted',logId,txr.error);return;}
   // 嵌套撤销（cost 转父打卡）由最外层统一收尾，避免事务中途渲染
   if(txr.nested)return;
   save();
@@ -7899,53 +8952,102 @@ function handleAchSave(){
   render();
 }
 
-function fillProdGateSelects(domainId,milestoneId){
-  const ds=document.getElementById('prodGateDomain');
-  if(ds){
-    let html='<option value="">不限制活跃度</option>';
-    state.domains.forEach(function(d){
-      html+='<option value="'+escAttr(d.id)+'"'+(d.id===(domainId||'')?' selected':'')+'>'+esc(d.name)+(isArchivedEntity(d)?'（已归档）':'')+'</option>';
-    });
-    ds.innerHTML=html;
+// ===== 商品门槛编辑器（通用条件树）=====
+// 条件树与周期活动共用 condDraft / renderCondTree / evalNode，不另起一套求值器。
+function onProdGateModeChange(){
+  const sel=document.getElementById('prodGateMode');
+  condDraft.mode=sel&&sel.value==='any'?'any':'all';
+  renderCondTree();
+}
+function updateProdTierHint(tier){
+  const t=tier||validProductTier((document.getElementById('prodTier')||{}).value);
+  const hint=document.getElementById('prodTierHint');
+  if(!hint)return;
+  hint.textContent=t==='daily'
+    ?'支付币种：活力点 · 无门槛'
+    :t==='quality'
+      ?'支付币种：成果点 · 需满足下方门槛条件'
+      :'支付币种：成果点 · 需满足下方门槛条件（专属级通常绑定里程碑）';
+}
+// 配置时即时预览：当前状态下条件是否满足，以及失败的具体条目
+function prodGatePreviewFn(el){
+  const tier=validProductTier((document.getElementById('prodTier')||{}).value);
+  if(tier==='daily'){el.innerHTML='';return;}
+  const node={group:true,mode:condDraft.mode==='any'?'any':'all',items:condDraft.items||[]};
+  if(!(condDraft.items||[]).length){
+    el.innerHTML='<span class="cp-badge">预览</span>未设置门槛条件：所有用户均可购买。';
+    return;
   }
-  const ms=document.getElementById('prodGateMilestone');
-  if(ms){
-    let html='<option value="">请选择里程碑</option>';
-    state.achievements.forEach(function(a){
-      const stateTxt=isArchivedEntity(a)?'（已归档）':(a.unlocked?'（已解锁）':'（未解锁）');
-      html+='<option value="'+escAttr(a.id)+'"'+(a.id===(milestoneId||'')?' selected':'')+'>'+esc(a.name)+stateTxt+'</option>';
-    });
-    ms.innerHTML=html;
-  }
+  const act={period:'week'};
+  const ts=Date.now();
+  const ok=evalNode(node,act,ts);
+  const reasons=ok?[]:gateFailReasons(node,act,ts);
+  el.innerHTML='<span class="cp-badge">预览</span>'+esc(ok?'按当前状态，条件已满足，可购买。':('按当前状态，条件未满足：'+reasons.join('；')));
+}
+// 门槛条件校验：引用必须存在，数值必须有限；空条件代表“无门槛”
+function validateGateCondition(cond){
+  const walk=function(items){
+    for(let i=0;i<(items||[]).length;i++){
+      const n=items[i];
+      if(n&&n.group){
+        const err=walk(n.items);
+        if(err)return err;
+        continue;
+      }
+      if(!n||COND_METRIC_KEYS.indexOf(n.metric)<0)return '存在无效的门槛指标';
+      if(!isFinite(Number(n.value)))return '门槛数值不合法';
+      if(n.metric==='milestone_unlocked'){
+        if(!n.target||!state.achievements.some(function(a){return a.id===n.target;}))return '请为「里程碑已解锁」选择里程碑';
+      }else if(n.metric==='budget_remaining'){
+        const c=n.target?BudgetEngine.category(n.target):null;
+        if(!c||c.archived)return '请为「预算剩余」选择有效的预算分类';
+      }else if(n.metric==='domain_activity'){
+        if(!n.target||!state.domains.some(function(d){return d.id===n.target;}))return '请为「领域活跃次数」选择领域';
+      }
+    }
+    return null;
+  };
+  return walk(cond&&cond.items);
+}
+// 把能无损表达的叶子同步回三段式字段，保证旧导出/旧读取路径仍可解释
+function syncLegacyGateFields(gate,cond){
+  const g=gate||defaultProductGate();
+  g.minLifetime=0;
+  g.activity={domainId:'',days:0,times:0};
+  g.milestoneId='';
+  if(!cond||cond.mode!=='all')return g;
+  (cond.items||[]).forEach(function(n){
+    if(!n||n.group)return;
+    if(n.metric==='lifetime_achievement')g.minLifetime=Math.max(0,Math.round(Number(n.value)||0));
+    else if(n.metric==='domain_activity'&&n.targetType==='domain'&&n.target&&n.range==='recent'){
+      g.activity={domainId:n.target,days:Math.max(1,Math.round(Number(n.days)||7)),times:Math.max(0,Math.round(Number(n.value)||0))};
+    }else if(n.metric==='milestone_unlocked'&&n.targetType==='milestone'&&n.target)g.milestoneId=n.target;
+  });
+  return g;
+}
+function renderProdGateEditor(gate,tier){
+  condDraft=gateConditionOf(gate,tier);
+  const modeSel=document.getElementById('prodGateMode');
+  if(modeSel)modeSel.value=condDraft.mode==='any'?'any':'all';
+  setCondDraftContext(condDraft,'prodGateCondItems','prodGatePreview',prodGatePreviewFn,function(){updateProdTierHint(tier);});
+  renderCondTree();
 }
 
 function onProdTierChange(){
   const sel=document.getElementById('prodTier');
   const tier=validProductTier(sel?sel.value:'daily');
-  const q=document.getElementById('prodGateQuality');
-  const e=document.getElementById('prodGateExclusive');
-  if(q)q.style.display=tier==='quality'?'block':'none';
-  if(e)e.style.display=tier==='exclusive'?'block':'none';
-  const hint=document.getElementById('prodTierHint');
-  if(hint){
-    hint.textContent=tier==='daily'
-      ?'支付币种：活力点 · 无门槛'
-      :tier==='quality'
-        ?'支付币种：成果点 · 需满足累计成果点与活跃度门槛'
-        :'支付币种：成果点 · 需绑定处于已解锁状态的里程碑';
-  }
-  editCurrency=tierCurrency(tier);
+  const box=document.getElementById('prodGateBox');
+  if(box)box.style.display=tier==='daily'?'none':'block';
+  updateProdTierHint(tier);
+  if(tier!=='daily')prodGatePreviewFn(document.getElementById('prodGatePreview')||{innerHTML:''});
 }
 
 function openProdModal(id,presetCatId){
   const title=document.getElementById('prodModalTitle');
   document.getElementById('prodId').value='';
   fillShopCatSelect(document.getElementById('prodCategory'),presetCatId||'sc_default');
-  fillProdGateSelects('','');
   document.getElementById('prodTier').value='daily';
-  document.getElementById('prodGateLifetime').value=0;
-  document.getElementById('prodGateDays').value=7;
-  document.getElementById('prodGateTimes').value=1;
+  let gate=defaultProductGate();
   if(id){
     const p=state.products.find(x=>x.id===id);
     if(!p)return;
@@ -7957,19 +9059,11 @@ function openProdModal(id,presetCatId){
     document.getElementById('prodStock').value=p.stock;
     document.getElementById('prodDebtRate').value=p.debtRate||0;
     fillShopCatSelect(document.getElementById('prodCategory'),p.categoryId||'sc_default');
-    const tier=validProductTier(p.tier);
-    const gate=normalizeProductGate(p.gate,productGateContext());
-    document.getElementById('prodTier').value=tier;
-    fillProdGateSelects(gate.activity.domainId,gate.milestoneId);
-    document.getElementById('prodGateLifetime').value=gate.minLifetime;
-    if(gate.activity.domainId){
-      document.getElementById('prodGateDays').value=gate.activity.days||7;
-      document.getElementById('prodGateTimes').value=gate.activity.times||1;
-    }
+    document.getElementById('prodTier').value=validProductTier(p.tier);
+    gate=normalizeProductGate(p.gate,productGateContext());
     const bp=(p.budget&&p.budget.categoryId)?p.budget:{categoryId:'',amount:0};
     fillProdBudgetSelect(bp.categoryId);
     document.getElementById('prodBudgetAmount').value=bp.amount||0;
-    pickCurrency(tierCurrency(tier));
   }else{
     title.textContent='上架商品';
     document.getElementById('prodName').value='';
@@ -7979,20 +9073,12 @@ function openProdModal(id,presetCatId){
     document.getElementById('prodDebtRate').value=0;
     fillProdBudgetSelect('');
     document.getElementById('prodBudgetAmount').value=0;
-    pickCurrency('vitality');
   }
+  renderProdGateEditor(gate,validProductTier(document.getElementById('prodTier').value));
   onProdBudgetChange();
   onProdTierChange();
   openModal('prodModal');
   setTimeout(()=>document.getElementById('prodName').focus(),50);
-}
-
-function pickCurrency(type){
-  editCurrency=type;
-  const pv=document.getElementById('ppV');
-  const pa=document.getElementById('ppA');
-  if(pv)pv.classList.toggle('sel',type==='vitality');
-  if(pa)pa.classList.toggle('sel',type==='achievement');
 }
 
 // 商品「现实预算联动」：未绑定分类时整组收起，绑定后才显示金额
@@ -8015,16 +9101,6 @@ function onProdBudgetChange(){
   if(!cat&&amt)amt.value=0;
 }
 
-function gateIntField(id,label,min,max){
-  const raw=document.getElementById(id).value;
-  const n=Number(raw);
-  if(raw===''||!isFinite(n)||Math.round(n)!==n||n<min||(max!==undefined&&n>max)){
-    toast(label+'需为 '+(max!==undefined?(min+'~'+max):('≥ '+min))+' 的整数','err');
-    return null;
-  }
-  return n;
-}
-
 function handleProdSave(){
   const id=document.getElementById('prodId').value;
   const name=document.getElementById('prodName').value.trim();
@@ -8041,28 +9117,12 @@ function handleProdSave(){
   if(isNaN(debtRate)||debtRate<0){toast('债率需 ≥ 0','err');return}
 
   let gate=defaultProductGate();
-  if(tier==='quality'){
-    const minLifetime=gateIntField('prodGateLifetime','累计成果点门槛',0);
-    if(minLifetime===null)return;
-    const domainId=document.getElementById('prodGateDomain').value;
-    gate.minLifetime=minLifetime;
-    if(domainId){
-      if(!state.domains.some(function(d){return d.id===domainId;})){
-        toast('关联领域不存在，请重新选择','err');return;
-      }
-      const days=gateIntField('prodGateDays','活跃度天数 X',1,ACTIVITY_MAX_DAYS);
-      if(days===null)return;
-      const times=gateIntField('prodGateTimes','活跃度次数 Y',1);
-      if(times===null)return;
-      gate.activity={domainId:domainId,days:days,times:times};
-    }
-  }else if(tier==='exclusive'){
-    const mid=document.getElementById('prodGateMilestone').value;
-    if(!mid){toast('专属级需绑定一个里程碑','err');return}
-    if(!state.achievements.some(function(a){return a.id===mid;})){
-      toast('绑定的里程碑不存在，请重新选择','err');return;
-    }
-    gate.milestoneId=mid;
+  if(tier!=='daily'){
+    const cond=normalizeCondition({mode:condDraft.mode,items:condDraft.items});
+    const condErr=validateGateCondition(cond);
+    if(condErr){toast(condErr,'err');return;}
+    gate.condition=cond;
+    syncLegacyGateFields(gate,cond);
   }
 
   // 现实预算联动：绑定分类时金额必须 > 0，且分类需存在/启用/未归档
@@ -8136,13 +9196,17 @@ function importData(ev){
     const raw=e.target.result;
     try{
       const probe=JSON.parse(raw);
-      if(!probe||typeof probe!=='object'||Array.isArray(probe)||!probe.scores)throw 0;
-    }catch(err){toast('导入失败：格式不正确','err');return;}
+      // 只接受当前 schema 的导出：低版本数据不再导入时迁移，避免两套迁移口径漂移
+      if(!probe||typeof probe!=='object'||Array.isArray(probe)||!probe.scores||!probe.schema||probe.schema.v!==SCHEMA_VERSION)throw 0;
+    }catch(err){toast('导入失败：仅支持当前版本（v'+SCHEMA_VERSION+'）导出的数据','err');return;}
     // 统一走 parseState 的迁移口径，避免导入/加载两套迁移规则漂移
     loadIssue=null;
     const s=parseState(raw);
     if(loadIssue){toast('导入失败：格式不正确','err');return;}
     state=s;
+    // 用户已显式导入：解除读档失败造成的写入暂停
+    _persistBlocked=false;
+    const rb=document.getElementById('recoverBar');if(rb)rb.style.display='none';
     // 导入后补一次预算结算：导入的历史周期应立刻结清，不必等下次记账
     BudgetEngine.reconcileAll();
     commit('导入成功');
@@ -8268,11 +9332,26 @@ function backupCorrupt(raw){
   }catch(e){}
 }
 
-// 启动装载：只读 IndexedDB；无存档则使用全新默认状态（v1 原点，无旧版迁移）
+// 启动装载：只读 IndexedDB；显式区分「有存档 / 真没存档 / 读超时」三种结果。
+// 超时或读取失败时返回空白默认库仅供渲染，同时 _persistBlocked=true 禁止落盘，
+// 避免用空库覆盖仍然完好的真实存档。
 async function loadStateFromStorage(){
   loadIssue=null;
-  let raw=null;
-  try{raw=await withTimeout(idbGet(KEY),3000,undefined);}catch(e){}
+  _persistBlocked=false;
+  const r=await withTimeout(idbGet(KEY),3000);
+  if(r.status==='timeout'){
+    loadIssue={type:'timeout'};
+    _persistBlocked=true;
+    return defaults();
+  }
+  if(r.status==='error'){
+    // 完全没有 IndexedDB 能力（如某些 file:// 环境）：这是真正的“无存档”
+    if(!window.indexedDB)return defaults();
+    loadIssue={type:'read-error'};
+    _persistBlocked=true;
+    return defaults();
+  }
+  const raw=r.value;
   const hasIDB=(raw!==undefined&&raw!==null&&raw!=='');
   if(hasIDB){
     const s=parseState(raw);
@@ -8283,6 +9362,52 @@ async function loadStateFromStorage(){
     return s;
   }
   return defaults();
+}
+// 读档失败时顶部横幅：暂停写入 + 手动重试（不自动重试，避免与用户操作抢写）
+function showLoadBanner(kind){
+  const rb=document.getElementById('recoverBar');
+  if(!rb)return;
+  rb.style.display='flex';
+  rb.innerHTML='<span>'+(kind==='timeout'
+    ?'读取本地存档超时，已暂停写入以免覆盖原有数据。'
+    :'无法读取本地存档，已暂停写入以免覆盖原有数据。')+'</span>'
+    +'<button class="btn btn-sm" onclick="retryLoadStorage()">重试读取</button>';
+}
+async function retryLoadStorage(){
+  const rb=document.getElementById('recoverBar');
+  const btn=rb?rb.querySelector('button'):null;
+  if(btn){btn.disabled=true;btn.textContent='重试中…';}
+  let r;
+  try{r=await withTimeout(idbGet(KEY),5000);}catch(e){r={status:'error',error:e};}
+  if(r.status==='ok'){
+    const raw=r.value;
+    if(raw===undefined||raw===null||raw===''){
+      // 已确认确实没有存档：解除暂停，按当前内存状态继续
+      _persistBlocked=false;loadIssue=null;
+      if(rb)rb.style.display='none';
+      save();render();
+      toast('已确认本地暂无存档，可以正常使用');
+      return;
+    }
+    // 读到存档：重新走完整启动流程（迁移、结算、渲染口径与正常启动一致）
+    if(typeof location.reload==='function'){location.reload();return;}
+    const s=parseState(raw);
+    if(!loadIssue){
+      state=s;_persistBlocked=false;
+      if(!state.domains.find(d=>d.id==='d_default'))state.domains.unshift({id:'d_default',name:'默认'});
+      if(!state.collections.find(c=>c.id==='c_default'))state.collections.unshift({id:'c_default',name:'默认'});
+      // 与正常启动保持同一套处理器：活动、债务、贷款、预算结算、跨天基准都要重跑
+      runStartupProcessors();
+      if(rb)rb.style.display='none';
+      save();render();
+      toast('已重新读取本地存档');
+      return;
+    }
+    toast('读取到的存档无法解析，未覆盖原数据','err');
+  }else{
+    toast(r.status==='timeout'?'读取仍然超时，已继续暂停写入':'读取失败，已继续暂停写入','err');
+  }
+  if(btn){btn.disabled=false;btn.textContent='重试读取';}
 }
 
 async function attemptRecovery(){
@@ -8303,6 +9428,174 @@ async function attemptRecovery(){
     if(bar)bar.style.display='none';
     if(btn){btn.disabled=false;btn.textContent='尝试恢复';}
   }
+}
+
+// ===== 一致性自检（#debug / 手动）=====
+// 只报告、不自动修复：所有结论都基于当前内存状态与日志，发现差异时输出到 console 与 #debug 面板。
+function renderDebugReport(report){
+  if(location.hash!=='#debug')return;
+  let box=document.getElementById('debugCheckPanel');
+  if(!box){
+    box=document.createElement('pre');
+    box.id='debugCheckPanel';
+    box.style.cssText='position:fixed;left:8px;bottom:8px;max-width:60vw;max-height:40vh;overflow:auto;z-index:9999;background:var(--bg-2,#111);color:var(--text-1,#eee);border:1px solid var(--border,#333);padding:8px;font-size:12px;white-space:pre-wrap';
+    document.body.appendChild(box);
+  }
+  const bad=report.filter(function(r){return !r.ok;});
+  const skipped=report.filter(function(r){return r.skip;}).length;
+  box.textContent='一致性自检 '+(bad.length?('发现 '+bad.length+' 处差异'):'全部通过')+(skipped?('（'+skipped+' 项因日志截断跳过）'):'')+'\n'+
+    report.map(function(r){return (r.skip?'[--] ':(r.ok?'[OK] ':'[!!] '))+r.label+(r.detail?'：'+r.detail:'');}).join('\n');
+}
+function runConsistencyChecks(verbose){
+  const report=[];
+  const add=function(label,ok,detail){report.push({label:label,ok:!!ok,detail:detail||''});};
+  const near=function(a,b){return Math.abs((Number(a)||0)-(Number(b)||0))<0.005;};
+  const st=(state.ext&&state.ext.stats)||{};
+  const truncatedLogs=(state.logs||[]).length>=LOG_MAX;
+  const invisible=st.invisible||{vitality:0,achievement:0,progress:{},cards:{}};
+  const evicted=st.evicted||{vitality:0,achievement:0,progress:{},cards:{}};
+
+  // 1) 各账户余额 vs 可见流水求和 + 隐形差额 + 已截断差额
+  // 三者相加恒等于余额，因此隐形操作（贷款/撤销/扩容/搬运）与 LOG_MAX 裁剪都不会再造成误报。
+  const visSum={vitality:0,achievement:0,progress:{}};
+  (state.logs||[]).forEach(function(l){
+    if(logHasType(l,'vitality'))visSum.vitality+=(Number(logAmt(l,'vitality'))||0);
+    if(l.st==='achievement')visSum.achievement+=(Number(l.amt)||0);
+    const agg=computeEntryAgg(l);
+    Object.keys(agg.pd||{}).forEach(function(d){visSum.progress[d]=(visSum.progress[d]||0)+agg.pd[d];});
+  });
+  const expectV=visSum.vitality+(Number(invisible.vitality)||0)+(Number(evicted.vitality)||0);
+  const expectA=visSum.achievement+(Number(invisible.achievement)||0)+(Number(evicted.achievement)||0);
+  add('活力点余额 vs 流水合计',near(state.scores.vitality,expectV),
+    '余额 '+fmt(state.scores.vitality)+' / 可见 '+fmt(visSum.vitality)+' + 隐形 '+fmt(invisible.vitality||0)+' + 截断 '+fmt(evicted.vitality||0));
+  add('成果点余额 vs 流水合计',near(state.scores.achievement,expectA),
+    '余额 '+fmt(state.scores.achievement)+' / 可见 '+fmt(visSum.achievement)+' + 隐形 '+fmt(invisible.achievement||0)+' + 截断 '+fmt(evicted.achievement||0));
+  state.domains.forEach(function(d){
+    const bal=Number(state.scores.progress[d.id])||0;
+    const sum=Number(visSum.progress[d.id])||0;
+    const inv=Number((invisible.progress||{})[d.id]||0)||0;
+    const evi=Number((evicted.progress||{})[d.id]||0)||0;
+    add('进度账户「'+d.name+'」vs 流水合计',near(bal,sum+inv+evi),
+      '余额 '+fmt(bal)+' / 可见 '+fmt(sum)+' + 隐形 '+fmt(inv)+' + 截断 '+fmt(evi));
+  });
+
+  // 2) periods.spent vs budget ledger 求和（按分类、按周期，仅统计未撤销账目）
+  const bd=state.ext&&state.ext.budgets;
+  const ledger=bd&&Array.isArray(bd.ledger)?bd.ledger:[];
+  const ledgerTrunc=!!(bd&&bd.settings&&ledger.length>=Number(bd.settings.ledgerMax||BUDGET_LEDGER_MAX));
+  if(bd&&bd.periods){
+    Object.keys(bd.periods).forEach(function(catId){
+      const map=bd.periods[catId]||{};
+      Object.keys(map).forEach(function(key){
+        const p=map[key];
+        if(!p)return;
+        const sum=ledger.reduce(function(s,e){
+          if(!e||e.categoryId!==catId||e.periodKey!==key||e.status==='reversed')return s;
+          return s+(Number(e.amount)||0);
+        },0);
+        add('预算周期 '+catId+'/'+key+' spent',near(p.spent,sum),
+          '周期 '+fmt(p.spent)+' / 账目 '+fmt(sum)+(ledgerTrunc?'（账目明细已截断）':''));
+      });
+    });
+  }
+
+  // 3) ext.activity 桶 vs 打卡日志（最近 90 天）
+  const expectedActivity={};
+  const actCut=dayKey(Date.now()-(ACTIVITY_MAX_DAYS-1)*864e5);
+  (state.logs||[]).forEach(function(l){
+    if(!l||l.src!=='checkin')return;
+    const key=dayKey(Number(l.time)||0);
+    if(key<actCut)return;
+    let dids=String(l.dom||'').split(',').filter(Boolean);
+    if(!dids.length&&l.taskId){
+      const t=(state.tasks||[]).find(function(x){return x.id===l.taskId;});
+      if(t)dids=getTaskDomainIds(t);
+    }
+    dids.forEach(function(d){
+      if(!expectedActivity[d])expectedActivity[d]={};
+      expectedActivity[d][key]=(expectedActivity[d][key]||0)+1;
+    });
+  });
+  const activity=state.ext&&state.ext.activity||{};
+  if(truncatedLogs){
+    // 日志已截断时无法还原 90 天完整打卡记录：降级为 console 提示，不参与 bad 判定
+    console.log('[自检] 活跃度桶检查跳过：日志已截断（'+LOG_MAX+' 条上限），无法还原最近 '+ACTIVITY_MAX_DAYS+' 天完整打卡记录');
+    report.push({label:'活跃度桶 vs 打卡日志',ok:true,skip:true,detail:'日志已截断，跳过严格比对'});
+  }else{
+    const actDoms=new Set(Object.keys(expectedActivity).concat(Object.keys(activity)));
+    actDoms.forEach(function(d){
+      const keys=new Set(Object.keys(expectedActivity[d]||{}).concat(Object.keys(activity[d]||{})));
+      let diff=0;
+      keys.forEach(function(k){if(k>=actCut)diff+=Math.abs((Number((activity[d]||{})[k])||0)-(Number((expectedActivity[d]||{})[k])||0));});
+      add('活跃度桶「'+d+'」vs 打卡日志',diff<1e-9,'差异合计 '+fmt(diff));
+    });
+  }
+
+  // 4) penalizedOverspend vs penaltyOverspendDelta 累计（仅未撤销账目）
+  if(bd&&bd.periods){
+    Object.keys(bd.periods).forEach(function(catId){
+      const map=bd.periods[catId]||{};
+      Object.keys(map).forEach(function(key){
+        const p=map[key];
+        if(!p)return;
+        const sum=ledger.reduce(function(s,e){
+          if(!e||e.categoryId!==catId||e.periodKey!==key||e.status==='reversed')return s;
+          return s+(Number(e.penaltyOverspendDelta)||0);
+        },0);
+        add('惩罚水位 '+catId+'/'+key,near(p.penalizedOverspend,sum),
+          '水位 '+fmt(p.penalizedOverspend)+' / 累计 '+fmt(sum)+(ledgerTrunc?'（账目明细已截断）':''));
+      });
+    });
+  }
+
+  // 5) ext.stats vs 从当前日志重建的值（日志截断时只要求计数器不小于重建值）
+  try{
+    const savedStats=clone(state.ext.stats);
+    const savedAggs=(state.logs||[]).map(function(l){return l.agg;});
+    Ledger.rebuildStats();
+    const rebuilt=clone(state.ext.stats);
+    state.ext.stats=savedStats;
+    (state.logs||[]).forEach(function(l,i){l.agg=savedAggs[i];});
+    const cmp=function(label,k){
+      const cur=Number(savedStats[k])||0,reb=Number(rebuilt[k])||0;
+      const ok=truncatedLogs?(cur+0.005>=reb):near(cur,reb);
+      add('统计计数器 '+label,ok,'计数器 '+fmt(cur)+' / 重建 '+fmt(reb)+(truncatedLogs?'（日志已截断）':''));
+    };
+    cmp('活力收入','lifetimeVitalityIn');
+    cmp('活力支出','lifetimeVitalityOut');
+    cmp('进度收入','lifetimeProgressIn');
+    cmp('进度支出','lifetimeProgressOut');
+    cmp('成果收入','lifetimeAchievementIn');
+    cmp('成果支出','lifetimeAchievementOut');
+    cmp('打卡次数','totalCheckins');
+    cmp('购买次数','totalPurchases');
+  }catch(e){
+    add('统计计数器重建',false,'重建异常：'+(e&&e.message||e));
+  }
+
+  // 6) achievementCounted vs 成就日志（计数器不得小于现有日志可证明的解锁金额）
+  const counted=state.ext&&state.ext.achievementCounted||{};
+  const logMax={};
+  (state.logs||[]).forEach(function(l){
+    if(!l||l.src!=='achievement'||!l.achId)return;
+    const amt=Number(l.amt)||0;
+    if(amt>0)logMax[l.achId]=Math.max(logMax[l.achId]||0,amt);
+  });
+  Object.keys(logMax).forEach(function(id){
+    const c=Number(counted[id])||0;
+    add('成就计数 '+id,c+0.005>=logMax[id],'已计入 '+fmt(c)+' / 日志 '+fmt(logMax[id]));
+  });
+
+  const bad=report.filter(function(r){return !r.ok;});
+  if(verbose||location.hash==='#debug'){
+    if(bad.length)bad.forEach(function(r){console.warn('[自检] '+r.label+'：'+r.detail);});
+    else console.log('[自检] 全部通过（'+report.length+' 项）');
+    renderDebugReport(report);
+  }else if(bad.length){
+    console.warn('[自检] 发现 '+bad.length+' 处不一致：'+bad.map(function(r){return r.label;}).join('；'));
+  }
+  if(typeof window!=='undefined')window.__debugChecks=report;
+  return report;
 }
 
 // 开发期自检：确认日志写入口只存在于 Ledger 内部（#debug 下输出警告，避免业务层回潮直写）
@@ -8332,13 +9625,36 @@ function devAuditLogWrites(){
 }
 
 // ===== Init =====
+// 启动/重新载入后统一要跑的一次性处理器（活动、债务、贷款、预算结算、跨天基准）
+function runStartupProcessors(){
+  checkAchievements();
+  // 代谢规则必须先于活动执行播种：否则升级后首次启动不会自动归档
+  ensureMetabolismRule();
+  // 启动时各处理器统一 silent，最后一次写盘
+  processDailyTaskDebts(true);
+  processLoansWithDecayReserve();
+  processActivities(true);
+  processChoreDecay(true);
+  // 启动时补结算：上次运行遗留的已结束周期在此结清
+  BudgetEngine.reconcileAll();
+  // 跨天检测基准必须在启动时写入：否则午夜前启动，第一次 tick 只把 null 填成当天
+  // 并提前 return，真正的跨天结算会被跳过一次。
+  _lastTickDay=dayKey(Date.now());
+}
 async function init(){
   state=await loadStateFromStorage();
   if(loadIssue){
-    toast(loadIssue.type==='salvaged'
-      ?'检测到数据不完整，已自动修复并恢复可读部分（原始内容已备份）'
-      :'本地数据已损坏，已重置（原始内容已备份）','err');
-    if(loadIssue.type==='corrupt'){const rb=document.getElementById('recoverBar');if(rb)rb.style.display='flex';}
+    if(loadIssue.type==='timeout'||loadIssue.type==='read-error'){
+      showLoadBanner(loadIssue.type);
+      toast(loadIssue.type==='timeout'
+        ?'读取本地存档超时：本次已暂停写入，避免空白数据覆盖原存档。请点顶部「重试读取」'
+        :'无法读取本地存档：本次已暂停写入，避免覆盖原存档。请点顶部「重试读取」','err');
+    }else{
+      toast(loadIssue.type==='salvaged'
+        ?'检测到数据不完整，已自动修复并恢复可读部分（原始内容已备份）'
+        :'本地数据已损坏，已重置（原始内容已备份）','err');
+      if(loadIssue.type==='corrupt'){const rb=document.getElementById('recoverBar');if(rb)rb.style.display='flex';}
+    }
   }
   maybeBackupReminder();
   // 申请持久化存储，降低浏览器自动清理 IndexedDB 的风险
@@ -8356,6 +9672,14 @@ async function init(){
 
   // 能力雷达指标为纯自定义：未创建指标时不显示任何指标
   if(!Array.isArray(state.metrics))state.metrics=[];
+
+  // 旧存档/首次启用统计计数器：从当前日志重建一次（之后靠写入时增量累加）
+  // 同时校准 invisible/evicted，使“余额 vs 流水合计”自检对历史隐形操作也能通过
+  if(!state.ext.stats||state.ext.stats.version!==STATS_VERSION||!state.ext.stats.daily){
+    const hadShadow=Array.isArray(state.ext.shadow)&&state.ext.shadow.length>0;
+    Ledger.rebuildStats();
+    if(!hadShadow)seedCalibrationShadow();
+  }
 
   document.querySelectorAll('.modal-bg').forEach(bg=>{
     bg.addEventListener('click',e=>{if(e.target===bg)bg.classList.remove('show')});
@@ -8391,15 +9715,7 @@ async function init(){
     if(e.key==='Escape')document.querySelectorAll('.modal-bg.show').forEach(m=>m.classList.remove('show'));
   });
 
-  checkAchievements();
-  // 启动时各处理器统一 silent，最后一次写盘
-  processDailyTaskDebts(true);
-  processMetabolism(true);
-  processLoansWithDecayReserve();
-  processActivities(true);
-  processChoreDecay(true);
-  // 启动时补结算：上次运行遗留的已结束周期在此结清
-  BudgetEngine.reconcileAll();
+  runStartupProcessors();
   save();
   setInterval(schedulerTick,60000);
   initDrag();
@@ -8407,6 +9723,7 @@ async function init(){
   bindTaskSliders();
   initPWA();
   devAuditLogWrites();
+  runConsistencyChecks();
   render();
 }
 
