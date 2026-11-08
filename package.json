@@ -1,0 +1,13 @@
+{
+  "name": "score-system",
+  "private": true,
+  "type": "module",
+  "description": "计分系统（纯静态 ES modules，无构建步骤）",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "vitest": "^3.2.4"
+  }
+}
