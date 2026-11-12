@@ -28,12 +28,14 @@ function budgetPeriodLabel(cat,b){
 }
 function budgetCatCardHTML(cat,ts){
   const r=BudgetEngine.readPeriod(cat,ts);
-  const p=r.period||{spent:0,entryCount:0,topupAmount:0,topupCost:0,penalizedOverspend:0,rewardSettled:false};
+  const p=r.period||{spent:0,refund:0,entryCount:0,topupAmount:0,topupCost:0,penalizedOverspend:0,rewardSettled:false};
   const eff=BudgetEngine.effectiveLimit(cat,p);
-  const spent=round4(Number(p.spent)||0);
-  const over=Math.max(0,round4(spent-eff));
-  const remain=Math.max(0,round4(eff-spent));
-  const pct=eff>0?Math.min(100,Math.round(spent/eff*100)):0;
+  // 已花按“净花费”展示：跨期冲正退回的额度不再计入本期超支
+  const refund=round4(Number(p.refund)||0);
+  const net=BudgetEngine.netSpentOf(p);
+  const over=Math.max(0,round4(net-eff));
+  const remain=Math.max(0,round4(eff-net));
+  const pct=eff>0?Math.min(100,Math.round(net/eff*100)):0;
   const reward=(cat.rules||[]).filter(function(x){return x.kind==='reward'&&x.enabled;}).length;
   const rules=(cat.rules||[]).filter(function(x){return x.enabled;});
   let html='<div class="bg-card'+(cat.enabled?'':' off')+'">';
@@ -44,15 +46,24 @@ function budgetCatCardHTML(cat,ts){
   html+='<button class="btn btn-sm" onclick="confirmDelBudgetCategory(\''+escAttr(cat.id)+'\')">删除</button>';
   html+='</div></div>';
   html+='<div class="bg-sub">'+(cat.cycle==='week'?('每周（'+weekAnchorName(cat.anchor)+'起）'):'每月')+' · '+budgetPeriodLabel(cat,r.b)+' · '+rules.length+' 条规则'+(reward?' · 含结余奖励':'')+'</div>';
-  html+='<div class="bg-nums"><span>已花 <b>'+fmt(spent)+'</b></span><span>额度 <b>'+fmt(eff)+'</b>'+(p.topupAmount?'（基础 '+fmt(cat.limit)+' + 扩容 '+fmt(p.topupAmount)+'）':'')+'</span><span>剩余 <b>'+fmt(remain)+'</b></span><span>本期 '+fmt(p.entryCount||0)+' 笔</span></div>';
+  html+='<div class="bg-nums"><span>已花 <b>'+fmt(net)+'</b>'+(refund?'（冲正 -'+fmt(refund)+'）':'')+'</span><span>额度 <b>'+fmt(eff)+'</b>'+(p.topupAmount?'（基础 '+fmt(cat.limit)+' + 扩容 '+fmt(p.topupAmount)+'）':'')+'</span><span>剩余 <b>'+fmt(remain)+'</b></span><span>本期 '+fmt(p.entryCount||0)+' 笔</span></div>';
   html+='<div class="bg-bar"><div class="bg-bar-fill'+(over?' danger':'')+'" style="width:'+pct+'%"></div></div>';
   html+='<div class="bg-foot">';
   if(over)html+='<span class="bg-badge danger">超支 '+fmt(over)+'</span>';
+  if(refund)html+='<span class="bg-badge">本期冲正 '+fmt(refund)+'</span>';
   if(p.topupAmount)html+='<span class="bg-badge">扩容 '+fmt(p.topupAmount)+'（花费 '+fmt(p.topupCost)+'）</span>';
   if(p.penalizedOverspend)html+='<span class="bg-badge">已计惩罚水位 '+fmt(p.penalizedOverspend)+'</span>';
   if(p.rewardSettled)html+='<span class="bg-badge ok">已结算'+(p.rewardAmount?' +'+fmt(p.rewardAmount):'')+'</span>';
   if(!cat.enabled)html+='<span class="bg-badge">已停用</span>';
   html+='</div>';
+  const snap=p.settlementSnapshot;
+  if(p.rewardSettled&&snap&&snap.rules&&snap.rules.length){
+    html+='<div class="bg-settle">结算明细：'+snap.rules.map(function(x){
+      const rule=(cat.rules||[]).find(function(y){return y.id===x.ruleId;});
+      const acc=rule?BUDGET_TARGET_NAMES[rule.target&&rule.target.account]||'':'';
+      return esc((acc?acc+' ':'')+'+'+fmt(x.amount));
+    }).join('；')+'</div>';
+  }
   if((cat.rules||[]).length){
     html+='<div class="bg-rules">'+cat.rules.map(function(rule){
       return '<span class="bg-rule '+(rule.kind||'')+(rule.enabled?'':' off')+'">'+BUDGET_RULE_NAMES[rule.kind]+'</span>';
@@ -61,28 +72,52 @@ function budgetCatCardHTML(cat,ts){
   html+='</div>';
   return html;
 }
+// 账目来源文案：事项自动记账与跨期冲正都要能一眼看出“这笔现实账是哪来的”
+const BUDGET_SRC_LABEL={manual:'手动',product:'商品',task:'任务',affair:'项目',chore:'杂事',reversal:'跨期冲正'};
+function budgetSourceLabel(e){
+  const base=BUDGET_SRC_LABEL[e.source]||'手动';
+  if(e.source==='product'){
+    const pr=state.products.find(function(x){return x.id===e.productId;});
+    return base+'·'+(pr?pr.name:'已删除');
+  }
+  if(e.source==='task'){
+    const log=e.links&&e.links.checkinLogId?state.logs.find(function(l){return l.id===e.links.checkinLogId;}):null;
+    const task=log?state.tasks.find(function(x){return x.id===log.taskId;}):null;
+    return base+(task?'·'+task.name:'');
+  }
+  if(e.source==='affair'){
+    const a=state.affairs.find(function(x){return x.id===(e.links&&e.links.affairId);});
+    return base+(a?'·'+a.name:'');
+  }
+  if(e.source==='chore'){
+    const c=state.chores.find(function(x){return x.id===(e.links&&e.links.choreId);});
+    return base+(c?'·'+c.name:'');
+  }
+  return base;
+}
 function budgetLedgerHTML(){
   const ledger=(state.ext.budgets.ledger||[]).slice().sort(function(a,b){return (b.ts||0)-(a.ts||0);});
   if(!ledger.length)return '<div class="empty" style="padding:18px"><p style="color:var(--text-3);margin:0">还没有现实账目 · 点「快速记账」或购买绑定商品时自动记录</p></div>';
   return ledger.slice(0,60).map(function(e){
     const cat=BudgetEngine.category(e.categoryId);
     const curKey=cat?BudgetEngine.bounds(cat.cycle,now()).key:'';
-    const canRev=e.status==='active'&&cat&&e.periodKey===curKey;
-    let src=e.source==='product'?'商品':'手动';
-    if(e.source==='product'){
-      const pr=state.products.find(function(x){return x.id===e.productId;});
-      src='商品·'+(pr?pr.name:'已删除');
-    }
-    let html='<div class="blog-row'+(e.status==='reversed'?' reversed':'')+'">';
-    html+='<div class="blog-main"><div class="blog-title">'+(cat?esc(cat.name):'已删除分类')+' · <b>'+fmt(e.amount)+'</b><span class="tag">'+esc(src)+'</span></div>';
+    // 冲正记录本身不可再撤（它携带的是 refund，不是一笔真实花费）
+    const canRev=e.status==='active'&&cat&&e.source!=='reversal'&&e.periodKey===curKey;
+    const src=budgetSourceLabel(e);
+    const refundAmt=round4(Number(e.refundAmount)||0);
+    let html='<div class="blog-row'+(e.status==='reversed'?' reversed':'')+(e.status==='compensated'?' compensated':'')+'">';
+    html+='<div class="blog-main"><div class="blog-title">'+(cat?esc(cat.name):'已删除分类')+' · <b>'+(refundAmt?'冲正 '+fmt(refundAmt):fmt(e.amount))+'</b><span class="tag">'+esc(src)+'</span></div>';
     html+='<div class="blog-sub">'+fmtDate(e.ts)+' · '+budgetPeriodLabel(cat||{cycle:'week'},BudgetEngine.bounds((cat&&cat.cycle)||'week',e.ts))+(e.note?' · '+esc(e.note):'')+'</div>';
     if(e.topupAdded)html+='<div class="blog-sub">扩容 '+fmt(e.topupAdded)+'（花费 '+fmt(e.topupCost)+'）</div>';
+    if(e.status==='compensated')html+='<div class="blog-sub">已于账期 '+(e.compensatedInPeriod||'')+' 冲正（历史周期与已发奖惩不变）</div>';
     const pen=(e.links.penaltyLogIds||[]).length,fed=(e.links.feedbackLogIds||[]).length;
     if(pen||fed)html+='<div class="blog-sub">'+(pen?'惩罚流水 '+pen+' 条':'')+(pen&&fed?' · ':'')+(fed?'反哺流水 '+fed+' 条':'')+'</div>';
     html+='</div>';
     html+='<div class="blog-act">';
     if(e.status==='reversed')html+='<span class="tag">已撤销</span>';
+    else if(e.status==='compensated')html+='<span class="tag">已冲正</span>';
     else if(canRev)html+='<button class="btn btn-sm" onclick="confirmReverseBudgetEntry(\''+escAttr(e.id)+'\')">撤销</button>';
+    else if(e.source==='reversal')html+='<span class="tag">冲正入账</span>';
     else html+='<span class="tag">跨期不可撤销</span>';
     html+='</div></div>';
     return html;
@@ -102,7 +137,7 @@ function renderBudget(){
   cats.forEach(function(c){
     const r=BudgetEngine.readPeriod(c,ts);
     totalLimit+=Number(c.limit)||0;
-    totalSpent+=Number(r.period&&r.period.spent)||0;
+    totalSpent+=BudgetEngine.netSpentOf(r.period);
   });
   const per=document.getElementById('bPeriod');
   if(per)per.textContent=cats.length?fmt(totalSpent)+' / '+fmt(totalLimit):'—';
@@ -333,11 +368,10 @@ function openBudgetCatModal(id){
   document.getElementById('budgetCatLimit').value=cat?cat.limit:300;
   document.getElementById('budgetCatEnabled').checked=cat?cat.enabled!==false:true;
   fillBudgetDomainSelect(cat?cat.defaultProgressDomainId:'');
-  const od=(cat&&cat.overdraft)||{enabled:false,currency:'achievement',rate:2,maxRealityPerPeriod:300,maxCostPerPeriod:150};
+  const od=(cat&&cat.overdraft)||{enabled:false,currency:'achievement',rate:2,maxCostPerPeriod:150};
   document.getElementById('budgetOdEnabled').checked=!!od.enabled;
   document.getElementById('budgetOdCurrency').value=od.currency||'achievement';
   document.getElementById('budgetOdRate').value=od.rate||2;
-  document.getElementById('budgetOdMaxReality').value=od.maxRealityPerPeriod!==undefined?od.maxRealityPerPeriod:300;
   document.getElementById('budgetOdMaxCost').value=od.maxCostPerPeriod!==undefined?od.maxCostPerPeriod:150;
   renderBudgetRuleList();
   openModal('budgetCatModal');
@@ -366,13 +400,15 @@ function saveBudgetCategory(){
   const odEnabled=document.getElementById('budgetOdEnabled').checked;
   const odCurrency=document.getElementById('budgetOdCurrency').value==='vitality'?'vitality':'achievement';
   const odRate=Number(document.getElementById('budgetOdRate').value);
-  const odMaxReality=Number(document.getElementById('budgetOdMaxReality').value);
   const odMaxCost=Number(document.getElementById('budgetOdMaxCost').value);
   if(!name){toast('请填写分类名称','err');return}
   if(!isFinite(limit)||limit<=0){toast('基础限额必须大于 0','err');return}
   if(did&&!state.domains.some(function(d){return d.id===did;})){toast('默认领域不存在','err');return}
   if(odEnabled&&(!isFinite(odRate)||odRate<=0)){toast('扩容汇率必须大于 0','err');return}
-  if(!isFinite(odMaxReality)||odMaxReality<0||!isFinite(odMaxCost)||odMaxCost<0){toast('扩容上限不能为负','err');return}
+  if(!isFinite(odMaxCost)||odMaxCost<0){toast('扩容花费上限不能为负','err');return}
+  // 「每期最多扩额度」不再单独填写：由花费上限 × 汇率自动换算（与引擎校验同一口径）
+  const odRateSafe=isFinite(odRate)&&odRate>0?odRate:2;
+  const odMaxReality=odMaxCost*odRateSafe;
   const catProto={
     defaultProgressDomainId:did,name:name,cycle:cycle,
     rules:budDraftRules.slice().sort(function(a,b){return (a.priority||0)-(b.priority||0);})
@@ -414,7 +450,7 @@ function saveBudgetCategory(){
     id:budEditingId||uid(),name:name.slice(0,40),enabled:enabled,archived:old?!!old.archived:false,
     cycle:cycle,anchor:anchor,limit:round4(limit),defaultProgressDomainId:did,
     rules:JSON.parse(JSON.stringify(budDraftRules)).sort(function(a,b){return (a.priority||0)-(b.priority||0);}),
-    overdraft:{enabled:odEnabled,currency:odCurrency,rate:Math.max(0.0001,odRate),maxRealityPerPeriod:Math.max(0,round4(odMaxReality)),maxCostPerPeriod:Math.max(0,round4(odMaxCost))},
+    overdraft:{enabled:odEnabled,currency:odCurrency,rate:Math.max(0.0001,odRateSafe),maxRealityPerPeriod:Math.max(0,round4(odMaxReality)),maxCostPerPeriod:Math.max(0,round4(odMaxCost))},
     createdAt:old?old.createdAt:now(),updatedAt:now()
   };
   const idx=bd.categories.findIndex(function(c){return c.id===cat.id;});
@@ -500,7 +536,8 @@ function budgetPreviewHTML(plan,base){
   if(!plan||!plan.ok)return '<div class="qr-alert danger">'+esc((plan&&plan.reason)||'预览失败')+'</div>';
   let html='<div class="qr-panel">';
   html+='<div class="qr-panel-head">'+esc(plan.cat.name)+' · 本期 '+esc(budgetPeriodLabel(plan.cat,plan.bounds))+'</div>';
-  html+='<div class="qr-line"><span>本期已花</span><span>'+fmt(plan.spentBefore)+' → <b>'+fmt(plan.spentAfter)+'</b></span></div>';
+  html+='<div class="qr-line"><span>本期已花</span><span>'+fmt(plan.netBefore!==undefined?plan.netBefore:plan.spentBefore)+' → <b>'+fmt(plan.netAfter!==undefined?plan.netAfter:plan.spentAfter)+'</b></span></div>';
+  if(plan.refund)html+='<div class="qr-line"><span>本期冲正</span><span>-'+fmt(plan.refund)+'（不计入结余奖励）</span></div>';
   html+='<div class="qr-line"><span>有效额度</span><span>'+fmt(plan.limitAfter)+(plan.topup.amount?'（含本次扩容 '+fmt(plan.topup.amount)+'）':'')+'</span></div>';
   if(plan.overspendAfter)html+='<div class="qr-line danger"><span>本期超支</span><span>'+fmt(plan.overspendAfter)+(plan.deltaOverspend?' · 本次新增 '+fmt(plan.deltaOverspend):'')+'</span></div>';
   if(plan.effects&&plan.effects.length){

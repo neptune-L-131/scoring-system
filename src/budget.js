@@ -49,7 +49,7 @@ const BudgetEngine=(function(){
   }
   function blankPeriod(b){
     return{
-      key:b.key,start:b.start,end:b.end,spent:0,entryCount:0,
+      key:b.key,start:b.start,end:b.end,spent:0,refund:0,entryCount:0,
       topupAmount:0,topupCost:0,penalizedOverspend:0,penaltyCharged:0,feedbackGranted:0,
       ruleTotals:{},rewardSettled:false,rewardAmount:0,settlementSnapshot:null,closedAt:null,settledAt:null
     };
@@ -98,7 +98,19 @@ const BudgetEngine=(function(){
     return{b:b,period:p};
   }
   function effectiveLimit(cat,p){return round4((Number(cat.limit)||0)+(Number(p&&p.topupAmount)||0));}
-  function overspendOf(cat,p){return Math.max(0,round4((Number(p&&p.spent)||0)-effectiveLimit(cat,p)));}
+  // 净花费 = 实际花费 - 本期冲正；冲正只影响“是否算超支”，不影响结余奖励口径
+  function netSpentOf(p){return Math.max(0,round4((Number(p&&p.spent)||0)-(Number(p&&p.refund)||0)));}
+  function overspendOf(cat,p){return Math.max(0,round4(netSpentOf(p)-effectiveLimit(cat,p)));}
+  // 水位 = 当期所有存活账目 overspendAfter 的最大值；与撤销顺序无关，且只降不升
+  function recomputeWater(cat,p){
+    if(!cat||!p)return;
+    const active=budgets().ledger.filter(function(e){
+      return e&&e.categoryId===cat.id&&e.periodKey===p.key&&e.status==='active';
+    });
+    if(active.some(function(e){return !e.snapshot||!isFinite(Number(e.snapshot.overspendAfter));}))return;
+    const calc=Math.max(0,round4(Math.max.apply(null,[0].concat(active.map(function(e){return round4(Number(e.snapshot.overspendAfter)||0);})))));
+    p.penalizedOverspend=Math.min(round4(Number(p.penalizedOverspend)||0),calc);
+  }
   function accountKeyOf(target){
     if(!target)return '';
     if(target.account==='progress')return 'progress:'+target.domainId;
@@ -201,10 +213,13 @@ const BudgetEngine=(function(){
     const limitAfter=round4(limitBefore+topupReq);
     const spentBefore=round4(Number(p.spent)||0);
     const spentAfter=round4(spentBefore+amount);
-    const overspendBefore=Math.max(0,round4(spentBefore-limitAfter));
+    // 冲正（refund）只参与超支/水位判定，不参与结余奖励计算
+    const netBefore=netSpentOf(p);
+    const netAfter=Math.max(0,round4(netBefore+amount));
+    const overspendBefore=Math.max(0,round4(netBefore-limitAfter));
     // 水位语义 = 已惩罚过的超支金额，单调不减：扩容会让当前超支变小，但水位不得跟着回落
     const waterBefore=round4(Number(p.penalizedOverspend)||0);
-    const overspendAfter=Math.max(0,round4(spentAfter-limitAfter));
+    const overspendAfter=Math.max(0,round4(netAfter-limitAfter));
     const deltaOverspend=Math.max(0,round4(overspendAfter-waterBefore));
     const entryCountAfter=(Number(p.entryCount)||0)+1;
     const surplus=Math.max(0,round4(cat.limit-spentAfter));
@@ -238,8 +253,8 @@ const BudgetEngine=(function(){
     });
     // 扩容建议：不静默扩容，只返回建议，由用户确认后显式传入 opts.topup
     let needsTopup=null;
-    if(topupReq<=0&&cat.overdraft.enabled&&spentAfter>limitBefore+1e-9){
-      const need=round4(spentAfter-limitBefore);
+    if(topupReq<=0&&cat.overdraft.enabled&&netAfter>limitBefore+1e-9){
+      const need=round4(netAfter-limitBefore);
       const maxReality=Math.max(0,round4(cat.overdraft.maxRealityPerPeriod-p.topupAmount));
       const maxCost=Math.max(0,round4(cat.overdraft.maxCostPerPeriod-p.topupCost));
       const byCost=round4(maxCost*(cat.overdraft.rate||1));
@@ -259,21 +274,34 @@ const BudgetEngine=(function(){
       ok:true,catId:cat.id,cat:cat,ts:ts,amount:amount,bounds:b,periodKey:b.key,
       period:p,periodLive:live,topup:{amount:topupReq,cost:topupCost,currency:cat.overdraft.currency},
       effects:effects,rewardPreview:rewardPreview,
-      spentBefore:spentBefore,spentAfter:spentAfter,limitBefore:limitBefore,limitAfter:limitAfter,
+      spentBefore:spentBefore,spentAfter:spentAfter,netBefore:netBefore,netAfter:netAfter,
+      refund:round4(Number(p.refund)||0),
+      limitBefore:limitBefore,limitAfter:limitAfter,
       overspendBefore:overspendBefore,overspendAfter:overspendAfter,deltaOverspend:deltaOverspend,
       waterBefore:waterBefore,entryCountAfter:entryCountAfter,balances:bal,
       insufficient:insufficient,needsTopup:needsTopup
     };
   }
   function preview(catId,amount,ts,opts){return analyze(catId,amount,ts,opts||{});}
+  // 事项自动记账的 source 白名单：未知来源一律降级为 manual，避免脏字段进入账本
+  const ENTRY_SOURCES=['manual','product','task','affair','chore'];
   function prepareEntry(catId,amount,opts){
     opts=opts||{};
     const plan=analyze(catId,amount,opts.ts,opts);
     if(!plan.ok)failB(plan.code,{reason:plan.reason});
-    if(plan.insufficient)failB('BUDGET_INSUFFICIENT',{
-      reason:plan.insufficient.reason,account:plan.insufficient.account,diff:plan.insufficient.diff
-    });
-    plan.source=opts.source==='product'?'product':'manual';
+    // allowNegative 仅由事项自动记账显式开启：余额不足时允许虚拟账户转负，照常完成动作。
+    // 商品购买 / 手工记账不传该开关，保持“余额不足整笔拒绝”的既有语义。
+    if(plan.insufficient){
+      if(opts.allowNegative){
+        plan.deficit=plan.insufficient;
+        plan.insufficient=null;
+      }else{
+        failB('BUDGET_INSUFFICIENT',{
+          reason:plan.insufficient.reason,account:plan.insufficient.account,diff:plan.insufficient.diff
+        });
+      }
+    }
+    plan.source=ENTRY_SOURCES.indexOf(opts.source)>=0?opts.source:'manual';
     plan.productId=String(opts.productId||'');
     plan.note=String(opts.note||'').slice(0,80);
     return plan;
@@ -339,7 +367,13 @@ const BudgetEngine=(function(){
       periodKey:p.key,status:'active',reversedAt:null,
       topupAdded:plan.topup.amount,topupCost:plan.topup.cost,
       penaltyOverspendDelta:plan.deltaOverspend,
-      links:{purchaseLogId:String(extra.purchaseLogId||''),topupLogId:topupLogId,penaltyLogIds:penaltyLogIds,feedbackLogIds:feedbackLogIds},
+      links:{
+        purchaseLogId:String(extra.purchaseLogId||''),topupLogId:topupLogId,
+        penaltyLogIds:penaltyLogIds,feedbackLogIds:feedbackLogIds,
+        checkinLogId:String(extra.checkinLogId||''),affairId:String(extra.affairId||''),
+        affairAdvanceId:String(extra.affairAdvanceId||''),choreId:String(extra.choreId||''),
+        reversalOf:''
+      },
       snapshot:{
         limit:round4(cat.limit),topupAmount:round4(p.topupAmount),
         overspendAfter:plan.overspendAfter,penaltyAfter:p.penalizedOverspend
@@ -444,19 +478,27 @@ const BudgetEngine=(function(){
       delete map[k];
     }
   }
+  // 分级裁剪：当期账目永不裁剪；历史账目按“已撤销/已冲正 → 无实体引用 → 有实体引用”顺序删除
   function pruneLedger(){
     const arr=budgets().ledger;
     const max=Math.max(1,Math.round(Number(settings().ledgerMax)||BUDGET_LEDGER_MAX));
     if(arr.length<=max)return;
     const curKeys={};
     categories().forEach(function(c){curKeys[c.id]=budgets().current[c.id]||'';});
-    const removable=arr.filter(function(e){
-      if(e.status==='reversed')return true;
+    const isCurrent=function(e){
       const ck=curKeys[e.categoryId]||'';
-      return !!(e.periodKey&&ck&&e.periodKey!==ck);
+      return !!(e.periodKey&&ck&&e.periodKey===ck);
+    };
+    const referenced=function(e){
+      return !!(e.links&&(e.links.checkinLogId||e.links.affairId||e.links.choreId));
+    };
+    const removable=arr.filter(function(e){
+      if(e.status&&e.status!=='active')return true;
+      return !isCurrent(e);
     });
     removable.sort(function(a,b){
-      const ar=a.status==='reversed'?0:1,br=b.status==='reversed'?0:1;
+      const ar=(a.status&&a.status!=='active')?0:(referenced(a)?2:1);
+      const br=(b.status&&b.status!=='active')?0:(referenced(b)?2:1);
       if(ar!==br)return ar-br;
       return (a.ts||0)-(b.ts||0);
     });
@@ -510,14 +552,71 @@ const BudgetEngine=(function(){
     }
     return topup;
   }
-  // 撤销一笔现实账目：只允许当期；按原始惩罚/反哺流水精确退回，水位只降不升
+  // 跨期冲正：历史周期冻结（不改 spent / 水位 / 已发奖惩），只在本期记一笔退回额度。
+  // 冲正只影响“是否还算超支”，不进入结余计算，避免用撤销旧消费的方式凭空多领结余奖励。
+  function compensateEntry(ref){
+    ref=ref||{};
+    const nested=Ledger.inTxn();
+    const run=function(){
+      const cat=category(ref.catId);
+      if(!cat)return null;
+      const amt=round4(Math.max(0,Number(ref.amount)||0));
+      if(amt<=0)return null;
+      const bd=budgets();
+      const origId=String(ref.entryId||'');
+      const orig=origId?bd.ledger.find(function(e){return e.id===origId;})||null:null;
+      if(orig&&orig.status&&orig.status!=='active')return orig;
+      const dup=bd.ledger.find(function(e){
+        return e&&e.source==='reversal'&&e.links&&e.links.reversalOf===origId&&origId;
+      });
+      if(dup)return dup;
+      const got=getPeriod(cat,now(),true);
+      const p=got.period;
+      p.refund=round4((Number(p.refund)||0)+amt);
+      if(orig){
+        orig.status='compensated';
+        orig.compensatedAt=now();
+        orig.compensatedInPeriod=p.key;
+      }
+      const entry={
+        id:uid(),ts:now(),txnId:'',categoryId:cat.id,
+        amount:0,refundAmount:amt,source:'reversal',productId:'',note:'跨期冲正',
+        periodKey:p.key,status:'active',reversedAt:null,topupAdded:0,topupCost:0,penaltyOverspendDelta:0,
+        links:{
+          purchaseLogId:'',topupLogId:'',penaltyLogIds:[],feedbackLogIds:[],
+          checkinLogId:'',affairId:'',affairAdvanceId:'',choreId:'',reversalOf:origId
+        },
+        snapshot:{
+          limit:round4(cat.limit),topupAmount:round4(p.topupAmount),
+          overspendAfter:overspendOf(cat,p),penaltyAfter:round4(Number(p.penalizedOverspend)||0)
+        }
+      };
+      bd.ledger.push(entry);
+      bd.current[cat.id]=p.key;
+      recomputeWater(cat,p);
+      pruneLedger();
+      prunePeriods(cat);
+      return entry;
+    };
+    if(nested){const got=run();if(!got)return false;return true;}
+    const r=Ledger.txn(run,{label:'budget-compensate',save:'none',render:false});
+    if(!r.ok){
+      const info=(r.error&&r.error.info)||{};
+      toast(info.reason||'冲正失败','err');
+      return false;
+    }
+    save();render();
+    toast('已跨期冲正现实账目（历史周期与已发奖惩不变）');
+    return true;
+  }
+  // 撤销一笔现实账目：只允许当期；按原始惩罚/反哺流水精确退回，水位按快照重算
   function reverseEntry(entryId){
     const nested=Ledger.inTxn();
     const r=Ledger.txn(function(){
       const bd=budgets();
       const e=bd.ledger.find(function(x){return x.id===entryId;});
       if(!e)return failB('BUDGET_ENTRY_MISSING',{reason:'账目不存在'});
-      if(e.status==='reversed')return failB('BUDGET_ENTRY_REVERSED',{reason:'该账目已撤销'});
+      if(e.status&&e.status!=='active')return failB('BUDGET_ENTRY_REVERSED',{reason:'该账目已撤销或已冲正'});
       const cat=category(e.categoryId);
       if(!cat)return failB('BUDGET_CATEGORY_MISSING',{reason:'预算分类不存在'});
       const map=bd.periods[cat.id];
@@ -534,11 +633,12 @@ const BudgetEngine=(function(){
       const spentNew=Math.max(0,round4(p.spent-e.amount));
       p.spent=spentNew;
       p.entryCount=Math.max(0,(Number(p.entryCount)||0)-1);
-      p.penalizedOverspend=Math.max(0,round4((Number(p.penalizedOverspend)||0)-(Number(e.penaltyOverspendDelta)||0)));
       e.status='reversed';
       e.reversedAt=now();
       e.links.penaltyLogIds=[];
       e.links.feedbackLogIds=[];
+      // 水位按存活账目快照重算：与撤销顺序无关，且只会降低
+      recomputeWater(cat,p);
       return e;
     },{label:'budget-reverse',save:'none',render:false});
     if(!r.ok){
@@ -565,6 +665,16 @@ const BudgetEngine=(function(){
     if(rule.params.mode==='fixed'&&!(Number(rule.params.value)>=0))return no+'固定值不能为负';
     if(rule.params.capPerPeriod!==null&&Number(rule.params.capPerPeriod)<0)return no+'每期上限不能为负';
     if(!(Number(rule.params.minAmount)>=0))return no+'最低值不能为负';
+    // 结余转化系数之和不得超过 1：否则多条规则会把同一份结余放大成多倍奖励（只拦新保存，不追溯历史配置）
+    if(rule.kind==='reward'&&rule.enabled&&rule.params.mode==='ratio'&&cat&&Array.isArray(cat.rules)){
+      let sum=Number(rule.params.rate)||0;
+      cat.rules.forEach(function(r){
+        if(!r||r===rule||r.id===rule.id)return;
+        if(r.kind!=='reward'||!r.enabled||!r.params||r.params.mode!=='ratio')return;
+        sum+=Number(r.params.rate)||0;
+      });
+      if(sum>1+1e-9)return no+'结余转化的比例系数之和不能超过 1（当前 '+fmt(sum)+'）';
+    }
     return '';
   }
   return{
@@ -572,7 +682,8 @@ const BudgetEngine=(function(){
     readPeriod:readPeriod,activityContext:activityContext,effectiveLimit:effectiveLimit,overspendOf:overspendOf,
     preview:preview,prepareEntry:prepareEntry,commitEntry:commitEntry,
     settlePeriod:settlePeriod,reconcileDue:reconcileDue,reconcileAll:reconcileAll,
-    reverseEntry:reverseEntry,noteEffectReversed:noteEffectReversed,validateRule:validateRule,
+    reverseEntry:reverseEntry,compensateEntry:compensateEntry,noteEffectReversed:noteEffectReversed,validateRule:validateRule,
+    netSpentOf:netSpentOf,recomputeWater:recomputeWater,
     pruneLedger:pruneLedger,prunePeriods:prunePeriods,ruleHandlers:RULE_HANDLERS
   };
 })();

@@ -7,6 +7,7 @@ import { archiveIdleEntities } from './entities.js';
 import { openModal } from './modal-host.js';
 import { cardName, isAffairMetric, isChoreMetric, isPointMetric, esc, fmt } from './pure.js';
 import { state } from './state.js';
+import { addDays, dayStart, now, rangeOf, relativeDay, weekStart } from './time.js';
 import { domainName, taskNameLabel } from './utils.js';
 // cycle.js —— 周期活动列表与编辑
 // 由 app.js 按功能拆分（第五轮可维护性重构），行为不变。
@@ -15,8 +16,7 @@ import { domainName, taskNameLabel } from './utils.js';
 function fmtDate(ts){
   if(!ts)return '—';
   const d=new Date(ts);
-  const today=new Date();today.setHours(0,0,0,0);
-  const diffDays=Math.round((ts-today.getTime())/864e5);
+  const diffDays=relativeDay(ts);
   if(diffDays===0)return '今天';
   if(diffDays===1)return '明天';
   if(diffDays===2)return '后天';
@@ -24,12 +24,9 @@ function fmtDate(ts){
 }
 function cycleNextGrant(cfg){
   const anchor=cfg.anchor||1;
-  if(cfg.period==='day'){const d=new Date();d.setHours(0,0,0,0);return d.getTime()+864e5;}
-  if(cfg.period==='month'){const d=new Date();return new Date(d.getFullYear(),d.getMonth()+1,1).getTime();}
-  const d=new Date();d.setHours(0,0,0,0);
-  const dow=(d.getDay()+6)%7+1;
-  let diff=anchor-dow;if(diff<=0)diff+=7;
-  return d.getTime()+diff*864e5;
+  if(cfg.period==='day')return addDays(dayStart(now()),1);
+  if(cfg.period==='month')return rangeOf('month',now()).end;
+  return addDays(weekStart(now(),anchor),7);
 }
 function updateExemptChip(){
   const chip=document.getElementById('exemptChip');

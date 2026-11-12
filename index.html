@@ -370,6 +370,8 @@
       </div>
     </div>
 
+    <div id="taskBudgetBind"></div>
+
     <div class="modal-foot">
       <button class="btn" onclick="closeModal('taskModal')">取消</button>
       <button class="btn" id="taskSaveBtn">保存</button>
@@ -426,6 +428,7 @@
       <div id="affairSteps"></div>
       <button type="button" class="btn btn-sm" style="margin-top:8px" onclick="affairAddStep()">+ 添加步骤</button>
     </div>
+    <div id="affairBudgetBind"></div>
     <div class="modal-foot">
       <button class="btn" onclick="closeModal('affairModal')">取消</button>
       <button class="btn btn-danger" id="affairDelBtn" style="display:none" onclick="delAffair(document.getElementById('affairId').value)">删除</button>
@@ -507,10 +510,42 @@
       <label>保鲜期覆盖 <span class="h">留空则使用全局默认（当前 <span id="choreFreshDefaultHint">7</span> 天）</span></label>
       <input type="number" id="choreFreshDays" min="0" step="1" placeholder="留空 = 跟随全局设置">
     </div>
+    <div class="fg">
+      <label>产出进度值 <span class="h">勾选完成时按领域分摊发放；留空 = 0（不产出）</span></label>
+      <input type="number" id="choreProgressAmount" min="0" step="0.01" placeholder="0">
+    </div>
+    <div class="fg">
+      <label>产出领域 <span class="h">多选；全部取消则使用默认领域</span></label>
+      <div id="choreProgressDomains" class="domain-checklist"></div>
+    </div>
+    <div id="choreBudgetBind"></div>
     <div class="modal-foot">
       <button class="btn" onclick="closeModal('choreModal')">取消</button>
+      <button class="btn" id="choreUndoConvBtn" style="display:none" onclick="undoConversion()">撤销转换</button>
+      <button class="btn" id="choreConvertBtn" style="display:none" onclick="choreConvertFromModal()">转为项目</button>
       <button class="btn btn-danger" id="choreDelBtn" style="display:none" onclick="delChore()">删除</button>
       <button class="btn" id="choreSaveBtn">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Budget Amount Modal（执行时临时输入现实金额） ===== -->
+<div class="modal-bg" id="budgetAmountModal">
+  <div class="modal">
+    <h2 id="budgetAmountTitle">记录现实花费</h2>
+    <div class="fg">
+      <label>预算分类</label>
+      <div class="bud-cat" id="budgetAmountCat">—</div>
+    </div>
+    <div class="fg">
+      <label>金额 <span class="h">确认后与本次动作在同一个事务里记账</span></label>
+      <input type="number" id="budgetAmountInput" min="0" step="0.01" placeholder="0.00" oninput="budgetAmountInput()">
+    </div>
+    <div class="amt-preview" id="budgetAmountPreview"></div>
+    <div class="bud-hint" id="budgetAmountHint"></div>
+    <div class="modal-foot">
+      <button class="btn" onclick="budgetAmountCancel()">取消</button>
+      <button class="btn" style="background:var(--progress);color:#fff" onclick="budgetAmountConfirm()">确认</button>
     </div>
   </div>
 </div>

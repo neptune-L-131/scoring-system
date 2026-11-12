@@ -1,8 +1,9 @@
 import { normalizeCondition } from './cond-model.js';
 import { gateConditionOf } from './cond-model.js';
+import { normalizeBudgetBinding, normalizeBudgetRef } from './budget-binding.js';
 import { ACTIVITY_MAX_DAYS, AUDIT_MAX, BUDGET_LEDGER_MAX, BUDGET_PERIOD_KEEP, BUDGET_RULE_KINDS, PROD_TIERS, SCHEMA_VERSION, SHADOW_MAX, STATS_ENTITY_MAPS, STATS_KEEP_DAYS, STATS_SCALARS, STATS_VERSION, COND_METRIC_KEYS } from './constants.js';
 import { defaultBudgetsState, defaultChoreConfig, defaultProductGate, migrateChore, normalizeChoreConfig, tierCurrency, defaultActivities, defaults } from './defaults.js';
-import { budgetBounds, dayKey, periodKey, migrateAffair, esc, now, uid, validRange, normOp, toNum, toTs, asArray, dateKeyOffset } from './pure.js';
+import { budgetBounds, dayKey, periodKey, migrateAffair, esc, now, uid, validRange, normOp, toNum, toTs, asArray, dateKeyOffset, round2 } from './pure.js';
 import { emptyAccountSums } from './stats.js';
 import { totalProgress } from './utils.js';
 // normalize.js —— 存档结构归一、迁移、解析（loadIssue / _persistBlocked 归此处）
@@ -89,14 +90,15 @@ function normalizeScores(s){
 }
 function normalizeTaskNums(t){
   if(!t||typeof t!=='object')return t;
-  t.initialValue=toNum(t.initialValue);
-  t.interestRate=toNum(t.interestRate);
-  t.debtRate=toNum(t.debtRate);
-  t.vitalityCost=toNum(t.vitalityCost);
+  // 金额类字段读档即统一到两位，历史存档里的浮点尾巴不会带入后续计算
+  t.initialValue=round2(toNum(t.initialValue));
+  t.interestRate=round2(toNum(t.interestRate));
+  t.debtRate=round2(toNum(t.debtRate));
+  t.vitalityCost=round2(toNum(t.vitalityCost));
   t.checkInCount=Math.max(0,Math.round(toNum(t.checkInCount)));
   t.streak=Math.max(0,Math.round(toNum(t.streak)));
-  t.totalEarned=toNum(t.totalEarned);
-  t.pendingDebt=toNum(t.pendingDebt);
+  t.totalEarned=round2(toNum(t.totalEarned));
+  t.pendingDebt=round2(toNum(t.pendingDebt));
   t.lastCheckIn=toTs(t.lastCheckIn);
   if(t.lastExempt!==undefined)t.lastExempt=toTs(t.lastExempt);
   if(t.archivedAt!==undefined)t.archivedAt=toTs(t.archivedAt);
@@ -235,6 +237,7 @@ function normalizeLogNums(l){
   l.amt=toNum(l.amt);
   if(l.amtV!==undefined)l.amtV=toNum(l.amtV);
   if(l.amtP!==undefined)l.amtP=toNum(l.amtP);
+  if(l.budgetRef!==undefined)l.budgetRef=normalizeBudgetRef(l.budgetRef);
   return l;
 }
 function normalizeCards(c){
@@ -332,6 +335,7 @@ function normalizeBudgetPeriod(p,key,cycle,anchor){
     start:toNum(p.start,0)||b.start,
     end:toNum(p.end,0)||b.end,
     spent:Math.max(0,toNum(p.spent,0)),
+    refund:Math.max(0,toNum(p.refund,0)),
     entryCount:Math.max(0,Math.round(toNum(p.entryCount,0))),
     topupAmount:Math.max(0,toNum(p.topupAmount,0)),
     topupCost:Math.max(0,toNum(p.topupCost,0)),
@@ -358,12 +362,15 @@ function normalizeBudgetLedgerEntry(e,ctx){
     txnId:String(e.txnId||''),
     categoryId:catId,
     amount:Math.max(0,toNum(e.amount,0)),
-    source:e.source==='product'?'product':'manual',
+    refundAmount:Math.max(0,toNum(e.refundAmount,0)),
+    source:['manual','product','task','affair','chore','reversal'].indexOf(e.source)>=0?e.source:'manual',
     productId:String(e.productId||''),
     note:String(e.note||'').slice(0,80),
     periodKey:String(e.periodKey||''),
-    status:e.status==='reversed'?'reversed':'active',
+    status:(e.status==='reversed'||e.status==='compensated')?e.status:'active',
     reversedAt:toTs(e.reversedAt),
+    compensatedAt:toTs(e.compensatedAt),
+    compensatedInPeriod:String(e.compensatedInPeriod||''),
     topupAdded:Math.max(0,toNum(e.topupAdded,0)),
     topupCost:Math.max(0,toNum(e.topupCost,0)),
     penaltyOverspendDelta:Math.max(0,toNum(e.penaltyOverspendDelta,0)),
@@ -371,7 +378,12 @@ function normalizeBudgetLedgerEntry(e,ctx){
       purchaseLogId:String(links.purchaseLogId||''),
       topupLogId:String(links.topupLogId||''),
       penaltyLogIds:asArray(links.penaltyLogIds).map(String).filter(Boolean),
-      feedbackLogIds:asArray(links.feedbackLogIds).map(String).filter(Boolean)
+      feedbackLogIds:asArray(links.feedbackLogIds).map(String).filter(Boolean),
+      checkinLogId:String(links.checkinLogId||''),
+      affairId:String(links.affairId||''),
+      affairAdvanceId:String(links.affairAdvanceId||''),
+      choreId:String(links.choreId||''),
+      reversalOf:String(links.reversalOf||'')
     },
     snapshot:{
       limit:Math.max(0,toNum(snap.limit,0)),
@@ -466,6 +478,8 @@ function applyMigrations(p){
   p.schema={v:SCHEMA_VERSION,migratedAt:now()};
 }
 function parseState(raw){
+  // 每次解析都是独立一次读档：先归零上一次的结果，避免失败状态残留到下一次成功解析
+  loadIssue=null;
   if(!raw)return defaults();
   let p;
   try{
@@ -499,6 +513,16 @@ function parseState(raw){
     // 先归一 ext：预算分类决定商品绑定分类是否有效，再归一商品
     const extNorm=normalizeExt(p.ext,prodCtx);
     if(!prodCtx.catIds)prodCtx.catIds=new Set((extNorm.budgets.categories||[]).map(function(c){return c.id;}));
+    // 事项 × 预算绑定：在预算分类归一之后做，才能判定绑定是否已失效
+    const budCtx={catIds:prodCtx.catIds};
+    tasks.forEach(function(t){t.budget=normalizeBudgetBinding(t.budget,budCtx);});
+    const affairs=asArray(p.affairs).filter(Boolean).map(migrateAffair);
+    const chores=asArray(p.chores).filter(Boolean).map(migrateChore);
+    affairs.forEach(function(a){a.budget=normalizeBudgetBinding(a.budget,budCtx);});
+    chores.forEach(function(c){
+      c.budget=normalizeBudgetBinding(c.budget,budCtx);
+      c.budgetRef=normalizeBudgetRef(c.budgetRef);
+    });
     return{
       schema:{v:SCHEMA_VERSION,migratedAt:toTs(p.schema&&p.schema.migratedAt)},
       scores:normalizeScores(p.scores),
@@ -511,12 +535,13 @@ function parseState(raw){
       majorCollapsed:asArray(p.majorCollapsed),
       tasks:tasks,
       achievements:achievements,
-      affairs:asArray(p.affairs).filter(Boolean).map(migrateAffair),
-      chores:asArray(p.chores).filter(Boolean).map(migrateChore),
+      affairs:affairs,
+      chores:chores,
       choreConfig:normalizeChoreConfig(p.choreConfig),
       affairPresets:asArray(p.affairPresets).filter(Boolean).map(normalizePresetNums),
       affairCollapsed:asArray(p.affairCollapsed),
       affairUndo:(p.affairUndo&&typeof p.affairUndo==='object'&&!Array.isArray(p.affairUndo))?p.affairUndo:{},
+      conversions:asArray(p.conversions).filter(function(x){return x&&typeof x==='object'&&!Array.isArray(x);}),
       products:asArray(p.products).filter(Boolean).map(function(prod){return normalizeProduct(prod,prodCtx);}),
       logs:asArray(p.logs).filter(Boolean).map(normalizeLogNums),
       loans:asArray(p.loans).filter(Boolean).map(normalizeLoanNums),

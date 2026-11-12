@@ -9,6 +9,7 @@ import { isArchivedEntity, round4, condWindowByRange, dayKey, dayStartTs, period
 import { processChoreDecay } from './render-work.js';
 import { render } from './render.js';
 import { state } from './state.js';
+import { dayDiff } from './time.js';
 import { activityCountForDomain, choreOverdueDays, domainName, totalProgress } from './utils.js';
 // entities.js —— 阶段 1 指标与结构操作（不活跃归档）
 // 由 app.js 按功能拆分（第五轮可维护性重构），行为不变。
@@ -190,7 +191,7 @@ function evalCondItem(it,act,ts){
   if(it.metric==='domain_activity'){
     const did=(it.targetType==='domain')?(it.target||''):'';
     if(!did)return false;
-    const days=range==='recent'?Math.max(1,Math.round(Number(it.days)||7)):Math.max(1,Math.round((w.end-w.start)/864e5));
+    const days=range==='recent'?Math.max(1,Math.round(Number(it.days)||7)):Math.max(1,dayDiff(w.end,w.start));
     return opSatisfied(activityCountForDomain(did,days),it.op,v);
   }
   // 阶段 1：点态指标（不活跃天数/超期件数）与项目、杂事指标

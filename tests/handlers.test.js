@@ -96,7 +96,9 @@ describe('内联事件处理器登记', () => {
 
   it('被报告失效的两个按钮确实已登记', () => {
     const handlers = new Set(readHandlers());
-    for (const n of ['budRuleEditWhen', 'budRuleDoneWhen', 'toggleAffairView', 'delMetric', 'closeAffairMenu']) {
+    for (const n of ['budRuleEditWhen', 'budRuleDoneWhen', 'toggleAffairView', 'delMetric', 'closeAffairMenu',
+      // 金额弹窗：确认/取消/输入预览 + 绑定组模式切换，漏登记会让弹窗按钮静默失效
+      'budgetAmountConfirm', 'budgetAmountCancel', 'budgetAmountInput', 'budgetBindingModeChange']) {
       expect(handlers.has(n), n + ' 未登记').toBe(true);
     }
   });

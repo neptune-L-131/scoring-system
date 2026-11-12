@@ -211,9 +211,14 @@ async function attemptRecovery(){
     let raw=null;
     try{raw=await idbGet(KEY+'_corrupt');}catch(e){}
     if(raw===undefined||raw===null||raw===''){toast('未找到可恢复的原始数据','err');return;}
+    setLoadIssue(null);
     const s=parseState(raw);
-    if(!s||typeof s!=='object'||!s.scores){toast('恢复失败：原始内容无法解析','err');return;}
+    // 备份本身也解析失败：不能当成恢复成功写入，否则会用空白默认库覆盖现场。
+    // 部分可修复（salvaged）属于成功路径，与正常读档口径保持一致。
+    if((loadIssue&&loadIssue.type!=='salvaged')||!s||typeof s!=='object'||!s.scores){toast('恢复失败：备份内容无法解析','err');return;}
     setState(s);
+    // 用户已显式执行恢复：解除读档失败造成的写盘暂停，否则 save() 会被静默跳过
+    setPersistBlocked(false);
     save();
     render();
     toast('已尝试恢复上次数据','ok');

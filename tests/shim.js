@@ -24,6 +24,19 @@ const EXPORT_NAMES = [
   'stageSel', 'stageValueAt', 'stageCellLabel', 'stageNetAt',
   'dayKey', 'weekStartKey', 'weekStartTs', 'periodKey', 'budgetBounds', 'dayStartTs',
   'prevPeriodRange', 'condWindowByRange', 'idleDaysSince', 'weekAnchorName',
+  // 统一时间源（time.js）
+  'dayStart', 'dayKeyOf', 'dayIndex', 'dayDiff', 'addDays', 'todayKey', 'isToday',
+  'weekStart', 'weekKey', 'periodKeyOf', 'rangeOf', 'keyOffset', 'relativeDay',
+  'businessDayKey', '__setClockForTest', '__clockRollbacks',
+  // 只读实体聚合层（entity-kit.js）
+  'ENTITY_KINDS', 'KIND_LABEL', 'normalizeEntityRef', 'entityRef', 'findEntity',
+  'entityName', 'entityDomainIds', 'entityActive', 'entityLastActivity', 'entityMeta',
+  'entityHistory', 'todayAgenda',
+  // 事项转换（entity-convert.js）
+  'CONVERSIONS_MAX', 'lossyFieldsOf', 'choreToAffair', 'affairToChore',
+  'conversionUndoState', 'lastConversion', 'canUndoConversion', 'undoConversion',
+  // 杂事产出进度（utils.js）
+  'choreProgressOf', 'choreProgressParts',
   // 账户差额 / 统计
   'emptyAccountSums', 'accountSumsAdd', 'statsDiffs', 'noteInvisible', 'noteEvicted',
   'shadowLabel', 'shadowPush', 'seedCalibrationShadow', 'accountLabel',
@@ -199,10 +212,10 @@ function installBrowserGlobals() {
 async function loadFromModules() {
   // 纯逻辑模块（不含 main.js：入口会跑初始化、碰 DOM）。
   const MODULES = [
-    'constants.js', 'pure.js', 'defaults.js', 'toast.js', 'cond-model.js', 'modal-host.js',
+    'constants.js', 'time.js', 'pure.js', 'entity-kit.js', 'defaults.js', 'toast.js', 'cond-model.js', 'modal-host.js',
     'state.js', 'theme.js', 'normalize.js', 'persist.js', 'utils.js', 'stats.js',
-    'ledger.js', 'gate.js', 'budget.js', 'conditions.js', 'entities.js', 'business.js',
-    'library.js', 'shell.js', 'render-work.js', 'render-bank.js', 'render-shop.js',
+    'ledger.js', 'gate.js', 'budget.js', 'budget-binding.js', 'conditions.js', 'entities.js', 'business.js',
+    'library.js', 'shell.js', 'render-work.js', 'entity-convert.js', 'render-bank.js', 'render-shop.js',
     'render-budget.js', 'cycle.js', 'cond-ui.js', 'ui-events.js', 'undo.js',
     'modals.js', 'data.js', 'pwa.js', 'debug.js', 'startup.js',
   ];

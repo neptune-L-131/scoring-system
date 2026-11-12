@@ -1,9 +1,13 @@
 import { registerRenderer } from './render.js';
-import { choreCfg, choreFreshDays, choreBaseTs, choreOverdueDays, choreTierRate, choreDailyDecay, choreUnsettled } from './utils.js';
+import { choreCfg, choreFreshDays, choreBaseTs, choreOverdueDays, choreTierRate, choreDailyDecay, choreUnsettled, choreProgressOf, choreProgressParts } from './utils.js';
 import { checkAchievements, checkIn, useExemption } from './business.js';
+import { BudgetEngine } from './budget.js';
+import { budgetBadgeHTML, budgetBindingHTML, budgetOf, budgetRefOf, openBudgetAmountDialog, readBudgetBinding, rememberBudgetDraft, resolveActionBudget, reverseBoundBudget } from './budget-binding.js';
 import { exemptionActivity } from './conditions.js';
 import { STAGE_NAMES, AFFAIR_CURVES } from './constants.js';
 import { defaultChoreConfig, normalizeChoreConfig } from './defaults.js';
+import { todayAgenda } from './entity-kit.js';
+import { affairToChore, canUndoConversion, choreToAffair, lastConversion, undoConversion } from './entity-convert.js';
 import { Ledger } from './ledger.js';
 import { addDomain, delCollection, delDomain, renameCollection, renameDomain, unlockTask } from './library.js';
 import { confirmDelAch, confirmDelTask, openAchModal, openTaskModal } from './modals.js';
@@ -11,8 +15,10 @@ import { closeModal, openModal } from './modal-host.js';
 import { commit, save } from './persist.js';
 import { calcCheckIn, calcSkip, dayKey, dayStartTs, weekStartTs, toNum, round2, stageCellLabel, stageNetAt, stageSel, taskIsStaged, clone, daysSince, esc, escAttr, fmt, fmtTime, getTaskDomainIds, now, taskCheckedToday, taskHasType, taskScoreTypes, uid, affairSteps, affairTotalSteps, affairDoneSteps, affairLastAdvance, affairCurve, affairCurveType, affairTargetAt, affairIsDone } from './pure.js';
 import { render } from './render.js';
+import { fillDomainChecklist } from './shell.js';
 import { state } from './state.js';
 import { toast } from './toast.js';
+import { addDays, dayDiff, dayStart, weekStart } from './time.js';
 import { drag, filterByDomain, syncMajorCollapse, toggleCollapse, toggleInline } from './ui-events.js';
 import { domainName, domainProgress, totalProgress } from './utils.js';
 // render-work.js —— 渲染：打工页（任务/项目/杂事/阶段奖励）
@@ -296,6 +302,8 @@ function renderAffairs(){
   // 2. 日程区（列表/日历视图切换只影响本区呈现）
   const schedCount=affairUnits().length;
   html+=affairZoneStart('schedule','日程',schedCount,'<button class="affair-view-toggle" onclick="event.stopPropagation();toggleAffairView()">'+(affairView==='cal'?'列表':'日历')+'</button>');
+  // 只读聚合：任务打卡 / 项目日程 / 到期杂事合成“今天该做什么”（不写 state、不改变下方分区）
+  html+=todayAgendaHTML();
   html+=(affairView==='cal')?renderAffairCalendar():renderAffairSchedule();
   html+=AFFAIR_ZONE_END;
   // 3. 草稿区（无步骤、未安排、尚未推进）
@@ -387,8 +395,11 @@ function toggleAffairMenu(e,id){
   let menu=document.getElementById('affairMenu');
   if(!menu){menu=document.createElement('div');menu.id='affairMenu';menu.className='affair-menu';document.body.appendChild(menu);}
   const canUndo=affairCanUndo(a);
+  const convUndo=canUndoConversion()&&lastConversion()&&lastConversion().entityId===id;
   menu.innerHTML=
     '<button onclick="openAffairModal(\''+id+'\');closeAffairMenu()">编辑</button>'
+    +'<button onclick="affairToChore(\''+id+'\');closeAffairMenu()">转为杂事</button>'
+    +(convUndo?'<button onclick="undoConversion();closeAffairMenu()">撤销转换</button>':'')
     +(canUndo
       ?'<button onclick="affairUndoAction(\''+id+'\');closeAffairMenu()">撤销上一步</button>'
       :'<button disabled>撤销上一步</button>')
@@ -415,7 +426,7 @@ function affairInProgressCardHTML(a){
   const stall=a.startedAt&&daysSince(a.startedAt)>3;
   return '<div class="card affair-card'+(stall?' stalled':'')+'" data-affair-id="'+a.id+'" onclick="openAffairModal(\''+a.id+'\')">'
     +'<div class="affair-row">'
-    +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+'</div>'
+    +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+budgetBadgeHTML(a)+'</div>'
     +'<div class="affair-actions" onclick="event.stopPropagation()">'
     +affairMoreBtn(a)
     +'<button class="btn btn-sm btn-checkin" onclick="advanceAffairStep(\''+a.id+'\')">完成下一步</button>'
@@ -430,7 +441,7 @@ function affairScheduleCardHTML(a,opts){
   const late=opts&&opts.late;
   return '<div class="card affair-card'+(late?' late':'')+'" data-affair-id="'+a.id+'" onclick="openAffairModal(\''+a.id+'\')">'
     +'<div class="affair-row">'
-    +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+'</div>'
+    +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+budgetBadgeHTML(a)+'</div>'
     +'<div class="affair-actions" onclick="event.stopPropagation()">'
     +affairMoreBtn(a)
     +'<span class="affair-time">'+(opts&&opts.time?opts.time:fmtPlan(a.plannedAt))+'</span>'
@@ -443,7 +454,7 @@ function affairScheduleCardHTML(a,opts){
 function affairDraftCardHTML(a){
   return '<div class="card affair-card" data-affair-id="'+a.id+'" onclick="openAffairModal(\''+a.id+'\')">'
     +'<div class="affair-row">'
-    +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+'</div>'
+    +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+budgetBadgeHTML(a)+'</div>'
     +'<div class="affair-actions" onclick="event.stopPropagation()">'
     +'<button class="btn btn-sm" onclick="openAffairPlanModal(\''+a.id+'\')">计划</button>'
     +affairMoreBtn(a)
@@ -457,7 +468,7 @@ function affairDraftCardHTML(a){
 function affairDoneCardHTML(a){
   return '<div class="card affair-card done" data-affair-id="'+a.id+'" onclick="openAffairModal(\''+a.id+'\')">'
     +'<div class="affair-row">'
-    +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+'</div>'
+    +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+budgetBadgeHTML(a)+'</div>'
     +'<div class="affair-actions" onclick="event.stopPropagation()">'
     +affairMoreBtn(a)
     +'<span class="affair-time">✓ '+fmtTime(a.doneAt)+'</span>'
@@ -496,24 +507,44 @@ function affairStepUnitCardHTML(u,opts){
     +'</div>';
 }
 
+// “今天该做什么”：只读聚合清单，插在日程区顶部；不提供任何写入动作（点击无副作用）
+function todayAgendaHTML(){
+  const items=todayAgenda();
+  if(!items.length)return '';
+  const doneN=items.filter(function(x){return x.status==='done';}).length;
+  const chips=items.map(function(it){
+    const kindCls=it.kind==='affair'?' affair':(it.kind==='chore'?' chore':'');
+    const cls='agenda-chip'+kindCls+(it.status==='done'?' done':'')+(it.overdue?' overdue':'');
+    const label=(it.status==='done'?'✓ ':'')+esc(it.title);
+    const sub=it.subtitle?'<i>'+esc(it.subtitle)+'</i>':'';
+    const flag=it.overdue?'<b>逾期</b>':'';
+    return '<span class="'+cls+'" title="'+(it.kind==='task'?'任务':it.kind==='affair'?'项目':'杂事')+'">'+label+sub+flag+'</span>';
+  }).join('');
+  return '<div class="agenda-box">'
+    +'<div class="agenda-head">今天该做什么 <span class="agenda-count">'+(items.length-doneN)+' 待办 · '+doneN+' 已完成</span></div>'
+    +'<div class="agenda-list">'+chips+'</div>'
+    +'</div>';
+}
+
 function renderAffairSchedule(){
   const units=affairUnits();
-  const nowTs=Date.now();
-  const todayStart=dayStartTs(nowTs);
-  const tomorrowStart=todayStart+864e5;
-  const dayAfter=tomorrowStart+864e5;
-  const weekEnd=weekStartTs(1,nowTs)+7*864e5;
+  const nowTs=now();
+  const todayStart=dayStart(nowTs);
+  const tomorrowStart=addDays(todayStart,1);
+  const dayAfter=addDays(todayStart,2);
+  const weekEnd=addDays(weekStart(nowTs,1),7);
   function bucket(ts){
+    if(ts<todayStart)return 'overdue';   // 逾期项单列，不再混进“今天”
     if(ts<tomorrowStart)return 'today';
     if(ts<dayAfter)return 'tomorrow';
     if(ts<weekEnd)return 'week';
     return 'later';
   }
-  const defs=[{key:'today',title:'今天'},{key:'tomorrow',title:'明天'},{key:'week',title:'本周'},{key:'later',title:'之后'}];
+  const defs=[{key:'overdue',title:'逾期'},{key:'today',title:'今天'},{key:'tomorrow',title:'明天'},{key:'week',title:'本周'},{key:'later',title:'之后'}];
   let html='';
   defs.forEach(function(d){
     const items=units.filter(function(u){return bucket(u.ts)===d.key;}).sort(function(a,b){return a.ts-b.ts;});
-    html+='<div class="affair-day-group">'
+    html+='<div class="affair-day-group'+(d.key==='overdue'?' overdue':'')+'">'
       +'<div class="affair-day-title">'+d.title+' <span class="affair-zone-count">'+items.length+'</span></div>';
     if(items.length===0){
       html+='<div class="affair-empty">无</div>';
@@ -534,10 +565,10 @@ function renderAffairCalendar(){
   const units=affairUnits();
   if(!affairCalCursor){const n=new Date();affairCalCursor={y:n.getFullYear(),m:n.getMonth()};}
   const y=affairCalCursor.y,m=affairCalCursor.m;
-  const todayTs=dayStartTs(Date.now());
+  const todayTs=dayStart(now());
   const first=new Date(y,m,1);
   const firstDow=(first.getDay()+6)%7; // 周一=0
-  const startTs=first.getTime()-firstDow*864e5;
+  const startTs=addDays(first.getTime(),-firstDow);
   let html='<div class="cal-head">'
     +'<button class="cal-nav" onclick="affairCalShift(-1)">◀</button>'
     +'<div class="cal-title">'+y+'年'+(m+1)+'月</div>'
@@ -546,7 +577,7 @@ function renderAffairCalendar(){
   html+='<div class="cal-grid">';
   ['一','二','三','四','五','六','日'].forEach(function(w){html+='<div class="cal-dow">'+w+'</div>';});
   for(let i=0;i<42;i++){
-    const ts=startTs+i*864e5;
+    const ts=addDays(startTs,i);
     const d=new Date(ts);
     const inMonth=d.getMonth()===m;
     const isToday=ts===todayTs;
@@ -614,11 +645,18 @@ function reverseAffairValue(a,amt,desc){
   }
 }
 // 推进 currentCell 并按水位结算；到达格 9 视为完成 + 发放成果点
-function affairApplyProgress(a,cell){
+function affairApplyProgress(a,cell,opts){
+  opts=opts||{};
   cell=Math.max(0,Math.min(9,Math.round(cell)));
   Ledger.txn(function(){
     a.currentCell=cell;
     if(cell>0&&!a.startedAt)a.startedAt=now();
+    // 现实预算先于本笔收益入账（先扣后收）
+    if(opts.plan){
+      const got=BudgetEngine.commitEntry(null,opts.plan,{affairId:a.id,affairAdvanceId:opts.advanceId||''});
+      if(opts.snap)opts.snap.budgetRef=budgetRefOf(got.entry,opts.plan);
+      if(a.budget&&a.budget.mode==='prompt')a.budget.lastAmount=opts.plan.amount;
+    }
     const target=affairTargetAt(a,cell);
     const diff=round2(target-(a.alreadyGiven||0));
     if(diff>0){
@@ -647,9 +685,11 @@ function affairPushUndo(a){
   // 撤销后步骤仍显示已完成，与项目进度不一致。
   stack.push({
     cell:a.currentCell||0,given:a.alreadyGiven||0,doneAt:a.doneAt||null,startedAt:a.startedAt||null,
-    steps:(a.steps||[]).map(function(s){return s?{doneAt:s.doneAt||null}:null;})
+    steps:(a.steps||[]).map(function(s){return s?{doneAt:s.doneAt||null}:null;}),
+    budgetRef:null
   });
   if(stack.length>AFFAIR_UNDO_LIMIT)stack.shift();
+  return stack[stack.length-1];
 }
 function affairUndoAction(id){
   const a=state.affairs.find(function(x){return x.id===id;});
@@ -659,6 +699,8 @@ function affairUndoAction(id){
   if(!snap){toast('没有可撤销的操作','warn');return;}
   const revoked=round2((a.alreadyGiven||0)-(snap.given||0));
   const txr=Ledger.txn(function(){
+    // 联动撤销现实账目：当期硬撤、跨期冲正；失败则整单回滚
+    if(snap.budgetRef)reverseBoundBudget(snap.budgetRef);
     if(revoked>0)reverseAffairValue(a,revoked,'撤销项目「'+a.name+'」推进');
     if(!!a.doneAt&&!snap.doneAt&&a.ach&&a.ach.enabled&&a.ach.amount>0){
       Ledger.grant('achievement',-a.ach.amount,{src:'affair',desc:'撤销项目「'+a.name+'」成果点',affairId:a.id});
@@ -672,40 +714,79 @@ function affairUndoAction(id){
   commit('已撤销「'+a.name+'」');
 }
 
-function _completeAffairStep(a,s){
+// 项目动作的预算闸门：临时金额弹窗必须在 Ledger.txn 之前完成
+function affairBudgetGate(a,resolved,again,onCancel){
+  const bind=budgetOf(a);
+  if(bind&&bind.mode==='prompt'&&(!resolved||resolved.amount==null)){
+    openBudgetAmountDialog({
+      kind:'affair',id:a.id,entity:a,title:'项目推进：'+a.name,
+      onConfirm:function(amount){again({amount:amount});},
+      onCancel:onCancel||function(){toast('已取消项目推进','warn');}
+    });
+    return{status:'prompt'};
+  }
+  const br=resolveActionBudget(a,{
+    kind:'affair',id:a.id,source:'affair',
+    amount:resolved?resolved.amount:undefined
+  });
+  if(br.status==='skip')toast(br.reason,'warn');
+  return{status:'ok',plan:br.status==='ok'?br.plan:null,amount:br.status==='ok'?br.amount:0};
+}
+function _completeAffairStep(a,s,resolved){
+  const gate=affairBudgetGate(a,resolved,function(r){_completeAffairStep(a,s,r);});
+  if(gate.status==='prompt')return;
   // 步骤完成态与进度结算必须同生共死：任何一笔发放失败时，s.doneAt 也不能留下
   const txr=Ledger.txn(function(){
-    affairPushUndo(a);
+    const snap=affairPushUndo(a);
     s.doneAt=now();
     const steps=affairSteps(a);
     const allDone=steps.every(function(x){return x.doneAt;});
-    affairApplyProgress(a,allDone?9:Math.min(8,(a.currentCell||0)+1));
+    affairApplyProgress(a,allDone?9:Math.min(8,(a.currentCell||0)+1),{plan:gate.plan,snap:snap});
   },{label:'affair-step',save:'none',render:false});
-  if(!txr.ok)return;
+  if(!txr.ok){
+    if(gate.plan)rememberBudgetDraft('affair',a.id,gate.plan.amount);
+    return;
+  }
   commit();
 }
-function advanceAffairStep(id){
+function advanceAffairStep(id,resolved){
   const a=state.affairs.find(function(x){return x.id===id;});
   if(!a||a.doneAt)return;
   const next=affairSteps(a).find(function(s){return !s.doneAt;});
   if(!next){
+    const gate=affairBudgetGate(a,resolved,function(r){advanceAffairStep(id,r);});
+    if(gate.status==='prompt')return;
     // 快照必须在事务内压栈：发放失败回滚时连 undo 栈一起还原，避免留下无效快照
-    const txr=Ledger.txn(function(){affairPushUndo(a);affairApplyProgress(a,9);},{label:'affair-complete',save:'none',render:false});
-    if(!txr.ok)return;
+    const txr=Ledger.txn(function(){
+      const snap=affairPushUndo(a);
+      affairApplyProgress(a,9,{plan:gate.plan,snap:snap});
+    },{label:'affair-complete',save:'none',render:false});
+    if(!txr.ok){
+      if(gate.plan)rememberBudgetDraft('affair',a.id,gate.plan.amount);
+      return;
+    }
     commit();
     return;
   }
-  _completeAffairStep(a,next);
+  _completeAffairStep(a,next,resolved);
 }
-function completeAffair(id){
+function completeAffair(id,resolved){
   const a=state.affairs.find(function(x){return x.id===id;});
   if(!a)return;
   if(a.doneAt){toast('该项目已完成','warn');return;}
-  const txr=Ledger.txn(function(){affairPushUndo(a);affairApplyProgress(a,9);},{label:'affair-complete',save:'none',render:false});
-  if(!txr.ok)return;
+  const gate=affairBudgetGate(a,resolved,function(r){completeAffair(id,r);});
+  if(gate.status==='prompt')return;
+  const txr=Ledger.txn(function(){
+    const snap=affairPushUndo(a);
+    affairApplyProgress(a,9,{plan:gate.plan,snap:snap});
+  },{label:'affair-complete',save:'none',render:false});
+  if(!txr.ok){
+    if(gate.plan)rememberBudgetDraft('affair',a.id,gate.plan.amount);
+    return;
+  }
   commit();
 }
-function completeAffairStep(id,idx){
+function completeAffairStep(id,idx,resolved){
   const a=state.affairs.find(function(x){return x.id===id;});
   if(!a)return;
   if(a.doneAt){toast('该项目已完成','warn');return;}
@@ -713,7 +794,7 @@ function completeAffairStep(id,idx){
   const s=steps[idx];
   if(!s){toast('步骤不存在','warn');return;}
   if(s.doneAt){toast('该步骤已完成','warn');return;}
-  _completeAffairStep(a,s);
+  _completeAffairStep(a,s,resolved);
 }
 
 // ===== 无步骤事务：进度轴拖拽推进 =====
@@ -725,7 +806,7 @@ function initAffairAxes(){
     track._affairBound=true;
     const id=axis.dataset.affairId;
     let startX=0,startY=0,startCell=0,pid=0;
-    let dragging=false,decided=false,abandoned=false,pushed=false;
+    let dragging=false,decided=false,abandoned=false,pushed=false,dragSnap=null,lastCell=0;
     function setCellFromX(clientX){
       const a=state.affairs.find(function(x){return x.id===id;});
       if(!a||a.doneAt)return;
@@ -734,16 +815,33 @@ function initAffairAxes(){
       p=Math.max(0,Math.min(1,p));
       let cell=Math.floor(p*10);if(cell>9)cell=9;if(cell<0)cell=0;
       if(cell<=startCell)return;
-      if(!pushed){affairPushUndo(a);pushed=true;}
+      if(!pushed){dragSnap=affairPushUndo(a);pushed=true;}
+      lastCell=cell;
+      // 拖拽期间只结算虚拟收益；现实账目在松手时按“一次手势一笔”补记
       affairApplyProgress(a,cell);
       const thumb=track.querySelector('.stage-thumb');if(thumb)thumb.style.left=(cell*10+5)+'%';
+    }
+    function finishDragBudget(a,snap,resolved){
+      const gate=affairBudgetGate(a,resolved,function(r){finishDragBudget(a,snap,r);},function(){
+        toast('已取消，本次拖拽进度已回退','warn');
+        affairUndoAction(a.id);
+      });
+      if(gate.status==='prompt')return;
+      if(!gate.plan){commit();return;}
+      const txr=Ledger.txn(function(){
+        const got=BudgetEngine.commitEntry(null,gate.plan,{affairId:a.id,affairAdvanceId:''});
+        snap.budgetRef=budgetRefOf(got.entry,gate.plan);
+        if(a.budget&&a.budget.mode==='prompt')a.budget.lastAmount=gate.plan.amount;
+      },{label:'affair-drag-budget',save:'none',render:false});
+      if(!txr.ok){rememberBudgetDraft('affair',a.id,gate.plan.amount);return;}
+      commit();
     }
     track.addEventListener('pointerdown',function(e){
       const a=state.affairs.find(function(x){return x.id===id;});
       if(!a||a.doneAt)return;
       startX=e.clientX;startY=e.clientY;pid=e.pointerId;
       startCell=a.currentCell||0;
-      dragging=false;decided=false;abandoned=false;pushed=false;
+      dragging=false;decided=false;abandoned=false;pushed=false;dragSnap=null;lastCell=startCell;
     });
     track.addEventListener('pointermove',function(e){
       if(e.pointerId!==pid||decided)return;
@@ -760,8 +858,13 @@ function initAffairAxes(){
     });
     function end(e){
       if(e&&e.pointerId!==pid)return;
-      if(pushed){commit();}
-      dragging=false;decided=false;abandoned=false;pushed=false;
+      const a=state.affairs.find(function(x){return x.id===id;});
+      const snap=dragSnap;
+      dragging=false;decided=false;abandoned=false;pushed=false;dragSnap=null;
+      if(!a||!snap){return;}
+      if(lastCell>startCell)finishDragBudget(a,snap,undefined);
+      else commit();
+      lastCell=startCell;
     }
     track.addEventListener('pointerup',end);
     track.addEventListener('pointercancel',end);
@@ -831,6 +934,9 @@ function openAffairModal(id){
     if(delBtn)delBtn.style.display='none';
   }
   renderAffairSteps();
+  const budBox=document.getElementById('affairBudgetBind');
+  if(budBox)budBox.innerHTML=budgetBindingHTML('affair',id?state.affairs.find(function(x){return x.id===id;}):null);
+  if(budBox)budgetBindingModeChange('affair');
   openModal('affairModal');
   setTimeout(function(){document.getElementById('affairName').focus();},50);
 }
@@ -847,6 +953,7 @@ function handleAffairSave(){
   const plannedAt=fromLocalInput(document.getElementById('affairPlannedAt').value);
   const steps=readAffairSteps();
   if(!name){toast('请输入项目名称','err');return;}
+  const budget=readBudgetBinding('affair');
   const ach={enabled:achEnabled,amount:achEnabled?achAmount:0};
   if(id){
     const a=state.affairs.find(function(x){return x.id===id;});
@@ -854,9 +961,10 @@ function handleAffairSave(){
     a.name=name;a.totalReward=totalReward;a.curve=curve;a.ach=ach;a.domainId=domainId;
     if(!a.doneAt)a.plannedAt=plannedAt;
     a.steps=steps;
+    a.budget=budget;
     Ledger.event('修改项目「'+name+'」','affair-edit');
   }else{
-    state.affairs.push({id:uid(),name:name,totalReward:totalReward,curve:curve,currentCell:0,alreadyGiven:0,domainId:domainId,plannedAt:plannedAt,steps:steps,ach:ach,createdAt:now(),startedAt:null,doneAt:null});
+    state.affairs.push({id:uid(),name:name,totalReward:totalReward,curve:curve,currentCell:0,alreadyGiven:0,domainId:domainId,plannedAt:plannedAt,steps:steps,ach:ach,createdAt:now(),startedAt:null,doneAt:null,budget:budget});
     Ledger.event('创建项目「'+name+'」','affair-create');
   }
   save();
@@ -1013,14 +1121,14 @@ function computeChoreDecay(){
   const rate=choreTierRate(overdue.length,cfg);
   let total=0,dueDays=0,charged=0;
   overdue.forEach(function(c){
-    const deadline=choreBaseTs(c)+Math.round(choreFreshDays(c))*864e5;
-    let start=deadline+864e5;
+    const deadline=addDays(choreBaseTs(c),Math.round(choreFreshDays(c)));
+    let start=addDays(deadline,1);
     if(c.decayKey){
       const p=String(c.decayKey).split('-');
       const last=new Date(Number(p[0]),Number(p[1])-1,Number(p[2])).getTime();
-      if(isFinite(last))start=Math.max(start,last+864e5);
+      if(isFinite(last))start=Math.max(start,addDays(last,1));
     }
-    const days=Math.round((today-start)/864e5)+1;
+    const days=dayDiff(today,start)+1;
     if(days<=0)return;
     charged++;
     dueDays+=days;
@@ -1050,17 +1158,79 @@ function addChoreFromInput(){
   inp.value='';inp.focus();
   render();
 }
-function toggleChoreDone(id){
+function toggleChoreDone(id,resolved){
   const c=(state.chores||[]).find(function(x){return x.id===id;});
   if(!c)return;
   if(c.done){
-    c.done=false;c.doneAt=null;
-    // 取消勾选：腐化从今天重新起算；已结算的批次不回退，避免反复领取
-    c.decayKey=dayKey(now());
-  }else{
+    // 取消勾选：联动撤销现实账目（当期硬撤 / 跨期冲正），失败整单回滚
+    const txr=Ledger.txn(function(){
+      if(c.budgetRef)reverseBoundBudget(c.budgetRef);
+      // 进度值零和：按勾选时的领域分摊快照逐领域回退（不按当前配置重算）
+      const award=c.progressAward;
+      if(award&&Number(award.amount)>0){
+        const parts=(Array.isArray(award.parts)&&award.parts.length)?award.parts:[{did:'d_default',amt:Number(award.amount)}];
+        const dids=parts.map(function(p){return p.did;});
+        Ledger.postSplits({splits:[{domainIds:dids,delta:-Number(award.amount)}],
+          entry:{st:'progress',amt:-Number(award.amount),desc:'取消杂事「'+c.name+'」进度',src:'chore-progress-undo',dom:dids.join(','),choreId:c.id},
+          reason:{src:'chore-progress-undo',dom:dids.join(',')}});
+        delete c.progressAward;
+      }
+      c.done=false;c.doneAt=null;
+      c.budgetRef=null;
+      // 取消勾选：腐化从今天重新起算；已结算的批次不回退，避免反复领取
+      c.decayKey=dayKey(now());
+    },{label:'chore-uncheck',save:'none',render:false});
+    if(!txr.ok){
+      const info=(txr.error&&txr.error.info)||{};
+      toast(info.reason||'取消失败：现实账目未能撤销','err');
+      return;
+    }
+    commit();
+    return;
+  }
+  const bind=budgetOf(c);
+  if(bind&&bind.mode==='prompt'&&(!resolved||resolved.amount==null)){
+    openBudgetAmountDialog({
+      kind:'chore',id:c.id,entity:c,title:'杂事：'+c.name,
+      onConfirm:function(amount){toggleChoreDone(id,{amount:amount});},
+      onCancel:function(){toast('已取消，本次未勾选','warn');render();}
+    });
+    return;
+  }
+  const br=resolveActionBudget(c,{kind:'chore',id:c.id,source:'chore',amount:resolved?resolved.amount:undefined});
+  if(br.status==='skip')toast(br.reason,'warn');
+  const plan=br.status==='ok'?br.plan:null;
+  const txr=Ledger.txn(function(){
     c.done=true;c.doneAt=now();
     c.decayKey=dayKey(now());
+    // 进度值：勾选即产出（与任务打卡同口径），按 splitCents 精确分摊到领域；
+    // 快照 progressAward 供取消勾选时逐分回退，保证零和。批量结算只发活力点，不重复发进度。
+    const awardParts=choreProgressParts(c);
+    if(awardParts.length){
+      const dids=awardParts.map(function(p){return p.did;});
+      const total=round2(awardParts.reduce(function(s,p){return s+p.amt;},0));
+      Ledger.postSplits({splits:[{domainIds:dids,delta:total}],
+        entry:{st:'progress',amt:total,desc:'杂事「'+c.name+'」产出进度',src:'chore-progress',dom:dids.join(','),choreId:c.id},
+        reason:{src:'chore-progress',desc:c.name,dom:dids.join(',')}});
+      c.progressAward={amount:total,parts:awardParts};
+      awardParts.forEach(function(p){checkAchievements(p.did);});
+    }else{
+      delete c.progressAward;
+    }
+    let ref=null;
+    if(plan){
+      const got=BudgetEngine.commitEntry(null,plan,{choreId:c.id});
+      ref=budgetRefOf(got.entry,plan);
+      if(c.budget&&c.budget.mode==='prompt')c.budget.lastAmount=plan.amount;
+    }
+    c.budgetRef=ref;
     settleChoreBatches();
+  },{label:'chore-check',save:'none',render:false});
+  if(!txr.ok){
+    if(plan)rememberBudgetDraft('chore',c.id,plan.amount);
+    const info=(txr.error&&txr.error.info)||{};
+    toast(info.reason||'勾选失败：现实账目未写入','err');
+    return;
   }
   commit();
 }
@@ -1073,13 +1243,15 @@ function choreCardHTML(c){
   const overdue=choreOverdueDays(c);
   let meta='';
   if(c.plannedAt)meta+='<span class="chore-date">📅 '+fmtChoreDate(c.plannedAt)+'</span>';
+  const pg=choreProgressOf(c);
+  if(pg.amount>0)meta+='<span class="chore-progress">+'+fmt(pg.amount)+' 进度</span>';
   if(overdue>0)meta+='<span class="chore-overdue">超期 '+overdue+' 天</span>';
   return '<div class="card chore-card'+(c.done?' done':'')+(overdue>0?' overdue':'')+'" data-chore-id="'+c.id+'" onclick="openChoreModal(\''+c.id+'\')">'
     +'<label class="chore-check" onclick="event.stopPropagation()">'
     +'<input type="checkbox"'+(c.done?' checked':'')+' onchange="toggleChoreDone(\''+c.id+'\')">'
     +'</label>'
     +'<div class="chore-main">'
-    +'<div class="chore-name">'+esc(c.name)+'</div>'
+    +'<div class="chore-name">'+esc(c.name)+budgetBadgeHTML(c)+'</div>'
     +(meta?'<div class="chore-meta">'+meta+'</div>':'')
     +'</div>'
     +'</div>';
@@ -1157,9 +1329,23 @@ function openChoreModal(id){
   document.getElementById('choreName').value=isEdit?c.name:'';
   document.getElementById('choreDate').value=isEdit&&c.plannedAt?toDateInputValue(c.plannedAt):'';
   document.getElementById('choreFreshDays').value=isEdit&&typeof c.freshDays==='number'?c.freshDays:'';
+  const pAmtEl=document.getElementById('choreProgressAmount');
+  if(pAmtEl)pAmtEl.value=isEdit&&typeof c.progressAmount==='number'&&c.progressAmount>0?c.progressAmount:'';
+  const pDomEl=document.getElementById('choreProgressDomains');
+  if(pDomEl)fillDomainChecklist(pDomEl,(isEdit&&Array.isArray(c.progressDomainIds)&&c.progressDomainIds.length)?c.progressDomainIds:['d_default']);
   const hint=document.getElementById('choreFreshDefaultHint');
   if(hint)hint.textContent=choreCfg().freshDays;
   document.getElementById('choreDelBtn').style.display=isEdit?'':'none';
+  const convBtn=document.getElementById('choreConvertBtn');
+  if(convBtn)convBtn.style.display=isEdit?'':'none';
+  const convUndoBtn=document.getElementById('choreUndoConvBtn');
+  if(convUndoBtn){
+    const last=lastConversion();
+    convUndoBtn.style.display=(isEdit&&last&&last.entityId===(c?c.id:'')&&canUndoConversion())?'':'none';
+  }
+  const budBox=document.getElementById('choreBudgetBind');
+  if(budBox)budBox.innerHTML=budgetBindingHTML('chore',c||null);
+  if(budBox)budgetBindingModeChange('chore');
   openModal('choreModal');
   if(!isEdit)setTimeout(function(){document.getElementById('choreName').focus();},50);
 }
@@ -1177,19 +1363,41 @@ function saveChore(){
     fresh=Math.max(0,Math.round(n));
   }
   if(!Array.isArray(state.chores))state.chores=[];
+  // 产出进度值：留空视为 0（不产出）；领域留空回落到默认领域
+  const pv=String(document.getElementById('choreProgressAmount').value).trim();
+  let pAmt=0;
+  if(pv!==''){
+    const n=Number(pv);
+    if(!isFinite(n)||n<0){toast('产出进度值需为非负数字','err');return;}
+    pAmt=round2(n);
+  }
+  const pDids=[];
+  document.querySelectorAll('#choreProgressDomains .dom-check input:checked').forEach(function(cb){pDids.push(cb.value);});
+  const budget=readBudgetBinding('chore');
   if(id){
     const c=state.chores.find(function(x){return x.id===id;});
     if(!c)return;
     c.name=name;c.plannedAt=plannedAt;c.freshDays=fresh;
+    c.budget=budget;
+    c.progressAmount=pAmt;
+    c.progressDomainIds=pDids;
     // 日期或保鲜期改动后从今天重新起算腐化，不补扣历史
     c.decayKey=dayKey(now());
     Ledger.event('修改杂事「'+name+'」','chore-edit');
   }else{
-    state.chores.push({id:uid(),name:name,done:false,doneAt:null,plannedAt:plannedAt,createdAt:now(),settled:false,freshDays:fresh,decayKey:null});
+    state.chores.push({id:uid(),name:name,done:false,doneAt:null,plannedAt:plannedAt,createdAt:now(),settled:false,freshDays:fresh,decayKey:null,budget:budget,budgetRef:null,progressAmount:pAmt,progressDomainIds:pDids});
     Ledger.event('新增杂事「'+name+'」','chore-create');
   }
   closeModal('choreModal');
   commit(id?'杂事已更新':'杂事已创建');
+}
+// 杂事编辑弹窗里的「转为项目」：同 id 换表，成功后关闭弹窗（转换本身已 commit + render）
+function choreConvertFromModal(){
+  const id=document.getElementById('choreId').value;
+  if(!id)return;
+  const r=choreToAffair(id);
+  if(!r.ok){toast(r.reason||'无法转换','warn');return;}
+  closeModal('choreModal');
 }
 function delChore(){
   const id=document.getElementById('choreId').value;
@@ -1322,9 +1530,9 @@ function taskCardHTML(t,collId){
   const streakTag=curStreak>0?'<span class="tag d">连胜'+curStreak+'天</span>':'';
 
   // Exemption card eligibility
-  const todayStart=new Date();todayStart.setHours(0,0,0,0);
+  const todayStart=dayStart(now());
   const checkedToday=taskCheckedToday(t);
-  const exemptToday=!!(t.lastExempt&&new Date(t.lastExempt)>=todayStart);
+  const exemptToday=!!(t.lastExempt&&t.lastExempt>=todayStart);
   const cards=(state.cards&&state.cards.exemption)||0;
   const exAct=exemptionActivity();
   const ruleEnabled=!!(exAct&&exAct.enabled);
@@ -1341,7 +1549,7 @@ function taskCardHTML(t,collId){
     +'<div class="task-row">'
     +'<div class="task-title-wrap">'
     +(hasV?'<span class="tdot v" title="活力点"></span>':'')+(hasP?'<span class="tdot p" title="进度值"></span>':'')
-    +'<span class="card-title">'+esc(t.name)+'</span>'
+    +'<span class="card-title">'+esc(t.name)+'</span>'+budgetBadgeHTML(t)
     +'</div>'
     +'<div class="task-row-actions"><span class="drag-handle" title="拖拽排序">⋮⋮</span>'+checkinBtn+'</div>'
     +'</div>'
@@ -1443,39 +1651,32 @@ function initStageBars(){
   });
 }
 
-// ===== 任务卡片：长按 1 秒浮现详情，3 秒后自动淡出 =====
-let taskReveal={card:null,timer:null,startX:0,startY:0};
+// ===== 任务卡片：点击标题展开详情，再点标题收起；点页面空白处也收起 =====
+let revealedTaskCard=null;
 function initTaskReveal(){
-  document.addEventListener('pointerdown',function(e){
-    const card=e.target.closest?e.target.closest('.task-card'):null;
-    if(!card)return;
-    // 不拦截交互控件（拖拽把手/按钮等）
-    if(e.target.closest&&e.target.closest('.drag-handle,.card-actions,button,a,input,select,textarea,.task-extra,.stage-bar'))return;
-    taskReveal.card=card;
-    taskReveal.startX=e.clientX;taskReveal.startY=e.clientY;
-    clearTimeout(taskReveal.timer);
-    taskReveal.timer=setTimeout(function(){showTaskExtra(card);},1000);
-  });
-  document.addEventListener('pointermove',function(e){
-    if(!taskReveal.card)return;
-    if(Math.abs(e.clientX-taskReveal.startX)>12||Math.abs(e.clientY-taskReveal.startY)>12){
-      clearTimeout(taskReveal.timer);taskReveal.timer=null;taskReveal.card=null;
+  document.addEventListener('click',function(e){
+    const title=e.target.closest?e.target.closest('.task-title-wrap'):null;
+    if(title){
+      const card=title.closest('.task-card');
+      if(!card)return;
+      const wasOpen=card.classList.contains('revealed');
+      closeTaskReveal();
+      if(!wasOpen){card.classList.add('revealed');revealedTaskCard=card;}
+      return;
     }
+    // 点卡片内的操作按钮/详情区不收起；点卡片外空白处、或切换到另一张卡片时收起
+    const card=e.target.closest?e.target.closest('.task-card'):null;
+    if(!card||card!==revealedTaskCard)closeTaskReveal();
   });
-  ['pointerup','pointercancel'].forEach(function(ev){
-    document.addEventListener(ev,function(){
-      if(taskReveal.card){clearTimeout(taskReveal.timer);taskReveal.timer=null;taskReveal.card=null;}
-    });
-  });
-  // 阻止长按触发系统右键/文本选择菜单
+  // 长按卡片不弹系统右键/文本选择菜单（卡片已 user-select:none，这里兜底）
   document.addEventListener('contextmenu',function(e){
     if(e.target.closest&&e.target.closest('.task-card'))e.preventDefault();
   });
 }
-function showTaskExtra(card){
-  card.classList.add('revealed');
-  clearTimeout(card._taskHideTimer);
-  card._taskHideTimer=setTimeout(function(){card.classList.remove('revealed');},3000);
+function closeTaskReveal(){
+  if(revealedTaskCard&&revealedTaskCard.isConnected)revealedTaskCard.classList.remove('revealed');
+  revealedTaskCard=null;
+  document.querySelectorAll('.task-card.revealed').forEach(function(c){c.classList.remove('revealed');});
 }
 
 function achCardHTML(a,domId){
@@ -1500,7 +1701,7 @@ function achCardHTML(a,domId){
 export function resetWorkUiState(){affairView='list';affairCalCursor=null;affairCalSelected=null;affairDoneOpen=false;choreDoneOpen=false;}
 export function closeChoreDoneZone(){choreDoneOpen=false;}
 
-export { affairView, affairCalCursor, affairCalSelected, affairDoneOpen, choreDoneOpen, choreArchivedOpen, editAffairSteps, setScoreCell, renderWork, frSameDay, fmtClock, fmtPlan, fmtDateCal, toLocalInput, fromLocalInput, editAffairCurve, affairTags, editPresetCurve, renderAffairPresetsHTML, applyAffairPreset, openPresetModal, presetCurvePreview, presetCurveRefresh, setPresetCurve, renderPresetCurveCustom, presetCurveInput, getPresetCurve, togglePresetAch, savePreset, delPreset, renderAffairs, affairStatusLine, affairAxisHTML, affairZoneStart, AFFAIR_ZONE_END, doneZoneHTML, toggleAffairZone, affairMoreBtn, affairMenuTarget, toggleAffairMenu, closeAffairMenu, affairInProgressCardHTML, affairScheduleCardHTML, affairDraftCardHTML, affairDoneCardHTML, affairUnits, affairStepUnitCardHTML, renderAffairSchedule, renderAffairCalendar, addAffairFromInput, applyAffairValue, reverseAffairValue, affairApplyProgress, AFFAIR_UNDO_LIMIT, affairCanUndo, affairPushUndo, affairUndoAction, _completeAffairStep, advanceAffairStep, completeAffair, completeAffairStep, initAffairAxes, openAffairPlanModal, saveAffairPlan, openAffairModal, handleAffairSave, delAffair, restoreAffair, renderAffairSteps, affairStepInput, affairStepTime, affairAddStep, affairRemoveStep, readAffairSteps, affairCurvePreview, affairCurveRefresh, setAffairCurve, renderAffairCurveCustom, affairCurveInput, getAffairCurve, toggleAffairAch, toggleAffairView, toggleAffairDone, affairSelectDay, affairCalShift, settleChoreBatches, computeChoreDecay, processChoreDecay, addChoreFromInput, toggleChoreDone, toggleChoreDoneZone, fmtChoreDate, choreCardHTML, renderChores, toggleChoreArchivedZone, restoreChore, toDateInputValue, openChoreModal, saveChore, delChore, CHORE_CFG_FIELDS, readChoreCfgForm, writeChoreCfgForm, choreCfgInputPreview, openChoreConfigModal, resetChoreConfig, saveChoreConfig, stageBarHTML, taskCardHTML, applyStageBar, updateStageBar, setStageFromX, initStageBars, taskReveal, initTaskReveal, showTaskExtra, achCardHTML };
+export { affairView, affairCalCursor, affairCalSelected, affairDoneOpen, choreDoneOpen, choreArchivedOpen, editAffairSteps, setScoreCell, renderWork, frSameDay, fmtClock, fmtPlan, fmtDateCal, toLocalInput, fromLocalInput, editAffairCurve, affairTags, editPresetCurve, renderAffairPresetsHTML, applyAffairPreset, openPresetModal, presetCurvePreview, presetCurveRefresh, setPresetCurve, renderPresetCurveCustom, presetCurveInput, getPresetCurve, togglePresetAch, savePreset, delPreset, renderAffairs, affairStatusLine, affairAxisHTML, affairZoneStart, AFFAIR_ZONE_END, doneZoneHTML, toggleAffairZone, affairMoreBtn, affairMenuTarget, toggleAffairMenu, closeAffairMenu, affairInProgressCardHTML, affairScheduleCardHTML, affairDraftCardHTML, affairDoneCardHTML, affairUnits, affairStepUnitCardHTML, todayAgendaHTML, renderAffairSchedule, renderAffairCalendar, addAffairFromInput, applyAffairValue, reverseAffairValue, affairApplyProgress, AFFAIR_UNDO_LIMIT, affairCanUndo, affairPushUndo, affairUndoAction, _completeAffairStep, advanceAffairStep, completeAffair, completeAffairStep, initAffairAxes, openAffairPlanModal, saveAffairPlan, openAffairModal, handleAffairSave, delAffair, restoreAffair, renderAffairSteps, affairStepInput, affairStepTime, affairAddStep, affairRemoveStep, readAffairSteps, affairCurvePreview, affairCurveRefresh, setAffairCurve, renderAffairCurveCustom, affairCurveInput, getAffairCurve, toggleAffairAch, toggleAffairView, toggleAffairDone, affairSelectDay, affairCalShift, settleChoreBatches, computeChoreDecay, processChoreDecay, addChoreFromInput, toggleChoreDone, toggleChoreDoneZone, fmtChoreDate, choreCardHTML, renderChores, toggleChoreArchivedZone, restoreChore, toDateInputValue, openChoreModal, saveChore, choreConvertFromModal, delChore, CHORE_CFG_FIELDS, readChoreCfgForm, writeChoreCfgForm, choreCfgInputPreview, openChoreConfigModal, resetChoreConfig, saveChoreConfig, stageBarHTML, taskCardHTML, applyStageBar, updateStageBar, setStageFromX, initStageBars, initTaskReveal, achCardHTML };
 
 registerRenderer('work', renderWork);
 registerRenderer('stageBars', initStageBars);

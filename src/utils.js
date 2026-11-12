@@ -1,7 +1,8 @@
 import { ACTIVITY_MAX_DAYS } from './constants.js';
 import { normalizeChoreConfig } from './defaults.js';
-import { dateKeyOffset, dayStartTs, now, round2 } from './pure.js';
+import { round2, splitCents } from './pure.js';
 import { state } from './state.js';
+import { addDays, dayDiff, dayStart, keyOffset, now } from './time.js';
 import { toast } from './toast.js';
 // utils.js —— 读取全局 state 的选择器 + 重命名输入
 // 由 app.js 按功能拆分（第五轮可维护性重构），第六轮把纯函数与 Ledger 回放下沉，行为不变。
@@ -32,13 +33,13 @@ function choreFreshDays(c){
 }
 function choreBaseTs(c){
   const base=(c&&c.plannedAt)?c.plannedAt:((c&&c.createdAt)?c.createdAt:now());
-  return dayStartTs(base);
+  return dayStart(base);
 }
 function choreOverdueDays(c,ts){
   if(!c||c.done)return 0;
-  const today=dayStartTs(ts||now());
-  const deadline=choreBaseTs(c)+Math.round(choreFreshDays(c))*864e5;
-  const d=Math.round((today-deadline)/864e5);
+  const today=dayStart(ts||now());
+  const deadline=addDays(choreBaseTs(c),Math.round(choreFreshDays(c)));
+  const d=dayDiff(today,deadline);
   return d>0?d:0;
 }
 function choreTierRate(count,cfg){
@@ -52,12 +53,32 @@ function choreDailyDecay(count,cfg){return round2(count*choreTierRate(count,cfg)
 function choreUnsettled(){
   return (state.chores||[]).filter(function(c){return c.done&&!c.settled&&!c.archived;});
 }
+// 杂事产出进度：未配置的实体按懒写入口径读取默认值（0 / 默认领域），不改 state
+function choreProgressOf(c){
+  const n=Number(c&&c.progressAmount);
+  const amount=(isFinite(n)&&n>0)?round2(n):0;
+  let dids=(c&&Array.isArray(c.progressDomainIds))?c.progressDomainIds.map(String).filter(Boolean):[];
+  if(!dids.length)dids=['d_default'];
+  return {amount:amount,domainIds:dids};
+}
+// 按分精确分摊到各领域（复用 splitCents）；amount<=0 时不产出
+function choreProgressParts(c){
+  const p=choreProgressOf(c);
+  if(p.amount<=0)return [];
+  const parts=splitCents(p.amount,p.domainIds.length);
+  const out=[];
+  p.domainIds.forEach(function(did,i){
+    const amt=parts[i];
+    if(amt)out.push({did:did,amt:amt});
+  });
+  return out;
+}
 function activityCountForDomain(did,days){
   const bucket=(state.ext&&state.ext.activity&&state.ext.activity[did])||{};
   let n=0;
   const d=Math.max(0,Math.round(Number(days)||0));
-  for(let i=0;i<d;i++)n+=Math.max(0,Math.round(Number(bucket[dateKeyOffset(i)])||0));
+  for(let i=0;i<d;i++)n+=Math.max(0,Math.round(Number(bucket[keyOffset(i)])||0));
   return n;
 }
 
-export { choreCfg, choreFreshDays, choreBaseTs, choreOverdueDays, choreTierRate, choreDailyDecay, choreUnsettled, activityCountForDomain };
+export { choreCfg, choreFreshDays, choreBaseTs, choreOverdueDays, choreTierRate, choreDailyDecay, choreUnsettled, choreProgressOf, choreProgressParts, activityCountForDomain };

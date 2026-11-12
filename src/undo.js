@@ -1,5 +1,6 @@
 import { BudgetEngine } from './budget.js';
 import { checkAchievements } from './business.js';
+import { reverseBoundBudget } from './budget-binding.js';
 import { parseCardGrantAmt } from './cond-ui.js';
 import { noteCheckinActivity } from './gate.js';
 import { Ledger, applyCheckinGain, setReverseHandler } from './ledger.js';
@@ -18,6 +19,15 @@ import { toast } from './toast.js';
 // reverse(log,ctx) 返回 false 表示已交由内层撤销处理，外层不再重复收尾（cost → 父打卡）。
 const UNDO_ADAPTERS={
   checkin:{reverse:function(log){
+    // 联动撤销现实账目：当期硬撤、跨期冲正；失败则抛出 __txn 让整个撤销事务回滚
+    let budRef=log.budgetRef||null;
+    if(!budRef&&state.ext&&state.ext.budgets&&Array.isArray(state.ext.budgets.ledger)){
+      const be=state.ext.budgets.ledger.find(function(e){
+        return e&&e.status==='active'&&e.links&&e.links.checkinLogId===log.id;
+      });
+      if(be)budRef={entryId:be.id,catId:be.categoryId,amount:be.amount,periodKey:be.periodKey};
+    }
+    if(budRef)reverseBoundBudget(budRef);
     // Reverse the score gain (handles 'vitality' / 'progress' / 'both')
     applyCheckinGain(log,-1);
     // 活跃度索引按原打卡日期反向扣减（与正向写入共用同一维护函数）

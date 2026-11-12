@@ -75,8 +75,10 @@ function toggleCollapse(type,id){
 
 // ===== Drag-and-drop (generic, long-press to reorder) =====
 let drag={active:false,type:null,id:null,groupId:null,el:null,ghost:null,indicator:null,timer:null,
-  startX:0,startY:0,originRect:null,offsetX:0,offsetY:0,pointerId:null};
+  startX:0,startY:0,originRect:null,offsetX:0,offsetY:0,pointerId:null,pending:null};
 let dragJustEnded=false;
+// 防误触：按下后位移超过 8px 才真正进入拖拽态（与阶段条 THRESH 一致）
+const DRAG_THRESH=8;
 
 function initDrag(){
   document.addEventListener('pointerdown',onDragDown);
@@ -131,25 +133,34 @@ function onDragDown(e){
   var target=getDragTarget(e.target);
   if(!target)return;
 
-  drag.type=target.type;
-  drag.id=target.id;
-  drag.groupId=target.groupId;
-  drag.el=target.el;
-  drag.startX=e.clientX;
-  drag.startY=e.clientY;
-  drag.pointerId=e.pointerId;
+  // 只记录候选，不立刻进入拖拽：手指只是碰到把手时页面仍可正常滚动。
+  // 位移超过阈值后才由 onDragMove → beginDrag 真正激活。
+  drag.pending={
+    type:target.type,id:target.id,groupId:target.groupId,el:target.el,
+    startX:e.clientX,startY:e.clientY,pointerId:e.pointerId
+  };
+}
 
-  // Start drag immediately (no long-press timer needed)
+function beginDrag(p,e){
+  drag.type=p.type;
+  drag.id=p.id;
+  drag.groupId=p.groupId;
+  drag.el=p.el;
+  drag.startX=p.startX;
+  drag.startY=p.startY;
+  drag.pointerId=p.pointerId;
+  drag.pending=null;
+
   drag.active=true;
-  target.el.classList.add('dragging');
+  p.el.classList.add('dragging');
   document.body.style.overflow='hidden';
 
   // Cache the element's position ONCE at drag start
-  drag.originRect=target.el.getBoundingClientRect();
+  drag.originRect=p.el.getBoundingClientRect();
   drag.offsetX=drag.startX-drag.originRect.left;
   drag.offsetY=drag.startY-drag.originRect.top;
 
-  drag.ghost=target.el.cloneNode(true);
+  drag.ghost=p.el.cloneNode(true);
   drag.ghost.classList.add('drag-ghost');
   drag.ghost.classList.remove('dragging');
   drag.ghost.style.width=drag.originRect.width+'px';
@@ -161,8 +172,8 @@ function onDragDown(e){
   drag.indicator.className='drag-indicator';
 
   // Capture pointer to ensure we keep receiving events
-  if(e.pointerId!==undefined&&target.el.setPointerCapture){
-    try{target.el.setPointerCapture(e.pointerId);}catch(err){}
+  if(e.pointerId!==undefined&&p.el.setPointerCapture){
+    try{p.el.setPointerCapture(e.pointerId);}catch(err){}
   }
 
   toast('拖拽中…松手放置','warn');
@@ -188,7 +199,19 @@ function getDragSiblings(){
 }
 
 function onDragMove(e){
-  if(!drag.active)return;
+  if(!drag.active){
+    var p=drag.pending;
+    if(!p||e.pointerId!==p.pointerId)return;
+    var dx=e.clientX-p.startX,dy=e.clientY-p.startY;
+    if(Math.abs(dx)<DRAG_THRESH&&Math.abs(dy)<DRAG_THRESH)return;
+    // 触屏/手写笔：纵向位移占优视为滚动，放弃拖拽（页面不锁死）；
+    // 鼠标不受此限制，保证桌面端纵向列表拖拽排序不退化。
+    if((e.pointerType==='touch'||e.pointerType==='pen')&&Math.abs(dy)>Math.abs(dx)){
+      drag.pending=null;
+      return;
+    }
+    beginDrag(p,e);
+  }
   e.preventDefault();
 
   // Position ghost using cached offset — ghost follows the finger precisely
@@ -223,6 +246,7 @@ function onDragMove(e){
 }
 
 function onDragUp(e){
+  drag.pending=null;
   // 幂等兜底：无论是否处于拖拽状态，都先恢复页面滚动（可被 pointerup/pointercancel/blur 重复调用）
   document.body.style.overflow='';
   if(!drag.active)return;

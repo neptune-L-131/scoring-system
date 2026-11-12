@@ -7,6 +7,7 @@ import { dayKey, weekStartTs, logAmt, esc, fmt, fmtTime, now } from './pure.js';
 import { achCardHTML, setScoreCell } from './render-work.js';
 import { state } from './state.js';
 import { accountLabel, shadowLabel } from './stats.js';
+import { addDays, dayDiff, dayStart as dayStartOf, weekStart } from './time.js';
 import { drag, toggleCollapse } from './ui-events.js';
 import { UNDO_ADAPTERS, undoLog } from './undo.js';
 import { domainName, domainProgress, metricValue, totalProgress } from './utils.js';
@@ -30,7 +31,7 @@ function renderBank(){
     let lhtml='<div class="lb-title">贷款 ('+state.loans.length+'笔)</div>';
     lhtml+=state.loans.map(l=>{
       const cn=l.currency==='vitality'?'活力点':'成果点';
-      const days=l.date?Math.max(0,Math.round((now()-l.date)/864e5)):0;
+      const days=l.date?Math.max(0,dayDiff(now(),l.date)):0;
       const dailyInterest=l.debtRate>0?l.amount*(l.debtRate/100):0;
       return '<div class="loan-item">'
         +'<div class="li-name">'+esc(l.productName)+' · '+cn+(l.debtRate>0?' · 债率'+fmt(l.debtRate)+'%/天':'')+'</div>'
@@ -209,13 +210,14 @@ function hideChartTip(){
 function drawChart(){
   const svg=document.getElementById('trendChart');
   const days=7;
-  const today=new Date();today.setHours(0,0,0,0);
+  const todayTs=dayStartOf(now());
   const dayLabels=[],dayStart=[],dayEnd=[];
   for(let i=days-1;i>=0;i--){
-    const d=new Date(today);d.setDate(d.getDate()-i);
+    const ts=addDays(todayTs,-i);
+    const d=new Date(ts);
     dayLabels.push((d.getMonth()+1)+'/'+d.getDate());
-    dayStart.push(d.getTime());
-    dayEnd.push(d.getTime()+864e5);
+    dayStart.push(ts);
+    dayEnd.push(addDays(ts,1));
   }
   const types=['vitality','progress','achievement'];
   const typeNames={vitality:'活力',progress:'进度',achievement:'成果'};
@@ -322,12 +324,12 @@ function drawChart(){
 function drawVitalityFlowChart(){
   const svg=document.getElementById('flowChart');
   const weeks=4;
-  const today=new Date();today.setHours(0,0,0,0);
+  const todayTs=dayStartOf(now());
   // Calculate week boundaries
   const weekRanges=[];
   for(let i=0;i<weeks;i++){
-    const end=i===0?today.getTime()+864e5:weekRanges[i-1].start;
-    const start=end-7*864e5;
+    const end=i===0?addDays(todayTs,1):weekRanges[i-1].start;
+    const start=addDays(end,-7);
     weekRanges.push({start:start,end:end});
   }
   const weekLabels=weekRanges.map((wr,i)=>{
@@ -410,11 +412,11 @@ function drawWeekCompareChart(){
   if(!svg)return;
   const summaryEl=document.getElementById('weekCompareSummary');
   const weeks=6,anchor=1;
-  const today=new Date();today.setHours(0,0,0,0);
+  const todayTs=dayStartOf(now());
   const ranges=[];
   for(let i=weeks-1;i>=0;i--){
-    const start=weekStartTs(anchor,today.getTime())-i*7*864e5;
-    ranges.push({start:start,end:start+7*864e5});
+    const start=addDays(weekStart(todayTs,anchor),-i*7);
+    ranges.push({start:start,end:addDays(start,7)});
   }
   const data=ranges.map((r,i)=>{
     const w=weekScore(r.start,r.end);

@@ -1,4 +1,5 @@
 import { AFFAIR_CURVES, COND_AFFAIR_METRICS, COND_CHORE_METRICS, COND_GATE_METRICS, COND_POINT_METRICS, STAGE_NAMES, WEEK_ANCHOR_NAMES } from './constants.js';
+import * as time from './time.js';
 // pure.js —— 纯函数底层（不读写全局 state、不调用 Ledger、import 时无副作用）
 // 由 utils/state/business/conditions/normalize/budget/render-work 抽离（第六轮循环依赖治理），实现逐字未改。
 
@@ -16,13 +17,13 @@ function fmt(n){
   // Show up to 5 decimal places, trim trailing zeros
   return parseFloat(r.toFixed(5)).toString();
 }
-function now(){return Date.now()}
+// 时间源已收敛到 time.js：这里保留同名函数作为兼容层（P1 会把其余日期工具也改为委托）。
+function now(){return time.now()}
 function daysSince(ts){return ts?(Date.now()-ts)/864e5:0}
 function effectiveLastTs(task){return Math.max(task.lastCheckIn||0,task.lastExempt||0)}
 function taskCheckedToday(task){
   if(!task||!task.lastCheckIn)return false;
-  const start=new Date();start.setHours(0,0,0,0);
-  return new Date(task.lastCheckIn)>=start;
+  return time.isToday(task.lastCheckIn);
 }
 function fmtTime(ts){
   if(!ts)return '从未';
@@ -82,16 +83,15 @@ function stageCellLabel(cell){if(cell<=8&&cell%2===0)return STAGE_NAMES[cell/2];
 function stageNetAt(t,type,cell,c){
   const base=stageValueAt(t,type,cell);
   const info=c||calcCheckIn(t);
-  return Math.max(0,base+(info.bonus||0)-(info.debt||0));
+  return Math.max(0,round2(base+(info.bonus||0)-(info.debt||0)));
 }
 function calcCheckIn(task){
   // Determine calendar-day gap since last check-in
   const isFirst=!task.lastCheckIn;
   let gapDays=0;
   if(!isFirst){
-    const prev=new Date(effectiveLastTs(task));prev.setHours(0,0,0,0);
-    const curr=new Date();curr.setHours(0,0,0,0);
-    gapDays=Math.round((curr-prev)/864e5);
+    // 日历日差（time.dayDiff），不再用毫秒差四舍五入：DST 切换日也恒为整数天
+    gapDays=time.dayDiff(time.now(), effectiveLastTs(task));
   }
 
   // Determine streak state
@@ -110,13 +110,14 @@ function calcCheckIn(task){
   }
 
   // Interest bonus: grows with consecutive-day streak
-  const bonus=task.initialValue*(task.interestRate/100)*Math.max(0,newStreak-1);
-  const gross=task.initialValue+bonus;
+  // 统一精度口径：连胜利息、毛额、欠债、净额都保留两位，预览与结算共用这一份结果
+  const bonus=round2(task.initialValue*(task.interestRate/100)*Math.max(0,newStreak-1));
+  const gross=round2(task.initialValue+bonus);
 
   // Debt: subtract accumulated pendingDebt from the earnable amount.
   // If net goes negative, the excess is deducted from total scores at check-in.
-  const pendingDebt=task.pendingDebt||0;
-  const net=gross-pendingDebt;
+  const pendingDebt=round2(task.pendingDebt||0);
+  const net=round2(gross-pendingDebt);
 
   return{gross:gross,bonus:bonus,debt:pendingDebt,net:net,gapDays:gapDays,newStreak:newStreak,broken:broken,isFirst:isFirst,curStreak:curStreak};
 }
@@ -125,9 +126,7 @@ function calcSkip(task){
   const isFirst=!task.lastCheckIn;
   let gapDays=0;
   if(!isFirst){
-    const prev=new Date(effectiveLastTs(task));prev.setHours(0,0,0,0);
-    const curr=new Date();curr.setHours(0,0,0,0);
-    gapDays=Math.round((curr-prev)/864e5);
+    gapDays=time.dayDiff(time.now(), effectiveLastTs(task));
   }
 
   // If first check-in or same day, skipping today has no penalty yet
@@ -136,13 +135,13 @@ function calcSkip(task){
   }
 
   const gapAfterSkip=gapDays+1;
-  const dailyDebt=task.initialValue*(task.debtRate/100);
-  const currentPending=task.pendingDebt||0;
+  const dailyDebt=round2(task.initialValue*(task.debtRate/100));
+  const currentPending=round2(task.pendingDebt||0);
 
   if(gapDays===1){
     // Checked in yesterday, skipping today → tomorrow gap=2, first debt day
     if(task.debtRate>0){
-      const tomorrowPending=currentPending+dailyDebt;
+      const tomorrowPending=round2(currentPending+dailyDebt);
       return{debt:dailyDebt,gapAfterSkip:gapAfterSkip,desc:'今日不打卡，明日待扣债+'+fmt(dailyDebt)+' (累计'+fmt(tomorrowPending)+')'};
     }else{
       return{debt:0,gapAfterSkip:gapAfterSkip,desc:'今日不打卡，连胜中断'};
@@ -150,7 +149,7 @@ function calcSkip(task){
   }else{
     // Already in debt period (gap >= 2), another day adds more
     if(task.debtRate>0){
-      const tomorrowPending=currentPending+dailyDebt;
+      const tomorrowPending=round2(currentPending+dailyDebt);
       return{debt:dailyDebt,gapAfterSkip:gapAfterSkip,desc:'已断更'+(gapDays-1)+'天，明日待扣债+'+fmt(dailyDebt)+' (累计'+fmt(tomorrowPending)+')'};
     }else{
       return{debt:0,gapAfterSkip:gapAfterSkip,desc:'已断更'+(gapDays-1)+'天'};
@@ -163,32 +162,28 @@ function dayKey(ts){
   return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
 }
 function weekStartKey(ts,anchor){
-  const d=new Date(ts);d.setHours(0,0,0,0);
-  const dow=(d.getDay()+6)%7+1; // 1=Mon .. 7=Sun
-  let diff=dow-(anchor||1);
-  if(diff<0)diff+=7;
-  return dayKey(d.getTime()-diff*864e5);
+  return time.weekKey(ts,anchor);
 }
 function weekStartTs(anchor,ts){
-  const d=new Date(ts);d.setHours(0,0,0,0);
-  const dow=(d.getDay()+6)%7+1;
-  let diff=dow-(anchor||1);
-  if(diff<0)diff+=7;
-  return d.getTime()-diff*864e5;
+  return time.weekStart(ts,anchor);
 }
 function periodKey(cfg,ts){
-  if(cfg.period==='day')return dayKey(ts);
-  if(cfg.period==='month'){const d=new Date(ts);return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0');}
-  return weekStartKey(ts,cfg.anchor||1);
+  return time.periodKeyOf(cfg,ts);
 }
-function dayStartTs(ts){const d=new Date(ts);d.setHours(0,0,0,0);return d.getTime();}
+function dayStartTs(ts){return time.dayStart(ts);}
 function prevPeriodRange(act,ts){
-  if(act.period==='day'){const s=dayStartTs(ts);return {start:s-864e5,end:s};}
-  if(act.period==='month'){const d=new Date(ts);const cur=new Date(d.getFullYear(),d.getMonth(),1).getTime();const prev=new Date(d.getFullYear(),d.getMonth()-1,1).getTime();return {start:prev,end:cur};}
-  const cur=weekStartTs(act.anchor||1,ts);return {start:cur-7*864e5,end:cur};
+  if(act.period==='day'){const s=time.dayStart(ts);return {start:time.addDays(s,-1),end:s};}
+  if(act.period==='month'){
+    const cur=time.rangeOf('month',ts);
+    return {start:time.rangeOf('month',time.addDays(cur.start,-1)).start,end:cur.start};
+  }
+  const cur=time.weekStart(ts,act.anchor||1);
+  return {start:time.addDays(cur,-7),end:cur};
 }
 function condWindowByRange(range,act,ts,days){
-  if(range==='today'){const s=dayStartTs(ts);return {start:s,end:s+864e5};}
+  if(range==='today'){const s=time.dayStart(ts);return {start:s,end:time.addDays(s,1)};}
+  // 最近 N 天是"滚动时长窗口"（从 ts 往前 N×24 小时），不是日历日边界：
+  // 这里保留毫秒位移，避免在有夏令时的时区改变条件求值结果。
   if(range==='recent'){const d=Math.max(1,Math.round(Number(days)||7));return {start:ts-d*864e5,end:ts};}
   // 预算规则的条件在当期实时求值：周期范围 = 预算分类当前周期（而非周期活动的“上一周期”）
   if(act&&act._periodRange)return act._periodRange;
@@ -207,26 +202,10 @@ function toTs(v){const n=Number(v);return (isFinite(n)&&n>0)?n:null;}
 function asArray(v){return Array.isArray(v)?v:[];}
 function defaultWatermark(){return {best:0,at:null};}
 function dateKeyOffset(daysAgo){
-  const d=new Date();
-  d.setHours(12,0,0,0);
-  d.setDate(d.getDate()-Math.max(0,Math.round(Number(daysAgo)||0)));
-  return dayKey(d.getTime());
+  return time.keyOffset(daysAgo);
 }
 function budgetBounds(cycle,ts,anchor){
-  ts=Number(ts)||now();
-  const d=new Date(ts);
-  if(cycle==='month'){
-    const y=d.getFullYear(),m=d.getMonth();
-    return{key:'M:'+y+'-'+String(m+1).padStart(2,'0'),start:new Date(y,m,1).getTime(),end:new Date(y,m+1,1).getTime()};
-  }
-  const s=new Date(d.getFullYear(),d.getMonth(),d.getDate());
-  const dow=(s.getDay()+6)%7+1; // 1=周一 … 7=周日
-  const a=Math.min(7,Math.max(1,Math.round(Number(anchor)||1)));
-  let diff=dow-a;
-  if(diff<0)diff+=7;
-  const start=new Date(s.getFullYear(),s.getMonth(),s.getDate()-diff).getTime();
-  const end=new Date(s.getFullYear(),s.getMonth(),s.getDate()-diff+7).getTime();
-  return{key:'W:'+dayKey(start),start:start,end:end};
+  return time.budgetBounds(cycle,ts,anchor);
 }
 function weekAnchorName(a){return WEEK_ANCHOR_NAMES[Math.min(7,Math.max(1,Math.round(Number(a)||1)))];}
 function round4(v){return Math.round((Number(v)||0)*10000)/10000;}
@@ -271,10 +250,11 @@ export { uid, fmt, now, daysSince, effectiveLastTs, taskCheckedToday, fmtTime, e
 
 function idleDaysSince(baseTs,refTs){
   if(!baseTs)return null;
-  const ref=dayStartTs(refTs||now());
-  const base=dayStartTs(baseTs);
-  const d=Math.round((ref-base)/864e5);
+  const d=time.dayDiff(refTs||time.now(),baseTs);
   return d>0?d:0;
 }
 function isArchivedEntity(o){return !!(o&&(o.archived||o.archivedAt));}
 export { idleDaysSince, isArchivedEntity };
+// 统一时间源的兼容出口：调用方可继续从 pure.js 取这些名字。
+// now / budgetBounds 已在本文件内定义（内部改为委托 time.js），不在此重复导出。
+export { dayStart, dayKeyOf, dayIndex, dayDiff, addDays, todayKey, isToday, weekStart, weekKey, periodKeyOf, rangeOf, keyOffset, relativeDay, businessDayKey } from './time.js';

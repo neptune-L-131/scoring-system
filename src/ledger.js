@@ -290,7 +290,8 @@ const Ledger=(function(){
       const l=state.loans.find(function(x){return x.id===id;});
       if(!l)return null;
       const before=l.amount;
-      l.amount=typeof factor==='function'?factor(before):(Number(factor)||0);
+      // 复利/计息结果统一保留两位，避免本金出现 123.45000000000002 这类尾巴
+      l.amount=round2(typeof factor==='function'?factor(before):(Number(factor)||0));
       audit({id:uid(),ts:now(),txn:tx?tx.label:'',op:'liability-mutate',liability:id,delta:l.amount-before,before:before,after:l.amount,visible:false,src:(reason&&reason.src)||''});
       return l;
     },

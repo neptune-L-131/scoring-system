@@ -109,6 +109,8 @@ function defaults(){
     affairPresets:[],
     affairCollapsed:[],
     affairUndo:{},
+    // 事项转换记录（P3）：只保留最近若干条，最后一条可撤销
+    conversions:[],
     loans:[],
     cards:{exemption:0},
     activities:defaultActivities(),

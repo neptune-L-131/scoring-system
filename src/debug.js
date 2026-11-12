@@ -3,6 +3,7 @@ import { Ledger } from './ledger.js';
 import { dayKey, logAmt, clone, fmt, getTaskDomainIds, logHasType } from './pure.js';
 import { state } from './state.js';
 import { computeEntryAgg } from './stats.js';
+import { keyOffset } from './time.js';
 // debug.js —— 一致性自检（#debug）
 // 由 app.js 按功能拆分（第五轮可维护性重构），行为不变。
 
@@ -77,7 +78,7 @@ function runConsistencyChecks(verbose){
 
   // 3) ext.activity 桶 vs 打卡日志（最近 90 天）
   const expectedActivity={};
-  const actCut=dayKey(Date.now()-(ACTIVITY_MAX_DAYS-1)*864e5);
+  const actCut=keyOffset(ACTIVITY_MAX_DAYS-1);
   (state.logs||[]).forEach(function(l){
     if(!l||l.src!=='checkin')return;
     const key=dayKey(Number(l.time)||0);

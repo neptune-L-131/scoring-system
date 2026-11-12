@@ -2,6 +2,7 @@ import { logDomainsOf } from './conditions.js';
 import { SHADOW_MAX, STATS_ENTITY_MAPS, STATS_KEEP_DAYS, STATS_SCALARS, STATS_VERSION, LOG_MAX } from './constants.js';
 import { dayKey, cardName, logAmt, round2, getTaskDomainIds, logHasType, now, uid } from './pure.js';
 import { state } from './state.js';
+import { keyOffset } from './time.js';
 import { domainName } from './utils.js';
 // stats.js —— 账户差额累计、隐形痕迹、统计聚合（唯一累加点）
 // 由 app.js 按功能拆分（第五轮可维护性重构），行为不变。
@@ -111,7 +112,7 @@ function statsDailyEnsure(key){
 function statsPrune(){
   const s=state.ext&&state.ext.stats;
   if(!s||!s.daily)return;
-  const cutoff=dayKey(Date.now()-STATS_KEEP_DAYS*864e5);
+  const cutoff=keyOffset(STATS_KEEP_DAYS);
   Object.keys(s.daily).forEach(function(k){if(k<cutoff)delete s.daily[k];});
 }
 // 从一条可见流水推导它对统计的贡献；不依赖写入时的上下文，撤销旧流水也能重算

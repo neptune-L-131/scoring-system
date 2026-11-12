@@ -11,6 +11,7 @@ import { commit, save } from './persist.js';
 import { isGateMetric, isPointMetric, isStage1Metric, effectiveLastTs, esc, fmt, taskCheckedToday, uid } from './pure.js';
 import { render } from './render.js';
 import { state } from './state.js';
+import { dayDiff, dayStart, now } from './time.js';
 import { toast } from './toast.js';
 // cond-ui.js —— 条件芯片编辑器与点选浮层
 // 由 app.js 按功能拆分（第五轮可维护性重构），行为不变。
@@ -587,17 +588,17 @@ function renderExemptPanel(){
   const cards=state.cards.exemption||0;
   const exAct=exemptionActivity();
   const ruleEnabled=!!(exAct&&exAct.enabled);
-  const today=new Date();today.setHours(0,0,0,0);
+  const todayStart=dayStart(now());
   const eligible=state.tasks.filter(t=>{
     if(t.archived)return false;
     const checkedToday=taskCheckedToday(t);
-    const exemptToday=!!(t.lastExempt&&new Date(t.lastExempt)>=today);
+    const exemptToday=!!(t.lastExempt&&t.lastExempt>=todayStart);
     return !checkedToday&&!exemptToday;
   });
   const selOpts=eligible.map(t=>{
     const lastEff=effectiveLastTs(t);
     let gapDays=0;
-    if(lastEff){const prev=new Date(lastEff);prev.setHours(0,0,0,0);gapDays=Math.round((today-prev)/864e5);}
+    if(lastEff)gapDays=dayDiff(todayStart,lastEff);
     const label=t.name+(gapDays>=2?'  ·  已断更'+(gapDays-1)+'天':'');
     return '<option value="'+t.id+'">'+esc(label)+'</option>';
   }).join('');

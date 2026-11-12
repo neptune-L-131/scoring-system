@@ -13,6 +13,7 @@ import { closeChoreDoneZone, computeChoreDecay, processChoreDecay, resetWorkUiSt
 import { fillDomainChecklist, fillSelect } from './shell.js';
 import { render } from './render.js';
 import { resetStagePresets, setState, state } from './state.js';
+import { addDays, dayDiff, dayStart } from './time.js';
 import { toast } from './toast.js';
 import { domainName, promptName } from './utils.js';
 // library.js —— 集合/领域/任务/成就/指标/商品/每日结算/清数据等业务操作
@@ -204,20 +205,21 @@ function saveTaskData(data){
       return false;
     }
 
-    finalizeTaskSave(t,data,{
+    // 重算/迁移失败时 finalize 返回 false：参数未写入，调用方不得提示保存成功
+    return finalizeTaskSave(t,data,{
       recalc:recalc,
       domainMode:(recalc&&domainChanged)?'recalc':null,
       oldDids:oldDids,
       newDids:newDids
     });
-    return true;
   }else{
     const nt={
       id:uid(),name:data.name,description:data.description||'',scoreTypes:data.scoreTypes||['vitality'],
       domainIds:data.domainIds||['d_default'],collectionId:data.collectionId||'c_default',
       initialValue:data.initialValue,interestRate:data.interestRate,debtRate:data.debtRate,
       vitalityCost:data.vitalityCost||0,
-      lastCheckIn:null,checkInCount:0,totalEarned:0,streak:0,createdAt:now(),archived:false
+      lastCheckIn:null,checkInCount:0,totalEarned:0,streak:0,createdAt:now(),archived:false,
+      budget:data.budget||null
     };
     if(data.stageRewards)nt.stageRewards=data.stageRewards;
     state.tasks.push(nt);
@@ -235,8 +237,9 @@ function resolveDomainChange(mode){
   if(!p)return;
   const t=state.tasks.find(x=>x.id===p.taskId);
   if(!t)return;
-  finalizeTaskSave(t,p.data,{recalc:false,domainMode:mode,oldDids:p.oldDids,newDids:p.newDids});
+  const ok=finalizeTaskSave(t,p.data,{recalc:false,domainMode:mode,oldDids:p.oldDids,newDids:p.newDids});
   closeModal('taskModal');
+  if(!ok){toast('保存失败：历史迁移未完成，参数未修改','err');return;}
   toast('任务已更新（'+(mode==='migrate'?'连同历史迁移':'仅影响未来')+'）');
   render();
 }
@@ -247,7 +250,10 @@ function cancelDomainChange(){
 
 function finalizeTaskSave(t,data,opts){
   if(opts.recalc){
-    recalcTaskHistory(t,data);
+    // 重算在独立事务里执行；失败时状态已整体回滚，这里必须立刻退出，
+    // 不能再把新参数写进对象、记「修改任务」事件或提示保存成功。
+    const rr=recalcTaskHistory(t,data);
+    if(!rr||!rr.ok)return false;
   }else if(opts.domainMode==='migrate'){
     // 1) 该任务的全部打卡流水改到新领域
     // 同时把流水自身的 splits 与活跃度索引一起搬走：撤销是按流水自带的分配明细
@@ -286,7 +292,7 @@ function finalizeTaskSave(t,data,opts){
         }
       }
     },{label:'task-domain-migrate',save:'none',render:false});
-    if(!txr.ok)return;
+    if(!txr.ok)return false;
   }
 
   Object.assign(t,data);
@@ -297,11 +303,12 @@ function finalizeTaskSave(t,data,opts){
   }
   Ledger.event('修改任务「'+data.name+'」','edit');
   save();
+  return true;
 }
 
 // Replay all check-in logs for a task using new parameters
 function recalcTaskHistory(t, newData){
-  Ledger.txn(function(){
+  return Ledger.txn(function(){
   // Collect all check-in logs for this task, sorted ascending by time
   const checkinLogs=state.logs.filter(l=>l.src==='checkin'&&l.taskId===t.id)
     .sort((a,b)=>a.time-b.time);
@@ -338,9 +345,7 @@ function recalcTaskHistory(t, newData){
     const logTime=log.time;
     let gapDays=0;
     if(runningLastCheckIn){
-      const prev=new Date(runningLastCheckIn);prev.setHours(0,0,0,0);
-      const curr=new Date(logTime);curr.setHours(0,0,0,0);
-      gapDays=Math.round((curr-prev)/864e5);
+      gapDays=dayDiff(logTime,runningLastCheckIn);
     }
     
     const isFirst=(idx===0&&!runningLastCheckIn);
@@ -355,11 +360,12 @@ function recalcTaskHistory(t, newData){
       newStreak=1; broken=true;
     }
     
-    const bonus=newInitial*(newInterest/100)*Math.max(0,newStreak-1);
-    const gross=newInitial+bonus;
+    // 与 calcCheckIn 逐项对齐：bonus → gross → debt → net，每一步都保留两位
+    const bonus=round2(newInitial*(newInterest/100)*Math.max(0,newStreak-1));
+    const gross=round2(newInitial+bonus);
     // Debt: pendingDebt reduces earnable amount at check-in; not tracked in replay
     const debt=0;
-    const net=gross-debt;
+    const net=round2(gross-debt);
     
     // Apply new net to scores (distribute across new domains)
     if(newScoreTypes.indexOf('vitality')>=0)Ledger.post({op:'grant',account:'vitality',delta:net,visible:false,reason:{src:'recalc'}});
@@ -416,7 +422,7 @@ function recalcTaskHistory(t, newData){
   // Step 4: Update task state
   t.streak=runningStreak;
   t.lastCheckIn=runningLastCheckIn;
-  t.totalEarned=totalEarned;
+  t.totalEarned=round2(totalEarned);
   t.checkInCount=checkinLogs.length;
   
   // Re-check achievements for affected domain(s)
@@ -439,13 +445,15 @@ function delTask(id){
     let progressMoved=null;
     if(taskHasType(t,'progress')&&(t.totalEarned||0)!==0){
       const dids=getTaskDomainIds(t);
-      const share=t.totalEarned/dids.length;
-      const fromDomains=dids.map(did=>({did:did,amount:share}));
-      dids.forEach(did=>{
-        Ledger.post({op:'grant',account:'progress:'+did,delta:-share,visible:false,reason:{src:'delete-task'}});
+      // 按分均摊：各领域扣减之和逐分等于回填额，删除与撤销都不会留下 3.3333… 的浮点尾巴
+      const parts=splitCents(t.totalEarned,dids.length);
+      const fromDomains=dids.map((did,i)=>({did:did,amount:parts[i]}));
+      dids.forEach((did,i)=>{
+        Ledger.post({op:'grant',account:'progress:'+did,delta:-parts[i],visible:false,reason:{src:'delete-task'}});
       });
-      Ledger.post({op:'grant',account:'progress:d_default',delta:t.totalEarned,visible:false,reason:{src:'delete-task'}});
-      progressMoved={fromDomains:fromDomains,totalMoved:t.totalEarned};
+      const totalMoved=parts.reduce((a,v)=>a+Math.round(v*100),0)/100;
+      Ledger.post({op:'grant',account:'progress:d_default',delta:totalMoved,visible:false,reason:{src:'delete-task'}});
+      progressMoved={fromDomains:fromDomains,totalMoved:totalMoved};
     }
 
     state.tasks=state.tasks.filter(x=>x.id!==id);
@@ -676,15 +684,14 @@ function buyProduct(id){
 // Debt is only applied at check-in time, reducing the earnable amount.
 // If net (gross - pendingDebt) goes negative, the excess is deducted from total scores.
 function processDailyTaskDebts(silent=false){
-  const today=new Date();today.setHours(0,0,0,0);
+  const todayTs=dayStart(now());
 
   state.tasks.forEach(task=>{
     if(task.archived)return; // 归档任务不参与打卡与债务累积
     if(task.debtRate<=0)return;
     if(!task.lastCheckIn)return;
 
-    const prev=new Date(effectiveLastTs(task));prev.setHours(0,0,0,0);
-    const gapDays=Math.round((today-prev)/864e5);
+    const gapDays=dayDiff(todayTs,effectiveLastTs(task));
 
     // Only accumulate debt if streak is broken (gap >= 2 days)
     if(gapDays<2)return;
@@ -692,19 +699,20 @@ function processDailyTaskDebts(silent=false){
     // Calculate how many debt days have already been accumulated
     let lastDebtDay;
     if(task.lastDebtDate){
-      lastDebtDay=new Date(task.lastDebtDate);lastDebtDay.setHours(0,0,0,0);
+      lastDebtDay=dayStart(task.lastDebtDate);
     }else{
       // First time: debt starts from the day after lastCheckIn
-      lastDebtDay=new Date(prev.getTime()+864e5);
+      lastDebtDay=addDays(dayStart(effectiveLastTs(task)),1);
     }
 
-    const daysSince=Math.round((today-lastDebtDay)/864e5);
+    const daysSince=dayDiff(todayTs,lastDebtDay);
     if(daysSince<=0)return;
 
     // Accumulate to pendingDebt (don't touch total scores)
-    const dailyDebt=task.initialValue*(task.debtRate/100);
-    task.pendingDebt=(task.pendingDebt||0)+dailyDebt*daysSince;
-    task.lastDebtDate=today.getTime();
+    // 与 calcCheckIn / calcSkip 同一精度口径：日债务与累计欠债都保留两位
+    const dailyDebt=round2(task.initialValue*(task.debtRate/100));
+    task.pendingDebt=round2((task.pendingDebt||0)+dailyDebt*daysSince);
+    task.lastDebtDate=todayTs;
   });
 
   if(!silent)save();
@@ -770,19 +778,18 @@ function processLoans(silent=false,reserveVitality=0){
 
     // 逐笔按自己的计息起点算天数：新借的贷款不会被全局 lastDebtDate 追溯计息
     if(state.loans.length>0){
-      const today=new Date();today.setHours(0,0,0,0);
+      const todayTs=dayStart(now());
       state.loans.slice().forEach(function(loan){
-        const startDay=new Date(loanInterestStart(loan));
-        startDay.setHours(0,0,0,0);
-        const days=Math.round((today-startDay)/864e5);
+        const startDay=dayStart(loanInterestStart(loan));
+        const days=dayDiff(todayTs,startDay);
         if(days>0&&loan.debtRate>0){
           // 复利按天换算为一次幂运算，避免按天循环
           Ledger.liability.mutate(loan.id,function(before){return before*Math.pow(1+loan.debtRate/100,days);},{src:'loan-interest'});
         }
         // 每笔贷款各自推进起点；日息为 0 的贷款也推进，避免恢复计息时补算历史天数
-        loan.lastInterestAt=today.getTime();
+        loan.lastInterestAt=todayTs;
       });
-      state.lastDebtDate=today.getTime();
+      state.lastDebtDate=todayTs;
     }else{
       state.lastDebtDate=now();
     }

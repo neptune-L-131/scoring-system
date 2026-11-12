@@ -1,12 +1,13 @@
 import { openModal, closeModal } from './modal-host.js';
 import { BudgetEngine } from './budget.js';
+import { budgetBindingHTML, budgetBindingModeChange, readBudgetBinding } from './budget-binding.js';
 import { gateConditionOf, normalizeCondition } from './cond-model.js';
 import { condDraft, renderCondTree, setCondDraft, setCondDraftContext } from './cond-ui.js';
 import { evalNode } from './conditions.js';
 import { COND_METRIC_KEYS, STAGE_NAMES } from './constants.js';
 import { defaultProductGate } from './defaults.js';
 import { gateFailReasons, validProductTier } from './gate.js';
-import { delAch, delProd, delTask, fillShopCatSelect, productGateContext, saveAchData, saveProdData, saveTaskData } from './library.js';
+import { delAch, delProd, delTask, fillShopCatSelect, pendingTaskSave, productGateContext, saveAchData, saveProdData, saveTaskData } from './library.js';
 import { normalizeProductGate } from './normalize.js';
 import { round4, round2, stageRewards, taskIsStaged, esc, escAttr, fmt, getTaskDomainIds, taskScoreTypes } from './pure.js';
 import { fillCollectionSelect, fillDomainChecklist, fillDomainSelect, getCheckedDomainIds } from './shell.js';
@@ -72,6 +73,9 @@ function openTaskModal(id,presetCollId){
   setTaskAccordion('accTaskMeta',false);
   setTaskAccordion('accTaskStage',false);
   updateTaskAccSummaries();
+  const budBox=document.getElementById('taskBudgetBind');
+  if(budBox)budBox.innerHTML=budgetBindingHTML('task',taskForStage);
+  if(budBox)budgetBindingModeChange('task');
   openModal('taskModal');
   setTimeout(()=>document.getElementById('taskName').focus(),50);
 }
@@ -313,8 +317,12 @@ function handleTaskSave(){
   const prevTask=id?state.tasks.find(x=>x.id===id):null;
   const wasStaged=prevTask&&taskIsStaged(prevTask);
   const recalc=id?((document.getElementById('taskRecalc').checked)&&!wasStaged&&!editStage.enabled):false;
-  const saved=saveTaskData({id:id||null,name:name,description:description,scoreTypes:editTypes.slice(),domainIds:domainIds,collectionId:collectionId,initialValue:initialValue,interestRate:interestRate,debtRate:debtRate,vitalityCost:vitalityCost,stageRewards:stageRewards,recalc:recalc});
-  if(!saved)return;
+  const saved=saveTaskData({id:id||null,name:name,description:description,scoreTypes:editTypes.slice(),domainIds:domainIds,collectionId:collectionId,initialValue:initialValue,interestRate:interestRate,debtRate:debtRate,vitalityCost:vitalityCost,stageRewards:stageRewards,recalc:recalc,budget:readBudgetBinding('task')});
+  if(!saved){
+    // 触发领域变更弹窗时 pendingTaskSave 有值，属于等待用户选择，不算失败
+    if(!pendingTaskSave)toast('保存失败：历史数据重算未完成，参数未修改','err');
+    return;
+  }
   closeModal('taskModal');
   toast(id?(recalc?'任务已更新，历史数据已重算':'任务已更新'):'任务已创建');
   render();

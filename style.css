@@ -343,6 +343,19 @@ body{
 
 .modal-foot{display:flex;gap:10px;margin-top:20px}
 .modal-foot .btn{flex:1;padding:10px;font-size:14px}
+/* ===== 事项 × 现实预算绑定 ===== */
+.budget-bind .bud-row{display:flex;gap:8px;flex-wrap:wrap}
+.budget-bind .bud-row select,.budget-bind .bud-row input{flex:1;min-width:110px}
+.bud-hint{font-size:12px;color:var(--text-3);margin-top:6px;line-height:1.5}
+.bud-badge{display:inline-flex;align-items:center;gap:4px;font-size:11px;padding:1px 6px;border-radius:8px;
+  background:var(--tag-p-bg);color:var(--progress);margin-left:6px;vertical-align:middle}
+.bud-badge.stale{background:var(--danger-hover-bg);color:var(--danger)}
+.amt-preview{font-size:13px;line-height:1.7;padding:10px 12px;border-radius:10px;background:var(--surface-2);
+  border:1px solid var(--border);margin-top:10px}
+.amt-preview .dim{color:var(--text-3)}
+.amt-preview .neg{color:var(--danger)}
+.amt-preview .pos{color:var(--vitality)}
+.bud-cat{font-weight:600}
 
 /* ===== Toast ===== */
 .toast-wrap{
@@ -811,6 +824,7 @@ body{
 .affair-sub{color:var(--text-3);font-size:11px}
 .affair-day-group{margin-bottom:10px}
 .affair-day-title{font-size:12px;color:var(--text-3);margin-bottom:6px}
+.affair-day-group.overdue .affair-day-title{color:var(--danger)}
 .tag.w{background:var(--tag-a-bg);color:var(--achievement)}
 
 /* 事务：奖励曲线选择器 */
@@ -947,10 +961,12 @@ body{
 .bg-rule.reward{background:var(--tag-v-bg);color:var(--vitality)}
 .bg-rule.feedback{background:var(--tag-p-bg);color:var(--progress)}
 .bg-rule.off{opacity:.45;text-decoration:line-through}
+.bg-settle{font-size:11px;color:var(--text-3);margin-top:6px;overflow-wrap:anywhere}
 
 .blog-row{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;padding:9px 13px;border-bottom:1px solid var(--border);font-size:12px}
 .blog-row:last-child{border-bottom:none}
 .blog-row.reversed{opacity:.55}
+.blog-row.compensated{opacity:.65}
 .blog-main{min-width:0;flex:1}
 .blog-title{color:var(--text);overflow-wrap:anywhere}
 .blog-title b{font-weight:600}
@@ -991,3 +1007,19 @@ body{
 .qr-topup input{width:auto}
 
 .shop-card .sh-budget{font-size:10px;color:var(--text-3);margin-top:2px;overflow-wrap:anywhere}
+
+/* ===== P2：“今天该做什么”只读聚合清单（日程区顶部） ===== */
+.agenda-box{margin:8px 0 10px;padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2)}
+.agenda-head{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;color:var(--text)}
+.agenda-count{margin-left:auto;font-size:11px;font-weight:400;color:var(--text-3)}
+.agenda-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+.agenda-chip{display:inline-flex;align-items:center;gap:4px;max-width:100%;font-size:11px;line-height:1.5;color:var(--text-2);background:var(--surface);border:1px solid var(--border-2);border-radius:999px;padding:2px 8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.agenda-chip i{font-style:normal;color:var(--text-3)}
+.agenda-chip b{font-weight:600;color:var(--danger)}
+.agenda-chip.affair{border-color:var(--tag-p-bg)}
+.agenda-chip.chore{border-color:var(--tag-v-bg)}
+.agenda-chip.done{opacity:.6;text-decoration:line-through}
+.agenda-chip.overdue{color:var(--danger);border-color:var(--danger)}
+
+/* ===== P4：杂事产出进度 ===== */
+.chore-progress{color:var(--progress);font-size:11px}
