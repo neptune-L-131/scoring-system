@@ -3,7 +3,6 @@ import { choreCfg, choreFreshDays, choreBaseTs, choreOverdueDays, choreTierRate,
 import { checkAchievements, checkIn, useExemption } from './business.js';
 import { BudgetEngine } from './budget.js';
 import { budgetBadgeHTML, budgetBindingHTML, budgetOf, budgetRefOf, openBudgetAmountDialog, readBudgetBinding, rememberBudgetDraft, resolveActionBudget, reverseBoundBudget } from './budget-binding.js';
-import { exemptionActivity } from './conditions.js';
 import { STAGE_NAMES, AFFAIR_CURVES } from './constants.js';
 import { defaultChoreConfig, normalizeChoreConfig } from './defaults.js';
 import { todayAgenda } from './entity-kit.js';
@@ -13,7 +12,8 @@ import { addDomain, delCollection, delDomain, renameCollection, renameDomain, un
 import { confirmDelAch, confirmDelTask, openAchModal, openTaskModal } from './modals.js';
 import { closeModal, openModal } from './modal-host.js';
 import { commit, save } from './persist.js';
-import { calcCheckIn, calcSkip, dayKey, dayStartTs, weekStartTs, toNum, round2, stageCellLabel, stageNetAt, stageSel, taskIsStaged, clone, daysSince, esc, escAttr, fmt, fmtTime, getTaskDomainIds, now, taskCheckedToday, taskHasType, taskScoreTypes, uid, affairSteps, affairTotalSteps, affairDoneSteps, affairLastAdvance, affairCurve, affairCurveType, affairTargetAt, affairIsDone } from './pure.js';
+import { runCommand } from './command.js';
+import { calcCheckIn, dayKey, dayStartTs, weekStartTs, toNum, round2, stageCellLabel, stageNetAt, stageSel, taskIsStaged, clone, daysSince, esc, escAttr, fmt, fmtTime, getTaskDomainIds, now, taskHasType, uid, affairSteps, affairTotalSteps, affairDoneSteps, affairLastAdvance, affairCurve, affairCurveType, affairTargetAt, affairIsDone } from './pure.js';
 import { render } from './render.js';
 import { fillDomainChecklist } from './shell.js';
 import { state } from './state.js';
@@ -21,6 +21,9 @@ import { toast } from './toast.js';
 import { addDays, dayDiff, dayStart, weekStart } from './time.js';
 import { drag, filterByDomain, syncMajorCollapse, toggleCollapse, toggleInline } from './ui-events.js';
 import { domainName, domainProgress, totalProgress } from './utils.js';
+import { affairCardView, choreCardView, taskCardView } from './view-models.js';
+import { ZONE_END, actionsRowHTML, collBodyHTML, collGroupHTML, collHeaderHTML, dragHandleHTML, emptyHTML, tagHTML, zoneHTML, zoneStartHTML } from './view-primitives.js';
+import { registerPanelTarget, renderPanel } from './render-targets.js';
 // render-work.js —— 渲染：打工页（任务/项目/杂事/阶段奖励）
 // 由 app.js 按功能拆分（第五轮可维护性重构），行为不变。
 
@@ -70,6 +73,11 @@ function renderWork(){
   renderAffairs();
   syncMajorCollapse();
 
+  renderWorkTasks();
+}
+
+// 任务面板：按集合分组的任务卡 + 归档区（work.tasks 的独立入口）
+function renderWorkTasks(){
   // Task groups by collection
   const tg=document.getElementById('taskGroups');
   if(!state.tasks.length){
@@ -79,34 +87,27 @@ function renderWork(){
     state.collections.forEach(c=>{
       const tasks=state.tasks.filter(t=>!t.archived&&t.collectionId===c.id&&(!state.filterDomain||!taskHasType(t,'progress')||getTaskDomainIds(t).includes(state.filterDomain)));
       const isCollapsed=(state.collapsedColls||[]).includes(c.id);
-      html+='<div class="coll-group'+(isCollapsed?' collapsed':'')+'" data-coll-id="'+c.id+'">';
-      // Header (clickable to toggle collapse)
-      html+='<div class="coll-header" onclick="toggleCollapse(\'collection\',\''+c.id+'\')">';
-      html+='<div class="coll-name"><span class="coll-toggle">▼</span>'+esc(c.name)+' <span class="coll-count">'+tasks.length+'个任务</span></div>';
-      html+='<div class="coll-actions" onclick="event.stopPropagation()">';
-      html+='<span class="drag-handle" title="拖拽集合">⋮⋮</span>';
-      html+='<button onclick="openTaskModal(null,\''+c.id+'\')">+ 任务</button>';
+      let actions=dragHandleHTML('拖拽集合');
+      actions+='<button onclick="openTaskModal(null,\''+c.id+'\')">+ 任务</button>';
       if(c.id!=='c_default'){
-        html+='<button onclick="renameCollection(\''+c.id+'\')">重命名</button><button onclick="delCollection(\''+c.id+'\')">删除</button>';
+        actions+='<button onclick="renameCollection(\''+c.id+'\')">重命名</button><button onclick="delCollection(\''+c.id+'\')">删除</button>';
       }
-      html+='</div>';
-      html+='</div>';
-      // Body (collapsible)
-      html+='<div class="coll-body">';
+      let body='';
       if(tasks.length===0){
-        html+='<div class="empty" style="padding:16px"><p style="margin:0;color:var(--text-3)">暂无任务 · 拖拽 ⋮⋮ 按钮可排序</p></div>';
+        body+='<div class="empty" style="padding:16px"><p style="margin:0;color:var(--text-3)">暂无任务 · 拖拽 ⋮⋮ 按钮可排序</p></div>';
       }else{
-        html+=tasks.map(t=>taskCardHTML(t,c.id)).join('');
+        body+=tasks.map(t=>taskCardHTML(t,c.id)).join('');
       }
-      html+='</div>';
-      html+='</div>';
+      html+=collGroupHTML('coll-group','data-coll-id="'+c.id+'"',isCollapsed,
+        collHeaderHTML({onclick:"toggleCollapse('collection','"+c.id+"')",name:esc(c.name),count:tasks.length,countLabel:'个任务',actions:actions})
+        +collBodyHTML(body));
     });
     // Tasks without valid collection
     const noColl=state.tasks.filter(t=>!t.archived&&!state.collections.find(c=>c.id===t.collectionId)&&(!state.filterDomain||!taskHasType(t,'progress')||getTaskDomainIds(t).includes(state.filterDomain)));
     if(noColl.length){
-      html+='<div class="coll-group" data-coll-id="_none"><div class="coll-header" onclick="toggleCollapse(\'collection\',\'_none\')"><div class="coll-name"><span class="coll-toggle">▼</span>未分类 <span class="coll-count">'+noColl.length+'个任务</span></div><div class="coll-actions" onclick="event.stopPropagation()"><span class="drag-handle" title="拖拽集合">⋮⋮</span></div></div>';
-      html+='<div class="coll-body">'+noColl.map(t=>taskCardHTML(t,'_none')).join('')+'</div>';
-      html+='</div>';
+      html+=collGroupHTML('coll-group','data-coll-id="_none"',false,
+        collHeaderHTML({onclick:"toggleCollapse('collection','_none')",name:'未分类',count:noColl.length,countLabel:'个任务',actions:dragHandleHTML('拖拽集合')})
+        +collBodyHTML(noColl.map(t=>taskCardHTML(t,'_none')).join('')));
     }
     tg.innerHTML=html;
   }
@@ -121,20 +122,19 @@ function renderWork(){
       ab.innerHTML='<div class="empty" style="padding:12px"><p style="margin:0;color:var(--text-3)">连续两周未打卡的任务将自动归档至此</p></div>';
     }else{
       const isCollapsed=(state.collapsedColls||[]).includes('_archive');
-      ab.innerHTML='<div class="coll-group'+(isCollapsed?' collapsed':'')+'" data-coll-id="_archive">'
-        +'<div class="coll-header" onclick="toggleCollapse(\'collection\',\'_archive\')">'
-        +'<div class="coll-name"><span class="coll-toggle">▼</span>已归档 <span class="coll-count">'+archived.length+'个任务</span></div>'
-        +'</div>'
-        +'<div class="coll-body">'+archived.map(t=>{
+      ab.innerHTML=collGroupHTML('coll-group','data-coll-id="_archive"',isCollapsed,
+        collHeaderHTML({onclick:"toggleCollapse('collection','_archive')",name:'已归档',count:archived.length,countLabel:'个任务'})
+        +collBodyHTML(archived.map(t=>{
           const cost=3;
           const canUnlock=(state.scores.vitality||0)>=cost;
           return '<div class="card" style="opacity:.7">'
-            +'<div class="card-top"><div>'+(taskHasType(t,'progress')?'<span class="tag p">进度值</span>':'')+(taskHasType(t,'vitality')?'<span class="tag v">活力点</span>':'')+'<span class="card-title">'+esc(t.name)+'</span></div>'
-            +'<div class="card-actions"><button onclick="openTaskModal(\''+t.id+'\')">编辑</button><button class="del" onclick="confirmDelTask(\''+t.id+'\')">删除</button></div></div>'
+            +'<div class="card-top"><div>'+(taskHasType(t,'progress')?tagHTML('p','进度值'):'')+(taskHasType(t,'vitality')?tagHTML('v','活力点'):'')+'<span class="card-title">'+esc(t.name)+'</span></div>'
+            +actionsRowHTML('card-actions','<button onclick="openTaskModal(\''+t.id+'\')">编辑</button><button class="del" onclick="confirmDelTask(\''+t.id+'\')">删除</button>')
+            +'</div>'
             +'<div class="card-meta"><span>打卡 '+(t.checkInCount||0)+' 次</span><span>归档于 '+(t.archivedAt?fmtTime(t.archivedAt):'—')+'</span></div>'
             +'<div class="card-bottom"><div class="preview"><span style="color:var(--text-3)">需 '+cost+' 活力点解锁</span></div><button class="btn btn-sm btn-exempt" onclick="unlockTask(\''+t.id+'\')" '+(canUnlock?'':'disabled')+'>解锁</button></div>'
             +'</div>';
-        }).join('')+'</div></div>';
+        }).join('')));
     }
   }
 }
@@ -149,8 +149,8 @@ function fromLocalInput(v){if(!v)return null;const t=new Date(v).getTime();retur
 // ===== 项目奖励曲线（10 格累计比例，格 9 恒为 100）=====
 let editAffairCurve={type:'even',values:AFFAIR_CURVES.even.slice()};
 function affairTags(a){
-  if(a.domainId)return '<span class="tag p">'+esc(domainName(a.domainId))+'</span>';
-  return '<span class="tag v">活力点</span>';
+  const v=affairCardView(a);
+  return tagHTML(v.tagKind,esc(v.tagText));
 }
 // ===== 项目预设 =====
 let editPresetCurve={type:'even',values:AFFAIR_CURVES.even.slice()};
@@ -317,18 +317,14 @@ function renderAffairs(){
   html+=doneZoneHTML(done);
   // 5. 已归档（规则归档的项目集中在此，可单独恢复）
   if(archived.length){
-    html+='<div class="affair-zone collapsed" id="affair-zone-archived">'
-      +'<div class="affair-zone-title" onclick="toggleAffairZone(\'archived\')">'
-      +'<span class="coll-toggle">▼</span>已归档 <span class="affair-zone-count">'+archived.length+'</span></div>'
-      +'<div class="affair-zone-body">'
-      +archived.map(function(a){
+    html+=zoneHTML({id:'affair-zone-archived',collapsed:true,onclick:"toggleAffairZone('archived')",title:'已归档',count:archived.length,
+      body:archived.map(function(a){
         return '<div class="card affair-card" style="opacity:.7">'
           +'<div class="affair-row"><div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span></div>'
-          +'<div class="affair-actions"><span class="affair-time">归档于 '+(a.archivedAt?fmtTime(a.archivedAt):'—')+'</span>'
-          +'<button class="btn btn-sm" onclick="restoreAffair(\''+a.id+'\')">恢复</button></div></div>'
-          +'</div>';
-      }).join('')
-      +'</div></div>';
+          +actionsRowHTML('affair-actions','<span class="affair-time">归档于 '+(a.archivedAt?fmtTime(a.archivedAt):'—')+'</span>'
+          +'<button class="btn btn-sm" onclick="restoreAffair(\''+a.id+'\')">恢复</button>')
+          +'</div></div>';
+      }).join('')});
   }
   panel.innerHTML=html;
 }
@@ -357,21 +353,12 @@ function affairAxisHTML(a){
 }
 function affairZoneStart(key,title,count,extra){
   const collapsed=(state.affairCollapsed||[]).indexOf(key)>=0;
-  return '<div class="affair-zone'+(collapsed?' collapsed':'')+'" id="affair-zone-'+key+'">'
-    +'<div class="affair-zone-title" onclick="toggleAffairZone(\''+key+'\')">'
-    +'<span class="coll-toggle">▼</span>'+title+' <span class="affair-zone-count">'+count+'</span>'
-    +(extra||'')
-    +'</div>'
-    +'<div class="affair-zone-body">';
+  return zoneStartHTML({id:'affair-zone-'+key,collapsed:collapsed,onclick:"toggleAffairZone('"+key+"')",title:title,count:count,extra:extra});
 }
-const AFFAIR_ZONE_END='</div></div>';
+const AFFAIR_ZONE_END=ZONE_END;
 function doneZoneHTML(done){
   const collapsed=!affairDoneOpen;
-  return '<div class="affair-zone'+(collapsed?' collapsed':'')+'" id="affair-zone-done">'
-    +'<div class="affair-zone-title" onclick="toggleAffairDone()">'
-    +'<span class="coll-toggle">▼</span>已完成 <span class="affair-zone-count">'+done.length+'</span></div>'
-    +'<div class="affair-zone-body">'+(done.length?done.map(affairDoneCardHTML).join(''):'<div class="affair-empty">无</div>')+'</div>'
-    +'</div>';
+  return zoneHTML({id:'affair-zone-done',collapsed:collapsed,onclick:'toggleAffairDone()',title:'已完成',count:done.length,body:done.length?done.map(affairDoneCardHTML).join(''):emptyHTML('affair-empty','无')});
 }
 function toggleAffairZone(key){
   const arr=state.affairCollapsed||[];
@@ -398,7 +385,7 @@ function toggleAffairMenu(e,id){
   const convUndo=canUndoConversion()&&lastConversion()&&lastConversion().entityId===id;
   menu.innerHTML=
     '<button onclick="openAffairModal(\''+id+'\');closeAffairMenu()">编辑</button>'
-    +'<button onclick="affairToChore(\''+id+'\');closeAffairMenu()">转为杂事</button>'
+    +'<button onclick="affairConvertToChore(\''+id+'\');closeAffairMenu()">转为杂事</button>'
     +(convUndo?'<button onclick="undoConversion();closeAffairMenu()">撤销转换</button>':'')
     +(canUndo
       ?'<button onclick="affairUndoAction(\''+id+'\');closeAffairMenu()">撤销上一步</button>'
@@ -427,10 +414,8 @@ function affairInProgressCardHTML(a){
   return '<div class="card affair-card'+(stall?' stalled':'')+'" data-affair-id="'+a.id+'" onclick="openAffairModal(\''+a.id+'\')">'
     +'<div class="affair-row">'
     +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+budgetBadgeHTML(a)+'</div>'
-    +'<div class="affair-actions" onclick="event.stopPropagation()">'
-    +affairMoreBtn(a)
-    +'<button class="btn btn-sm btn-checkin" onclick="advanceAffairStep(\''+a.id+'\')">完成下一步</button>'
-    +'</div>'
+    +actionsRowHTML('affair-actions',affairMoreBtn(a)
+    +'<button class="btn btn-sm btn-checkin" onclick="advanceAffairStep(\''+a.id+'\')">完成下一步</button>',true)
     +'</div>'
     +affairAxisHTML(a)
     +'<div class="affair-meta">'+affairStatusLine(a)+'</div>'
@@ -442,11 +427,9 @@ function affairScheduleCardHTML(a,opts){
   return '<div class="card affair-card'+(late?' late':'')+'" data-affair-id="'+a.id+'" onclick="openAffairModal(\''+a.id+'\')">'
     +'<div class="affair-row">'
     +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+budgetBadgeHTML(a)+'</div>'
-    +'<div class="affair-actions" onclick="event.stopPropagation()">'
-    +affairMoreBtn(a)
+    +actionsRowHTML('affair-actions',affairMoreBtn(a)
     +'<span class="affair-time">'+(opts&&opts.time?opts.time:fmtPlan(a.plannedAt))+'</span>'
-    +'<button class="btn btn-sm btn-checkin" onclick="completeAffair(\''+a.id+'\')">完成</button>'
-    +'</div>'
+    +'<button class="btn btn-sm btn-checkin" onclick="completeAffair(\''+a.id+'\')">完成</button>',true)
     +'</div>'
     +'</div>';
 }
@@ -455,10 +438,8 @@ function affairDraftCardHTML(a){
   return '<div class="card affair-card" data-affair-id="'+a.id+'" onclick="openAffairModal(\''+a.id+'\')">'
     +'<div class="affair-row">'
     +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+budgetBadgeHTML(a)+'</div>'
-    +'<div class="affair-actions" onclick="event.stopPropagation()">'
-    +'<button class="btn btn-sm" onclick="openAffairPlanModal(\''+a.id+'\')">计划</button>'
-    +affairMoreBtn(a)
-    +'</div>'
+    +actionsRowHTML('affair-actions','<button class="btn btn-sm" onclick="openAffairPlanModal(\''+a.id+'\')">计划</button>'
+    +affairMoreBtn(a),true)
     +'</div>'
     +affairAxisHTML(a)
     +'<div class="affair-meta">'+affairStatusLine(a)+'</div>'
@@ -469,10 +450,8 @@ function affairDoneCardHTML(a){
   return '<div class="card affair-card done" data-affair-id="'+a.id+'" onclick="openAffairModal(\''+a.id+'\')">'
     +'<div class="affair-row">'
     +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+budgetBadgeHTML(a)+'</div>'
-    +'<div class="affair-actions" onclick="event.stopPropagation()">'
-    +affairMoreBtn(a)
-    +'<span class="affair-time">✓ '+fmtTime(a.doneAt)+'</span>'
-    +'</div>'
+    +actionsRowHTML('affair-actions',affairMoreBtn(a)
+    +'<span class="affair-time">✓ '+fmtTime(a.doneAt)+'</span>',true)
     +'</div>'
     +affairAxisHTML(a)
     +'<div class="affair-meta">'+affairStatusLine(a)+'</div>'
@@ -498,10 +477,8 @@ function affairStepUnitCardHTML(u,opts){
   return '<div class="card affair-card'+(late?' late':'')+'" data-affair-id="'+a.id+'" onclick="openAffairModal(\''+a.id+'\')">'
     +'<div class="affair-row">'
     +'<div class="affair-name-wrap"><span class="affair-name">'+esc(s.text)+'</span></div>'
-    +'<div class="affair-actions" onclick="event.stopPropagation()">'
-    +'<span class="affair-time">'+(opts&&opts.time?opts.time:fmtClock(u.ts))+'</span>'
-    +'<button class="btn btn-sm btn-checkin" onclick="completeAffairStep(\''+a.id+'\','+i+')">完成</button>'
-    +'</div>'
+    +actionsRowHTML('affair-actions','<span class="affair-time">'+(opts&&opts.time?opts.time:fmtClock(u.ts))+'</span>'
+    +'<button class="btn btn-sm btn-checkin" onclick="completeAffairStep(\''+a.id+'\','+i+')">完成</button>',true)
     +'</div>'
     +'<div class="affair-meta"><span class="affair-sub">'+esc(a.name)+' · 第 '+(i+1)+'/'+affairTotalSteps(a)+' 步</span></div>'
     +'</div>';
@@ -648,31 +625,36 @@ function reverseAffairValue(a,amt,desc){
 function affairApplyProgress(a,cell,opts){
   opts=opts||{};
   cell=Math.max(0,Math.min(9,Math.round(cell)));
-  Ledger.txn(function(){
-    a.currentCell=cell;
-    if(cell>0&&!a.startedAt)a.startedAt=now();
-    // 现实预算先于本笔收益入账（先扣后收）
-    if(opts.plan){
-      const got=BudgetEngine.commitEntry(null,opts.plan,{affairId:a.id,affairAdvanceId:opts.advanceId||''});
-      if(opts.snap)opts.snap.budgetRef=budgetRefOf(got.entry,opts.plan);
-      if(a.budget&&a.budget.mode==='prompt')a.budget.lastAmount=opts.plan.amount;
-    }
-    const target=affairTargetAt(a,cell);
-    const diff=round2(target-(a.alreadyGiven||0));
-    if(diff>0){
-      applyAffairValue(a,diff,'项目「'+a.name+'」进度结算');
-      a.alreadyGiven=round2(target);
-    }
-    if(cell>=9&&!a.doneAt){
-      a.doneAt=now();
-      if(a.ach&&a.ach.enabled&&a.ach.amount>0){
-        Ledger.grant('achievement',a.ach.amount,{src:'affair',desc:'完成项目「'+a.name+'」',affairId:a.id});
-        toast('项目「'+a.name+'」完成 · 成果点 +'+fmt(a.ach.amount),'warn');
-      }else{
-        toast('项目「'+a.name+'」已完成');
+  let doneToast=null;
+  runCommand({
+    label:'affair-progress',save:false,render:false,silentFail:true,
+    run:function(tx){
+      a.currentCell=cell;
+      if(cell>0&&!a.startedAt)a.startedAt=now();
+      // 现实预算先于本笔收益入账（先扣后收）
+      if(opts.plan){
+        const got=BudgetEngine.commitEntry(tx,opts.plan,{affairId:a.id,affairAdvanceId:opts.advanceId||''});
+        if(opts.snap)opts.snap.budgetRef=budgetRefOf(got.entry,opts.plan);
+        if(a.budget&&a.budget.mode==='prompt')a.budget.lastAmount=opts.plan.amount;
       }
+      const target=affairTargetAt(a,cell);
+      const diff=round2(target-(a.alreadyGiven||0));
+      if(diff>0){
+        applyAffairValue(a,diff,'项目「'+a.name+'」进度结算');
+        a.alreadyGiven=round2(target);
+      }
+      if(cell>=9&&!a.doneAt){
+        a.doneAt=now();
+        if(a.ach&&a.ach.enabled&&a.ach.amount>0){
+          Ledger.grant('achievement',a.ach.amount,{src:'affair',desc:'完成项目「'+a.name+'」',affairId:a.id});
+          doneToast={msg:'项目「'+a.name+'」完成 · 成果点 +'+fmt(a.ach.amount),type:'warn'};
+        }else{
+          doneToast={msg:'项目「'+a.name+'」已完成'};
+        }
+      }
+      return {toast:doneToast};
     }
-  },{label:'affair-progress',save:'none',render:false});
+  });
 }
 
 // ===== 撤销（快照持久化到 state，限量保留）=====
@@ -695,23 +677,30 @@ function affairUndoAction(id){
   const a=state.affairs.find(function(x){return x.id===id;});
   if(!a)return;
   const stack=(state.affairUndo&&state.affairUndo[a.id])||[];
-  const snap=stack.pop();
-  if(!snap){toast('没有可撤销的操作','warn');return;}
-  const revoked=round2((a.alreadyGiven||0)-(snap.given||0));
-  const txr=Ledger.txn(function(){
-    // 联动撤销现实账目：当期硬撤、跨期冲正；失败则整单回滚
-    if(snap.budgetRef)reverseBoundBudget(snap.budgetRef);
-    if(revoked>0)reverseAffairValue(a,revoked,'撤销项目「'+a.name+'」推进');
-    if(!!a.doneAt&&!snap.doneAt&&a.ach&&a.ach.enabled&&a.ach.amount>0){
-      Ledger.grant('achievement',-a.ach.amount,{src:'affair',desc:'撤销项目「'+a.name+'」成果点',affairId:a.id});
+  if(!stack.length){
+    return runCommand({reject:{reason:'empty',toast:{msg:'没有可撤销的操作',type:'warn'}}});
+  }
+  runCommand({
+    label:'affair-undo',silentFail:true,
+    toast:{msg:'已撤销「'+a.name+'」'},
+    run:function(){
+      // 弹栈放进事务：失败回滚时快照会随 state 一起还原，不会被白白弹掉
+      const st=(state.affairUndo&&state.affairUndo[a.id])||[];
+      const snap=st.pop();
+      if(!snap)return;
+      const revoked=round2((a.alreadyGiven||0)-(snap.given||0));
+      // 联动撤销现实账目：当期硬撤、跨期冲正；失败则整单回滚
+      if(snap.budgetRef)reverseBoundBudget(snap.budgetRef);
+      if(revoked>0)reverseAffairValue(a,revoked,'撤销项目「'+a.name+'」推进');
+      if(!!a.doneAt&&!snap.doneAt&&a.ach&&a.ach.enabled&&a.ach.amount>0){
+        Ledger.grant('achievement',-a.ach.amount,{src:'affair',desc:'撤销项目「'+a.name+'」成果点',affairId:a.id});
+      }
+      a.currentCell=snap.cell;a.alreadyGiven=snap.given;a.doneAt=snap.doneAt;a.startedAt=snap.startedAt;
+      if(Array.isArray(snap.steps)&&Array.isArray(a.steps)){
+        a.steps.forEach(function(s,i){if(s&&snap.steps[i])s.doneAt=snap.steps[i].doneAt;});
+      }
     }
-    a.currentCell=snap.cell;a.alreadyGiven=snap.given;a.doneAt=snap.doneAt;a.startedAt=snap.startedAt;
-    if(Array.isArray(snap.steps)&&Array.isArray(a.steps)){
-      a.steps.forEach(function(s,i){if(s&&snap.steps[i])s.doneAt=snap.steps[i].doneAt;});
-    }
-  },{label:'affair-undo',save:'none',render:false});
-  if(!txr.ok)return;
-  commit('已撤销「'+a.name+'」');
+  });
 }
 
 // 项目动作的预算闸门：临时金额弹窗必须在 Ledger.txn 之前完成
@@ -736,18 +725,17 @@ function _completeAffairStep(a,s,resolved){
   const gate=affairBudgetGate(a,resolved,function(r){_completeAffairStep(a,s,r);});
   if(gate.status==='prompt')return;
   // 步骤完成态与进度结算必须同生共死：任何一笔发放失败时，s.doneAt 也不能留下
-  const txr=Ledger.txn(function(){
-    const snap=affairPushUndo(a);
-    s.doneAt=now();
-    const steps=affairSteps(a);
-    const allDone=steps.every(function(x){return x.doneAt;});
-    affairApplyProgress(a,allDone?9:Math.min(8,(a.currentCell||0)+1),{plan:gate.plan,snap:snap});
-  },{label:'affair-step',save:'none',render:false});
-  if(!txr.ok){
-    if(gate.plan)rememberBudgetDraft('affair',a.id,gate.plan.amount);
-    return;
-  }
-  commit();
+  runCommand({
+    label:'affair-step',silentFail:true,
+    onFail:function(){if(gate.plan)rememberBudgetDraft('affair',a.id,gate.plan.amount);},
+    run:function(tx){
+      const snap=affairPushUndo(a);
+      s.doneAt=now();
+      const steps=affairSteps(a);
+      const allDone=steps.every(function(x){return x.doneAt;});
+      affairApplyProgress(a,allDone?9:Math.min(8,(a.currentCell||0)+1),{plan:gate.plan,snap:snap});
+    }
+  });
 }
 function advanceAffairStep(id,resolved){
   const a=state.affairs.find(function(x){return x.id===id;});
@@ -756,16 +744,15 @@ function advanceAffairStep(id,resolved){
   if(!next){
     const gate=affairBudgetGate(a,resolved,function(r){advanceAffairStep(id,r);});
     if(gate.status==='prompt')return;
-    // 快照必须在事务内压栈：发放失败回滚时连 undo 栈一起还原，避免留下无效快照
-    const txr=Ledger.txn(function(){
-      const snap=affairPushUndo(a);
-      affairApplyProgress(a,9,{plan:gate.plan,snap:snap});
-    },{label:'affair-complete',save:'none',render:false});
-    if(!txr.ok){
-      if(gate.plan)rememberBudgetDraft('affair',a.id,gate.plan.amount);
-      return;
-    }
-    commit();
+    // 快照在事务内压栈：发放失败回滚时连 undo 栈一起还原，避免留下无效快照
+    runCommand({
+      label:'affair-complete',silentFail:true,
+      onFail:function(){if(gate.plan)rememberBudgetDraft('affair',a.id,gate.plan.amount);},
+      run:function(tx){
+        const snap=affairPushUndo(a);
+        affairApplyProgress(a,9,{plan:gate.plan,snap:snap});
+      }
+    });
     return;
   }
   _completeAffairStep(a,next,resolved);
@@ -773,18 +760,17 @@ function advanceAffairStep(id,resolved){
 function completeAffair(id,resolved){
   const a=state.affairs.find(function(x){return x.id===id;});
   if(!a)return;
-  if(a.doneAt){toast('该项目已完成','warn');return;}
+  if(a.doneAt)return runCommand({reject:{reason:'done',toast:{msg:'该项目已完成',type:'warn'}}});
   const gate=affairBudgetGate(a,resolved,function(r){completeAffair(id,r);});
   if(gate.status==='prompt')return;
-  const txr=Ledger.txn(function(){
-    const snap=affairPushUndo(a);
-    affairApplyProgress(a,9,{plan:gate.plan,snap:snap});
-  },{label:'affair-complete',save:'none',render:false});
-  if(!txr.ok){
-    if(gate.plan)rememberBudgetDraft('affair',a.id,gate.plan.amount);
-    return;
-  }
-  commit();
+  runCommand({
+    label:'affair-complete',silentFail:true,
+    onFail:function(){if(gate.plan)rememberBudgetDraft('affair',a.id,gate.plan.amount);},
+    run:function(tx){
+      const snap=affairPushUndo(a);
+      affairApplyProgress(a,9,{plan:gate.plan,snap:snap});
+    }
+  });
 }
 function completeAffairStep(id,idx,resolved){
   const a=state.affairs.find(function(x){return x.id===id;});
@@ -828,8 +814,8 @@ function initAffairAxes(){
       });
       if(gate.status==='prompt')return;
       if(!gate.plan){commit();return;}
-      const txr=Ledger.txn(function(){
-        const got=BudgetEngine.commitEntry(null,gate.plan,{affairId:a.id,affairAdvanceId:''});
+      const txr=Ledger.txn(function(tx){
+        const got=BudgetEngine.commitEntry(tx,gate.plan,{affairId:a.id,affairAdvanceId:''});
         snap.budgetRef=budgetRefOf(got.entry,gate.plan);
         if(a.budget&&a.budget.mode==='prompt')a.budget.lastAmount=gate.plan.amount;
       },{label:'affair-drag-budget',save:'none',render:false});
@@ -1071,16 +1057,18 @@ function toggleAffairAch(){
   const row=document.getElementById('affairAchAmountRow');
   if(row)row.style.display=on?'':'none';
 }
-function toggleAffairView(){affairView=(affairView==='cal'?'list':'cal');affairCalSelected=null;render();}
-function toggleAffairDone(){affairDoneOpen=!affairDoneOpen;render();}
-function affairSelectDay(ts){affairCalSelected=ts;render();}
+// 以下四个动作只改项目面板的展示状态（affairView / affairDoneOpen / affairCalCursor / affairCalSelected
+// 仅在 renderAffairs 内被读取），不写账、不改分数，局部重绘即可。
+function toggleAffairView(){affairView=(affairView==='cal'?'list':'cal');affairCalSelected=null;renderPanel('work.affairs');}
+function toggleAffairDone(){affairDoneOpen=!affairDoneOpen;renderPanel('work.affairs');}
+function affairSelectDay(ts){affairCalSelected=ts;renderPanel('work.affairs');}
 function affairCalShift(d){
   if(!affairCalCursor){const n=new Date();affairCalCursor={y:n.getFullYear(),m:n.getMonth()};}
   let y=affairCalCursor.y,m=affairCalCursor.m+d;
   if(m<0){m=11;y--;}else if(m>11){m=0;y++;}
   affairCalCursor={y:y,m:m};
   affairCalSelected=null;
-  render();
+  renderPanel('work.affairs');
 }
 
 // ===== 杂事（极简快速清单）=====
@@ -1096,18 +1084,23 @@ function settleChoreBatches(silent=false){
   if(batches<=0)return 0;
   const used=pool.slice(0,batches*need);
   const gain=round2(batches*cfg.batchY);
-  const txr=Ledger.txn(function(){
-    // 标记已结算必须与发放入账同一事务：发放失败时不能把杂事吞成“已结算”
-    used.forEach(function(c){c.settled=true;});
-    if(gain>0){
-      const target=round2((state.scores.vitality||0)+gain);
-      Ledger.post({op:'adjust',account:'vitality',target:target,entry:{st:'vitality',amt:gain,desc:'杂事批量结算：'+used.length+' 件',src:'chore-batch',dom:''},reason:{src:'chore-batch'}});
-      if(!silent)toast('批量结算 '+used.length+' 件杂事 · 活力点 +'+fmt(gain));
-    }else{
-      Ledger.event('杂事批量结算：'+used.length+' 件（当前奖励为 0）','chore-batch');
+  let msg='';
+  const r=runCommand({
+    label:'chore-batch',save:false,render:false,silentFail:true,
+    run:function(){
+      // 标记已结算必须与发放入账同一事务：发放失败时不能把杂事吞成“已结算”
+      used.forEach(function(c){c.settled=true;});
+      if(gain>0){
+        const target=round2((state.scores.vitality||0)+gain);
+        Ledger.post({op:'adjust',account:'vitality',target:target,entry:{st:'vitality',amt:gain,desc:'杂事批量结算：'+used.length+' 件',src:'chore-batch',dom:''},reason:{src:'chore-batch'}});
+        if(!silent)msg='批量结算 '+used.length+' 件杂事 · 活力点 +'+fmt(gain);
+      }else{
+        Ledger.event('杂事批量结算：'+used.length+' 件（当前奖励为 0）','chore-batch');
+      }
+      return {toast:msg?{msg:msg}:null};
     }
-  },{label:'chore-batch',save:'none',render:false});
-  return txr.ok?gain:0;
+  });
+  return r.ok?gain:0;
 }
 // 腐化债静默结算：超期杂事按档位系数逐日累积，直接从活力点扣除，不弹提示
 // 纯计算：只统计当天应扣总额与件数/天数，不修改 state、不写日志
@@ -1139,12 +1132,15 @@ function computeChoreDecay(){
 function processChoreDecay(silent=false){
   const r=computeChoreDecay();
   if(r.total<=0||r.charged<=0)return 0;
-  const txr=Ledger.txn(function(){
-    const target=round2((state.scores.vitality||0)-r.total);
-    Ledger.post({op:'adjust',account:'vitality',target:target,entry:{st:'vitality',amt:-r.total,desc:'杂事腐化债：'+r.charged+' 件超期，累计 '+r.dueDays+' 天',src:'chore-decay',dom:''},reason:{src:'chore-decay'}});
-    r.overdue.forEach(function(c){c.decayKey=dayKey(r.today);});
-  },{label:'chore-decay',save:silent?'none':undefined,render:false});
-  return txr.ok?r.total:0;
+  const res=runCommand({
+    label:'chore-decay',save:!silent,render:false,silentFail:true,
+    run:function(){
+      const target=round2((state.scores.vitality||0)-r.total);
+      Ledger.post({op:'adjust',account:'vitality',target:target,entry:{st:'vitality',amt:-r.total,desc:'杂事腐化债：'+r.charged+' 件超期，累计 '+r.dueDays+' 天',src:'chore-decay',dom:''},reason:{src:'chore-decay'}});
+      r.overdue.forEach(function(c){c.decayKey=dayKey(r.today);});
+    }
+  });
+  return res.ok?r.total:0;
 }
 function addChoreFromInput(){
   const inp=document.getElementById('choreInput');
@@ -1163,29 +1159,27 @@ function toggleChoreDone(id,resolved){
   if(!c)return;
   if(c.done){
     // 取消勾选：联动撤销现实账目（当期硬撤 / 跨期冲正），失败整单回滚
-    const txr=Ledger.txn(function(){
-      if(c.budgetRef)reverseBoundBudget(c.budgetRef);
-      // 进度值零和：按勾选时的领域分摊快照逐领域回退（不按当前配置重算）
-      const award=c.progressAward;
-      if(award&&Number(award.amount)>0){
-        const parts=(Array.isArray(award.parts)&&award.parts.length)?award.parts:[{did:'d_default',amt:Number(award.amount)}];
-        const dids=parts.map(function(p){return p.did;});
-        Ledger.postSplits({splits:[{domainIds:dids,delta:-Number(award.amount)}],
-          entry:{st:'progress',amt:-Number(award.amount),desc:'取消杂事「'+c.name+'」进度',src:'chore-progress-undo',dom:dids.join(','),choreId:c.id},
-          reason:{src:'chore-progress-undo',dom:dids.join(',')}});
-        delete c.progressAward;
+    runCommand({
+      label:'chore-uncheck',
+      failText:'取消失败：现实账目未能撤销',
+      run:function(){
+        if(c.budgetRef)reverseBoundBudget(c.budgetRef);
+        // 进度值零和：按勾选时的领域分摊快照逐领域回退（不按当前配置重算）
+        const award=c.progressAward;
+        if(award&&Number(award.amount)>0){
+          const parts=(Array.isArray(award.parts)&&award.parts.length)?award.parts:[{did:'d_default',amt:Number(award.amount)}];
+          const dids=parts.map(function(p){return p.did;});
+          Ledger.postSplits({splits:[{domainIds:dids,delta:-Number(award.amount)}],
+            entry:{st:'progress',amt:-Number(award.amount),desc:'取消杂事「'+c.name+'」进度',src:'chore-progress-undo',dom:dids.join(','),choreId:c.id},
+            reason:{src:'chore-progress-undo',dom:dids.join(',')}});
+          delete c.progressAward;
+        }
+        c.done=false;c.doneAt=null;
+        c.budgetRef=null;
+        // 取消勾选：腐化从今天重新起算；已结算的批次不回退，避免反复领取
+        c.decayKey=dayKey(now());
       }
-      c.done=false;c.doneAt=null;
-      c.budgetRef=null;
-      // 取消勾选：腐化从今天重新起算；已结算的批次不回退，避免反复领取
-      c.decayKey=dayKey(now());
-    },{label:'chore-uncheck',save:'none',render:false});
-    if(!txr.ok){
-      const info=(txr.error&&txr.error.info)||{};
-      toast(info.reason||'取消失败：现实账目未能撤销','err');
-      return;
-    }
-    commit();
+    });
     return;
   }
   const bind=budgetOf(c);
@@ -1193,65 +1187,63 @@ function toggleChoreDone(id,resolved){
     openBudgetAmountDialog({
       kind:'chore',id:c.id,entity:c,title:'杂事：'+c.name,
       onConfirm:function(amount){toggleChoreDone(id,{amount:amount});},
-      onCancel:function(){toast('已取消，本次未勾选','warn');render();}
+      onCancel:function(){runCommand({reject:{reason:'canceled',toast:{msg:'已取消，本次未勾选',type:'warn'}},render:true});}
     });
     return;
   }
   const br=resolveActionBudget(c,{kind:'chore',id:c.id,source:'chore',amount:resolved?resolved.amount:undefined});
-  if(br.status==='skip')toast(br.reason,'warn');
+  const skipReason=br.status==='skip'?br.reason:'';
   const plan=br.status==='ok'?br.plan:null;
-  const txr=Ledger.txn(function(){
-    c.done=true;c.doneAt=now();
-    c.decayKey=dayKey(now());
-    // 进度值：勾选即产出（与任务打卡同口径），按 splitCents 精确分摊到领域；
-    // 快照 progressAward 供取消勾选时逐分回退，保证零和。批量结算只发活力点，不重复发进度。
-    const awardParts=choreProgressParts(c);
-    if(awardParts.length){
-      const dids=awardParts.map(function(p){return p.did;});
-      const total=round2(awardParts.reduce(function(s,p){return s+p.amt;},0));
-      Ledger.postSplits({splits:[{domainIds:dids,delta:total}],
-        entry:{st:'progress',amt:total,desc:'杂事「'+c.name+'」产出进度',src:'chore-progress',dom:dids.join(','),choreId:c.id},
-        reason:{src:'chore-progress',desc:c.name,dom:dids.join(',')}});
-      c.progressAward={amount:total,parts:awardParts};
-      awardParts.forEach(function(p){checkAchievements(p.did);});
-    }else{
-      delete c.progressAward;
+  runCommand({
+    label:'chore-check',
+    failText:'勾选失败：现实账目未写入',
+    onFail:function(){if(plan)rememberBudgetDraft('chore',c.id,plan.amount);},
+    run:function(tx){
+      c.done=true;c.doneAt=now();
+      c.decayKey=dayKey(now());
+      // 进度值：勾选即产出（与任务打卡同口径），按 splitCents 精确分摊到领域；
+      // 快照 progressAward 供取消勾选时逐分回退，保证零和。批量结算只发活力点，不重复发进度。
+      const awardParts=choreProgressParts(c);
+      if(awardParts.length){
+        const dids=awardParts.map(function(p){return p.did;});
+        const total=round2(awardParts.reduce(function(s,p){return s+p.amt;},0));
+        Ledger.postSplits({splits:[{domainIds:dids,delta:total}],
+          entry:{st:'progress',amt:total,desc:'杂事「'+c.name+'」产出进度',src:'chore-progress',dom:dids.join(','),choreId:c.id},
+          reason:{src:'chore-progress',desc:c.name,dom:dids.join(',')}});
+        c.progressAward={amount:total,parts:awardParts};
+        awardParts.forEach(function(p){checkAchievements(p.did);});
+      }else{
+        delete c.progressAward;
+      }
+      let ref=null;
+      if(plan){
+        const got=BudgetEngine.commitEntry(tx,plan,{choreId:c.id});
+        ref=budgetRefOf(got.entry,plan);
+        if(c.budget&&c.budget.mode==='prompt')c.budget.lastAmount=plan.amount;
+      }
+      c.budgetRef=ref;
+      settleChoreBatches();
+      return {preToasts:skipReason?[{msg:skipReason,type:'warn'}]:null};
     }
-    let ref=null;
-    if(plan){
-      const got=BudgetEngine.commitEntry(null,plan,{choreId:c.id});
-      ref=budgetRefOf(got.entry,plan);
-      if(c.budget&&c.budget.mode==='prompt')c.budget.lastAmount=plan.amount;
-    }
-    c.budgetRef=ref;
-    settleChoreBatches();
-  },{label:'chore-check',save:'none',render:false});
-  if(!txr.ok){
-    if(plan)rememberBudgetDraft('chore',c.id,plan.amount);
-    const info=(txr.error&&txr.error.info)||{};
-    toast(info.reason||'勾选失败：现实账目未写入','err');
-    return;
-  }
-  commit();
+  });
 }
-function toggleChoreDoneZone(){choreDoneOpen=!choreDoneOpen;render();}
+function toggleChoreDoneZone(){choreDoneOpen=!choreDoneOpen;renderPanel('work.chores');}
 function fmtChoreDate(ts){
   const d=new Date(ts);
   return (d.getMonth()+1)+'/'+d.getDate();
 }
 function choreCardHTML(c){
-  const overdue=choreOverdueDays(c);
+  const v=choreCardView(c);
   let meta='';
-  if(c.plannedAt)meta+='<span class="chore-date">📅 '+fmtChoreDate(c.plannedAt)+'</span>';
-  const pg=choreProgressOf(c);
-  if(pg.amount>0)meta+='<span class="chore-progress">+'+fmt(pg.amount)+' 进度</span>';
-  if(overdue>0)meta+='<span class="chore-overdue">超期 '+overdue+' 天</span>';
-  return '<div class="card chore-card'+(c.done?' done':'')+(overdue>0?' overdue':'')+'" data-chore-id="'+c.id+'" onclick="openChoreModal(\''+c.id+'\')">'
+  if(v.plannedAt)meta+='<span class="chore-date">📅 '+fmtChoreDate(v.plannedAt)+'</span>';
+  if(v.progressAmount>0)meta+='<span class="chore-progress">+'+fmt(v.progressAmount)+' 进度</span>';
+  if(v.overdueDays>0)meta+='<span class="chore-overdue">超期 '+v.overdueDays+' 天</span>';
+  return '<div class="card chore-card'+(v.done?' done':'')+(v.overdueDays>0?' overdue':'')+'" data-chore-id="'+v.id+'" onclick="openChoreModal(\''+v.id+'\')">'
     +'<label class="chore-check" onclick="event.stopPropagation()">'
-    +'<input type="checkbox"'+(c.done?' checked':'')+' onchange="toggleChoreDone(\''+c.id+'\')">'
+    +'<input type="checkbox"'+(v.done?' checked':'')+' onchange="toggleChoreDone(\''+v.id+'\')">'
     +'</label>'
     +'<div class="chore-main">'
-    +'<div class="chore-name">'+esc(c.name)+budgetBadgeHTML(c)+'</div>'
+    +'<div class="chore-name">'+esc(v.name)+budgetBadgeHTML(c)+'</div>'
     +(meta?'<div class="chore-meta">'+meta+'</div>':'')
     +'</div>'
     +'</div>';
@@ -1281,33 +1273,23 @@ function renderChores(){
       ?('有 '+readyBatches+' 批待入账（'+unsettled+' 件）· 完成下一件即入账')
       :('待入账 '+unsettled+' 件 · 再完成 '+next+' 件可结算'))+'</span>'
     +'</div>';
-  html+=todo.length?todo.map(choreCardHTML).join(''):'<div class="affair-empty">还没有杂事。输入名称回车，即刻创建。</div>';
+  html+=todo.length?todo.map(choreCardHTML).join(''):emptyHTML('affair-empty','还没有杂事。输入名称回车，即刻创建。');
   if(done.length){
-    const collapsed=!choreDoneOpen;
-    html+='<div class="affair-zone'+(collapsed?' collapsed':'')+'" id="chore-zone-done">'
-      +'<div class="affair-zone-title" onclick="toggleChoreDoneZone()">'
-      +'<span class="coll-toggle">▼</span>已完成 <span class="affair-zone-count">'+done.length+'</span></div>'
-      +'<div class="affair-zone-body">'+done.map(choreCardHTML).join('')+'</div>'
-      +'</div>';
+    html+=zoneHTML({id:'chore-zone-done',collapsed:!choreDoneOpen,onclick:'toggleChoreDoneZone()',title:'已完成',count:done.length,body:done.map(choreCardHTML).join('')});
   }
   if(archived.length){
-    const collapsed=!choreArchivedOpen;
-    html+='<div class="affair-zone'+(collapsed?' collapsed':'')+'" id="chore-zone-archived">'
-      +'<div class="affair-zone-title" onclick="toggleChoreArchivedZone()">'
-      +'<span class="coll-toggle">▼</span>已归档 <span class="affair-zone-count">'+archived.length+'</span></div>'
-      +'<div class="affair-zone-body">'
-      +archived.map(function(c){
+    html+=zoneHTML({id:'chore-zone-archived',collapsed:!choreArchivedOpen,onclick:'toggleChoreArchivedZone()',title:'已归档',count:archived.length,
+      body:archived.map(function(c){
         return '<div class="card chore-card" style="opacity:.7">'
           +'<div class="chore-row"><div class="chore-main"><span class="chore-name">'+esc(c.name)+'</span></div>'
-          +'<div class="chore-actions"><span class="chore-time">归档于 '+(c.archivedAt?fmtTime(c.archivedAt):'—')+'</span>'
-          +'<button class="btn btn-sm" onclick="restoreChore(\''+c.id+'\')">恢复</button></div></div>'
-          +'</div>';
-      }).join('')
-      +'</div></div>';
+          +actionsRowHTML('chore-actions','<span class="chore-time">归档于 '+(c.archivedAt?fmtTime(c.archivedAt):'—')+'</span>'
+          +'<button class="btn btn-sm" onclick="restoreChore(\''+c.id+'\')">恢复</button>')
+          +'</div></div>';
+      }).join('')});
   }
   panel.innerHTML=html;
 }
-function toggleChoreArchivedZone(){choreArchivedOpen=!choreArchivedOpen;renderChores();}
+function toggleChoreArchivedZone(){choreArchivedOpen=!choreArchivedOpen;renderPanel('work.chores');}
 function restoreChore(id){
   const c=(state.chores||[]).find(function(x){return x.id===id;});
   if(!c||!c.archived)return;
@@ -1391,6 +1373,11 @@ function saveChore(){
   closeModal('choreModal');
   commit(id?'杂事已更新':'杂事已创建');
 }
+// 项目 → 杂事的 UI 入口：有损项目被直接拒绝，原因用 toast 明确展示
+function affairConvertToChore(id){
+  const r=affairToChore(id);
+  if(!r.ok)toast(r.reason||'无法转为杂事','warn');
+}
 // 杂事编辑弹窗里的「转为项目」：同 id 换表，成功后关闭弹窗（转换本身已 commit + render）
 function choreConvertFromModal(){
   const id=document.getElementById('choreId').value;
@@ -1462,7 +1449,10 @@ function saveChoreConfig(){
     if(!c.done)c.decayKey=dayKey(now());
   });
   closeModal('choreConfigModal');
-  commit('杂事经济设置已保存，作为所有杂事的默认');
+  // 配置只影响杂事面板的展示口径（choreCfg 仅被 renderChores / 腐化计算读取），局部重绘即可
+  save();
+  renderPanel('work.chores');
+  toast('杂事经济设置已保存，作为所有杂事的默认');
 }
 
 function stageBarHTML(t){
@@ -1489,23 +1479,18 @@ function stageBarHTML(t){
 }
 
 function taskCardHTML(t,collId){
-  const c=calcCheckIn(t);
-  const s=calcSkip(t);
-  const staged=taskIsStaged(t);
-  const types=taskScoreTypes(t);
-  const hasV=types.indexOf('vitality')>=0;
-  const hasP=types.indexOf('progress')>=0;
-  const isV=!hasP;
-  const name=hasV&&hasP?'活力+进度':(hasP?'进度值':'活力点');
+  const v=taskCardView(t);
+  const c=v.checkIn;
+  const s=v.skip;
+  const staged=v.staged;
+  const hasV=v.hasV;
+  const hasP=v.hasP;
   const posClass=hasP?'pos p':'pos';
-  const typeTag=hasV&&hasP
-    ?'<span class="tag v">活力点</span><span class="tag p">进度值</span>'
-    :(hasP?'<span class="tag p">进度值</span>':'<span class="tag v">活力点</span>');
-  const sign=c.net>=0?'+':'';
-  const cost=t.vitalityCost||0;
+  const typeTag=v.typeTags.map(function(x){return tagHTML(x.kind,x.text);}).join('');
+  const sign=v.sign;
+  const cost=v.cost;
   // Use effective streak for display consistency with calcCheckIn
-  let curStreak=t.streak||0;
-  if(curStreak===0&&t.lastCheckIn)curStreak=1;
+  const curStreak=v.streak;
 
   // Preview: show check-in result and skip penalty
   let prev='';
@@ -1526,23 +1511,18 @@ function taskCardHTML(t,collId){
     prev+='　<span style="color:var(--text-3)">已断更'+(c.gapDays-1)+'天</span>';
   }
 
-  const domTags=!isV?getTaskDomainIds(t).map(did=>'<span class="tag d">'+esc(domainName(did))+'</span>').join(''):'';
-  const streakTag=curStreak>0?'<span class="tag d">连胜'+curStreak+'天</span>':'';
+  const domTags=!v.isV?v.domainNames.map(function(n){return tagHTML('d',esc(n));}).join(''):'';
+  const streakTag=curStreak>0?tagHTML('d','连胜'+curStreak+'天'):'';
 
   // Exemption card eligibility
-  const todayStart=dayStart(now());
-  const checkedToday=taskCheckedToday(t);
-  const exemptToday=!!(t.lastExempt&&t.lastExempt>=todayStart);
-  const cards=(state.cards&&state.cards.exemption)||0;
-  const exAct=exemptionActivity();
-  const ruleEnabled=!!(exAct&&exAct.enabled);
-  const canExempt=ruleEnabled&&cards>0&&!checkedToday&&!exemptToday;
-  const exemptLabel=c.gapDays>=2?'补救':'请假';
+  const cards=v.exemption.cards;
+  const canExempt=v.exemption.canExempt;
+  const exemptLabel=v.exemption.label;
   const exemptBtn=canExempt
     ?'<button class="btn btn-sm btn-exempt" title="剩余豁免卡 '+cards+' 张" onclick="useExemption(\''+t.id+'\')">豁免·'+exemptLabel+'</button>'
     :'';
 
-  const checkinBtn=checkedToday
+  const checkinBtn=v.checkedToday
     ?'<button class="btn btn-sm btn-checkin" disabled title="今日已打卡，明天再来">今日已打卡</button>'
     :'<button class="btn btn-sm btn-checkin" onclick="checkIn(\''+t.id+'\')" '+(cost>0&&state.scores.vitality<cost?'title="活力点不足，将进入负值（贷款）"':'')+'>打卡</button>';
   return '<div class="card task-card" data-task-id="'+t.id+'" data-coll-id="'+(collId||'')+'">'
@@ -1551,13 +1531,13 @@ function taskCardHTML(t,collId){
     +(hasV?'<span class="tdot v" title="活力点"></span>':'')+(hasP?'<span class="tdot p" title="进度值"></span>':'')
     +'<span class="card-title">'+esc(t.name)+'</span>'+budgetBadgeHTML(t)
     +'</div>'
-    +'<div class="task-row-actions"><span class="drag-handle" title="拖拽排序">⋮⋮</span>'+checkinBtn+'</div>'
+    +actionsRowHTML('task-row-actions',dragHandleHTML('拖拽排序')+checkinBtn)
     +'</div>'
     +(staged?'<div class="task-stage-row">'+stageBarHTML(t)+'</div>':'')
     +'<div class="task-extra">'
     +'<div class="card-top">'
     +'<div>'+typeTag+domTags+streakTag+'</div>'
-    +'<div class="card-actions"><span class="drag-handle" title="拖拽排序">⋮⋮</span><button onclick="openTaskModal(\''+t.id+'\')">编辑</button><button class="del" onclick="confirmDelTask(\''+t.id+'\')">删除</button></div>'
+    +actionsRowHTML('card-actions',dragHandleHTML('拖拽排序')+'<button onclick="openTaskModal(\''+t.id+'\')">编辑</button><button class="del" onclick="confirmDelTask(\''+t.id+'\')">删除</button>')
     +'</div>'
     +'<div class="card-meta">'
     +'<span>初始 <b>'+fmt(t.initialValue)+'</b></span>'
@@ -1685,8 +1665,8 @@ function achCardHTML(a,domId){
   const pct=a.threshold>0?Math.min(100,(prog/a.threshold)*100):(prog>0?100:0);
   return '<div class="card" data-ach-id="'+a.id+'" data-dom-id="'+(domId||a.domainId)+'">'
     +'<div class="card-top">'
-    +'<div><span class="tag a">成果</span><span class="card-title">'+(a.unlocked?'✓ ':'')+esc(a.name)+'</span></div>'
-    +'<div class="card-actions"><span class="drag-handle" title="拖拽排序">⋮⋮</span><button onclick="openAchModal(\''+a.id+'\')">编辑</button><button class="del" onclick="confirmDelAch(\''+a.id+'\')">删除</button></div>'
+    +'<div>'+tagHTML('a','成果')+'<span class="card-title">'+(a.unlocked?'✓ ':'')+esc(a.name)+'</span></div>'
+    +actionsRowHTML('card-actions',dragHandleHTML('拖拽排序')+'<button onclick="openAchModal(\''+a.id+'\')">编辑</button><button class="del" onclick="confirmDelAch(\''+a.id+'\')">删除</button>')
     +'</div>'
     +'<div class="card-meta">'
     +'<span>领域 <b>'+esc(domainName(a.domainId))+'</b></span>'
@@ -1698,11 +1678,17 @@ function achCardHTML(a,domId){
     +'</div>';
 }
 
-export function resetWorkUiState(){affairView='list';affairCalCursor=null;affairCalSelected=null;affairDoneOpen=false;choreDoneOpen=false;}
+export function resetWorkUiState(){affairView='list';affairCalCursor=null;affairCalSelected=null;affairDoneOpen=false;choreDoneOpen=false;choreArchivedOpen=false;}
 export function closeChoreDoneZone(){choreDoneOpen=false;}
 
-export { affairView, affairCalCursor, affairCalSelected, affairDoneOpen, choreDoneOpen, choreArchivedOpen, editAffairSteps, setScoreCell, renderWork, frSameDay, fmtClock, fmtPlan, fmtDateCal, toLocalInput, fromLocalInput, editAffairCurve, affairTags, editPresetCurve, renderAffairPresetsHTML, applyAffairPreset, openPresetModal, presetCurvePreview, presetCurveRefresh, setPresetCurve, renderPresetCurveCustom, presetCurveInput, getPresetCurve, togglePresetAch, savePreset, delPreset, renderAffairs, affairStatusLine, affairAxisHTML, affairZoneStart, AFFAIR_ZONE_END, doneZoneHTML, toggleAffairZone, affairMoreBtn, affairMenuTarget, toggleAffairMenu, closeAffairMenu, affairInProgressCardHTML, affairScheduleCardHTML, affairDraftCardHTML, affairDoneCardHTML, affairUnits, affairStepUnitCardHTML, todayAgendaHTML, renderAffairSchedule, renderAffairCalendar, addAffairFromInput, applyAffairValue, reverseAffairValue, affairApplyProgress, AFFAIR_UNDO_LIMIT, affairCanUndo, affairPushUndo, affairUndoAction, _completeAffairStep, advanceAffairStep, completeAffair, completeAffairStep, initAffairAxes, openAffairPlanModal, saveAffairPlan, openAffairModal, handleAffairSave, delAffair, restoreAffair, renderAffairSteps, affairStepInput, affairStepTime, affairAddStep, affairRemoveStep, readAffairSteps, affairCurvePreview, affairCurveRefresh, setAffairCurve, renderAffairCurveCustom, affairCurveInput, getAffairCurve, toggleAffairAch, toggleAffairView, toggleAffairDone, affairSelectDay, affairCalShift, settleChoreBatches, computeChoreDecay, processChoreDecay, addChoreFromInput, toggleChoreDone, toggleChoreDoneZone, fmtChoreDate, choreCardHTML, renderChores, toggleChoreArchivedZone, restoreChore, toDateInputValue, openChoreModal, saveChore, choreConvertFromModal, delChore, CHORE_CFG_FIELDS, readChoreCfgForm, writeChoreCfgForm, choreCfgInputPreview, openChoreConfigModal, resetChoreConfig, saveChoreConfig, stageBarHTML, taskCardHTML, applyStageBar, updateStageBar, setStageFromX, initStageBars, initTaskReveal, achCardHTML };
+export { affairView, affairCalCursor, affairCalSelected, affairDoneOpen, choreDoneOpen, choreArchivedOpen, editAffairSteps, setScoreCell, renderWork, frSameDay, fmtClock, fmtPlan, fmtDateCal, toLocalInput, fromLocalInput, editAffairCurve, affairTags, editPresetCurve, renderAffairPresetsHTML, applyAffairPreset, openPresetModal, presetCurvePreview, presetCurveRefresh, setPresetCurve, renderPresetCurveCustom, presetCurveInput, getPresetCurve, togglePresetAch, savePreset, delPreset, renderAffairs, affairStatusLine, affairAxisHTML, affairZoneStart, AFFAIR_ZONE_END, doneZoneHTML, toggleAffairZone, affairMoreBtn, affairMenuTarget, toggleAffairMenu, closeAffairMenu, affairInProgressCardHTML, affairScheduleCardHTML, affairDraftCardHTML, affairDoneCardHTML, affairUnits, affairStepUnitCardHTML, todayAgendaHTML, renderAffairSchedule, renderAffairCalendar, addAffairFromInput, applyAffairValue, reverseAffairValue, affairApplyProgress, AFFAIR_UNDO_LIMIT, affairCanUndo, affairPushUndo, affairUndoAction, _completeAffairStep, advanceAffairStep, completeAffair, completeAffairStep, initAffairAxes, openAffairPlanModal, saveAffairPlan, openAffairModal, handleAffairSave, delAffair, restoreAffair, renderAffairSteps, affairStepInput, affairStepTime, affairAddStep, affairRemoveStep, readAffairSteps, affairCurvePreview, affairCurveRefresh, setAffairCurve, renderAffairCurveCustom, affairCurveInput, getAffairCurve, toggleAffairAch, toggleAffairView, toggleAffairDone, affairSelectDay, affairCalShift, settleChoreBatches, computeChoreDecay, processChoreDecay, addChoreFromInput, toggleChoreDone, toggleChoreDoneZone, fmtChoreDate, choreCardHTML, renderChores, toggleChoreArchivedZone, restoreChore, toDateInputValue, openChoreModal, saveChore, affairConvertToChore, choreConvertFromModal, delChore, CHORE_CFG_FIELDS, readChoreCfgForm, writeChoreCfgForm, choreCfgInputPreview, openChoreConfigModal, resetChoreConfig, saveChoreConfig, stageBarHTML, taskCardHTML, applyStageBar, updateStageBar, setStageFromX, initStageBars, initTaskReveal, achCardHTML };
 
 registerRenderer('work', renderWork);
 registerRenderer('stageBars', initStageBars);
 registerRenderer('affairAxes', initAffairAxes);
+
+// 面板级重绘入口（S3-B：能力已可用，现有调用点仍只走全量 render()）
+registerPanelTarget('work', renderWork);
+registerPanelTarget('work.tasks', renderWorkTasks);
+registerPanelTarget('work.chores', renderChores);
+registerPanelTarget('work.affairs', renderAffairs);

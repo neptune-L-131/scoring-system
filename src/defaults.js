@@ -1,4 +1,4 @@
-import { BUDGET_LEDGER_MAX, BUDGET_PERIOD_KEEP, BUDGET_VERSION, SCHEMA_VERSION, STATS_VERSION } from './constants.js';
+import { ASSET_VERSION, BUDGET_LEDGER_MAX, BUDGET_PERIOD_KEEP, BUDGET_VERSION, FLOW_VERSION, SCHEMA_VERSION, STATS_VERSION } from './constants.js';
 import { defaultWatermark, now, uid } from './pure.js';
 // defaults.js —— 默认状态与默认配置工厂
 // 由 state/normalize 抽离（第六轮循环依赖治理），返回值逐字未改。
@@ -65,6 +65,17 @@ function migrateChore(c){
   return c;
 }
 
+function defaultAssetDef(id,name,extra){
+  return Object.assign({
+    v:ASSET_VERSION,id:id,name:name,unit:'张',
+    maxBalance:null,maxIssuedPerPeriod:null,
+    issuePeriod:{cycle:'week',anchor:1},
+    enabled:true,archived:false,origin:'builtin',createdAt:0,updatedAt:0
+  },extra||{});
+}
+function defaultAssetDefs(){
+  return[defaultAssetDef('exemption','断更豁免卡')];
+}
 function defaultActivities(){
   return[
     {id:'act_exemption',name:'断更豁免卡',enabled:true,period:'week',anchor:1,
@@ -88,7 +99,10 @@ function newExtState(){
     shadow:[],
     // 代谢规则是否已播种：一旦为 true，用户删除默认规则后不再自动补回
     metabolismSeeded:false,
-    features:{audit:true}
+    features:{audit:true},
+    // 阶段 4 运行层：资产周期计量与动作流运行记录（缺省空结构，懒安全）
+    assetMeters:{v:ASSET_VERSION,byAsset:{},idem:{}},
+    flowRuns:{v:FLOW_VERSION,seq:0,byId:{},recent:[]}
   };
 }
 function defaults(){
@@ -113,6 +127,9 @@ function defaults(){
     conversions:[],
     loans:[],
     cards:{exemption:0},
+    // 阶段 4 配置层：资产定义（内置豁免卡恒定存在）与动作流（默认空）
+    assetDefs:defaultAssetDefs(),
+    flows:[],
     activities:defaultActivities(),
     lastDebtDate:null,
     filterDomain:null,
@@ -121,4 +138,4 @@ function defaults(){
   };
 }
 
-export { defaultBudgetSettings, defaultBudgetsState, defaultProductGate, tierCurrency, defaultChoreConfig, normalizeChoreConfig, migrateChore, defaultActivities, newExtState, defaults };
+export { defaultBudgetSettings, defaultBudgetsState, defaultProductGate, tierCurrency, defaultChoreConfig, normalizeChoreConfig, migrateChore, defaultAssetDef, defaultAssetDefs, defaultActivities, newExtState, defaults };

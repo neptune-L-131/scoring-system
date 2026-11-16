@@ -32,6 +32,14 @@ async function init(){
       toast(loadIssue.type==='timeout'
         ?'读取本地存档超时：本次已暂停写入，避免空白数据覆盖原存档。请点顶部「重试读取」'
         :'无法读取本地存档：本次已暂停写入，避免覆盖原存档。请点顶部「重试读取」','err');
+    }else if(loadIssue.type==='future'){
+      // 高版本存档：拒载且已暂停写盘（normalize 里置位），不让默认值覆盖原存档
+      const rb=document.getElementById('recoverBar');
+      if(rb){
+        rb.style.display='flex';
+        rb.innerHTML='<span>本地存档由更高版本（v'+loadIssue.from+'）写入，本次已暂停写入以保护原数据。请升级应用后再打开。</span>';
+      }
+      toast('存档版本高于当前应用（v'+loadIssue.from+'），已暂停写入以保护原数据','err');
     }else{
       toast(loadIssue.type==='salvaged'
         ?'检测到数据不完整，已自动修复并恢复可读部分（原始内容已备份）'
@@ -79,7 +87,9 @@ async function init(){
     affairPlanSaveBtn:saveAffairPlan,
     presetSaveBtn:savePreset,
     choreSaveBtn:saveChore,
-    choreCfgSaveBtn:saveChoreConfig
+    choreCfgSaveBtn:saveChoreConfig,
+    assetSaveBtn:handleAssetSave,
+    flowSaveBtn:m_flow_ui.handleFlowSave
   };
   Object.keys(MODAL_SAVERS).forEach(id=>{
     const el=document.getElementById(id);
@@ -132,6 +142,8 @@ import * as m_library from './src/library.js';
 import * as m_shell from './src/shell.js';
 import * as m_render_work from './src/render-work.js';
 import * as m_render_bank from './src/render-bank.js';
+import * as m_asset_ui from './src/asset-ui.js';
+import * as m_flow_ui from './src/flow-ui.js';
 import * as m_render_shop from './src/render-shop.js';
 import * as m_render_budget from './src/render-budget.js';
 import * as m_cycle from './src/cycle.js';
@@ -151,9 +163,9 @@ const __ALL__ = Object.assign({},
   m_cond_model,
   m_conditions, m_entities, m_business, m_library, m_shell, m_render_work, m_render_bank,
   m_render_shop, m_render_budget, m_cycle, m_cond_ui, m_ui_events, m_undo, m_modals,
-  m_data, m_pwa, m_debug, m_startup, m_modal_host);
+  m_data, m_pwa, m_debug, m_startup, m_modal_host, m_asset_ui, m_flow_ui);
 
-const __HANDLERS__ = ["activityPeriodChanged","addAffairFromInput","addChoreFromInput","addCollection","addCondGroup","addCondItem","addDomain","addRewardRow","addShopCategory","advanceAffairStep","affairAddStep","affairCalShift","affairCurveInput","affairCurveRefresh","affairRemoveStep","affairSelectDay","affairStepInput","affairStepTime","affairToChore","affairUndoAction","applyAffairPreset","applyStagePreset","askDelActivityFromModal","attemptRecovery","budgetAmountCancel","budgetAmountConfirm","budgetAmountInput","budgetBindingModeChange","budCondModeChange","budRuleAccountChanged","budRuleAdd","budRuleDelete","budRuleDoneWhen","budRuleEditWhen","budRuleKindChanged","budRuleModeChanged","budRuleMove","buyProduct","cancelDomainChange","changeGroupMode","changeSoldoutCat","checkIn","choreCfgInputPreview","choreConvertFromModal","clearDataResults","clearEverything","closeAffairMenu","closeModal","commitCondOp","completeAffair","completeAffairStep","confirmCondDays","confirmDelAch","confirmDelBudgetCategory","confirmDelProd","confirmDelTask","confirmReverseBudgetEntry","delAffair","delChore","delCollection","delDomain","delMetric","delPreset","delShopCategory","dismissBudgetAnchorNotice","doDeleteActivity","editCondValue","exportData","filterByDomain","goTab","hideChartTip","importData","installApp","manualAdjustBalance","onCondModeChange","onProdBudgetChange","onProdGateModeChange","onProdTierChange","onStageEnabled","onStageInput","openAchModal","openActivityModal","openAffairModal","openAffairPlanModal","openBudgetCatModal","openChoreConfigModal","openChoreModal","openCondMetricPanel","openCondOpPanel","openMetricModal","openModal","openPresetModal","openProdModal","openQuickRecordModal","openTaskModal","pickCondAggregate","pickCondBudgetCat","pickCondDomain","pickCondMetric","pickCondMilestone","pickCondNewFilter","pickCondRange","pickCondTargetType","pickCondTask","presetCurveInput","presetCurveRefresh","qrConfirm","qrToggleTopup","removeCondNode","removeRewardRow","renameCollection","renameDomain","renameShopCategory","renderQuickPreview","resetChoreConfig","resolveDomainChange","restoreAffair","restoreChore","retryLoadStorage","rrTypeChanged","runStagePreset","saveBudgetCategory","setAffairCurve","setPresetCurve","showChartTip","syncBudgetAnchorVisibility","toggleAcc","toggleActivity","toggleAffairAch","toggleAffairDone","toggleAffairMenu","toggleAffairView","toggleAffairZone","toggleChartSeries","toggleChoreArchivedZone","toggleChoreDone","toggleChoreDoneZone","toggleCollapse","toggleInline","toggleMajor","togglePresetAch","toggleScoreType","toggleShadowList","toggleStageParam","toggleTheme","toggleTrendMode","undoConversion","undoLog","unlockTask","updateCondPreview","useExemption","useExemptionFromSel"];
+const __HANDLERS__ = ["activityPeriodChanged","addAffairFromInput","addChoreFromInput","addCollection","addCondGroup","addCondItem","addDomain","addRewardRow","addShopCategory","advanceAffairStep","affairAddStep","affairCalShift","affairConvertToChore","affairCurveInput","affairCurveRefresh","affairRemoveStep","affairSelectDay","affairStepInput","affairStepTime","affairToChore","affairUndoAction","applyAffairPreset","applyStagePreset","archiveAssetDef","askDelActivityFromModal","attemptRecovery","budgetAmountCancel","budgetAmountConfirm","budgetAmountInput","budgetBindingModeChange","budCondModeChange","budRuleAccountChanged","budRuleAdd","budRuleDelete","budRuleDoneWhen","budRuleEditWhen","budRuleKindChanged","budRuleModeChanged","budRuleMove","buyProduct","cancelDomainChange","changeGroupMode","changeSoldoutCat","checkIn","choreCfgInputPreview","choreConvertFromModal","clearDataResults","clearEverything","closeAffairMenu","closeModal","commitCondOp","completeAffair","completeAffairStep","confirmCondDays","confirmDelAch","confirmDelBudgetCategory","confirmDelProd","confirmDelTask","confirmReverseBudgetEntry","delAffair","delAssetDef","delChore","delCollection","delDomain","delMetric","delPreset","delShopCategory","dismissBudgetAnchorNotice","doDeleteActivity","editCondValue","exportData","filterByDomain","goTab","handleAssetSave","hideChartTip","importData","installApp","manualAdjustBalance","onCondModeChange","onProdBudgetChange","onProdGateModeChange","onProdTierChange","onStageEnabled","onStageInput","openAchModal","openActivityModal","openAffairModal","openAffairPlanModal","openAssetModal","openBudgetCatModal","openChoreConfigModal","openChoreModal","openCondMetricPanel","openCondOpPanel","openMetricModal","openModal","openPresetModal","openProdModal","openQuickRecordModal","openTaskModal","pickCondAggregate","pickCondBudgetCat","pickCondDomain","pickCondMetric","pickCondMilestone","pickCondNewFilter","pickCondRange","pickCondTargetType","pickCondTask","presetCurveInput","presetCurveRefresh","qrConfirm","qrToggleTopup","removeCondNode","removeRewardRow","renameCollection","renameDomain","renameShopCategory","renderQuickPreview","resetChoreConfig","resolveDomainChange","restoreAffair","restoreChore","retryLoadStorage","rrTypeChanged","runStagePreset","saveBudgetCategory","setAffairCurve","setPresetCurve","showChartTip","syncBudgetAnchorVisibility","toggleAcc","toggleActivity","toggleAffairAch","toggleAffairDone","toggleAffairMenu","toggleAffairView","toggleAffairZone","toggleAssetEnabled","toggleChartSeries","toggleChoreArchivedZone","toggleChoreDone","toggleChoreDoneZone","toggleCollapse","toggleInline","toggleMajor","togglePresetAch","toggleScoreType","toggleShadowList","toggleStageParam","toggleTheme","toggleTrendMode","unarchiveAssetDef","undoConversion","undoLog","unlockTask","updateCondPreview","useExemption","useExemptionFromSel","openFlowModal","closeFlowModal","handleFlowSave","flowTriggerChanged","flowCondModeChange","flowStepAtomChanged","flowStepParamChanged","flowStepMove","flowStepDelete","flowAddStep","flowAddBranch","toggleFlowEnabled","dryRunFlow","executeFlow","undoFlowRunUI"];
 __HANDLERS__.forEach(function(name){
   const fn = __ALL__[name];
   if (typeof fn === 'function') window[name] = fn;
@@ -167,6 +179,7 @@ initPersistHooks();
 registerAchievementLifetimePolicy();
 registerProductGatePolicy();
 registerBudgetPreflightPolicy();
+
 initAffairMenuDismiss();
 initCondPanelDismiss();
 

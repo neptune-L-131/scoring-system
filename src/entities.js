@@ -1,230 +1,18 @@
-import { idleDaysSince } from './pure.js';
+import { affairActive, evalCondition } from './cond-eval.js';
+import { idleDaysSince, dayKey, periodKey, cardName, affairLastAdvance, effectiveLastTs, fmt, now } from './pure.js';
 import { BudgetEngine } from './budget.js';
 import { checkAchievements } from './business.js';
-import { condLeafEntities, entityMetricValue, evalCondition, logDomainsOf, opSatisfied, rangeStats } from './conditions.js';
+import { FlowEngine } from './flow-engine.js';
 import { Ledger } from './ledger.js';
 import { ensureMetabolismRule, processDailyTaskDebts, processLoansWithDecayReserve } from './library.js';
 import { save, scheduleRender } from './persist.js';
-import { isArchivedEntity, round4, condWindowByRange, dayKey, dayStartTs, periodKey, cardName, isAffairMetric, isChoreMetric, isPointMetric, validRange, affairLastAdvance, round2, effectiveLastTs, fmt, getTaskDomainIds, now } from './pure.js';
 import { processChoreDecay } from './render-work.js';
-import { render } from './render.js';
 import { state } from './state.js';
-import { dayDiff } from './time.js';
-import { activityCountForDomain, choreOverdueDays, domainName, totalProgress } from './utils.js';
+import { domainName } from './utils.js';
 // entities.js —— 阶段 1 指标与结构操作（不活跃归档）
 // 由 app.js 按功能拆分（第五轮可维护性重构），行为不变。
+// 第五轮 S2-A：条件叶子求值已下沉到 cond-eval.js；本文件只保留结构操作与周期活动调度。
 
-// ===== 阶段 1：项目 / 杂事 / 不活跃指标 =====
-// 不活跃天数按自然日计算；从未活跃（无基准时间）返回 null，由调用方决定是否跳过
-function affairActive(a){return !!a&&!a.doneAt&&!a.archived;}
-// 点态指标：只看“此刻”的实体状态，与时间范围无关（配置时强制 range='today'）
-function pointMetricValue(metric,it,ts){
-  const tt=it.targetType||'all';
-  const target=it.target||'';
-  if(metric==='task_idle'){
-    let tasks=(state.tasks||[]).filter(t=>!t.archived);
-    if(tt==='task'&&target)tasks=tasks.filter(t=>t.id===target);
-    else if(tt==='domain'&&target)tasks=tasks.filter(t=>getTaskDomainIds(t).indexOf(target)>=0);
-    let max=0;
-    tasks.forEach(t=>{
-      const d=idleDaysSince(effectiveLastTs(t),ts);
-      if(d!==null&&d>max)max=d;
-    });
-    return max;
-  }
-  if(metric==='affair_stall'){
-    let list=(state.affairs||[]).filter(affairActive);
-    if(tt==='domain'&&target)list=list.filter(a=>a.domainId===target);
-    let max=0;
-    list.forEach(a=>{
-      const d=idleDaysSince(affairLastAdvance(a)||a.createdAt,ts);
-      if(d!==null&&d>max)max=d;
-    });
-    return max;
-  }
-  if(metric==='chore_overdue'){
-    return (state.chores||[]).filter(c=>!c.done&&!c.archived&&choreOverdueDays(c,ts)>0).length;
-  }
-  if(metric==='chore_idle'){
-    let max=0;
-    (state.chores||[]).filter(c=>!c.archived).forEach(c=>{
-      const d=idleDaysSince(c.doneAt||c.plannedAt||c.createdAt,ts);
-      if(d!==null&&d>max)max=d;
-    });
-    return max;
-  }
-  // ===== 阶段 3：门槛条件用点态指标 =====
-  if(metric==='lifetime_achievement'){
-    return Math.max(0,Number(state.ext&&state.ext.stats&&state.ext.stats.lifetimeAchievementEarned)||0);
-  }
-  if(metric==='checkin_streak'){
-    let list=(state.tasks||[]).filter(t=>!t.archived);
-    if(tt==='task'&&target)list=list.filter(t=>t.id===target);
-    else if(tt==='domain'&&target)list=list.filter(t=>getTaskDomainIds(t).indexOf(target)>=0);
-    let max=0;
-    list.forEach(t=>{const v=Math.max(0,Math.round(Number(t.streak)||0));if(v>max)max=v;});
-    return max;
-  }
-  if(metric==='milestone_unlocked'){
-    if(!target)return 0;
-    const a=(state.achievements||[]).find(x=>x.id===target);
-    return (a&&!isArchivedEntity(a)&&a.unlocked)?1:0;
-  }
-  if(metric==='budget_remaining'){
-    if(!target)return 0;
-    const cat=BudgetEngine.category(target);
-    if(!cat||!cat.enabled||cat.archived)return 0;
-    const p=BudgetEngine.readPeriod(cat,ts).period;
-    // 剩余额度按“基础限额 + 本期扩容”计算，与超支惩罚同一口径
-    return round4(BudgetEngine.effectiveLimit(cat,p)-(Number(p&&p.spent)||0));
-  }
-  return 0;
-}
-// 窗口求和：遍历可见流水；日志被截断后旧记录不再参与（窗口取最近时影响可控）
-function sumLogsInWindow(w,pred,useAbs){
-  let sum=0;
-  (state.logs||[]).forEach(function(l){
-    const t=Number(l.time)||0;
-    if(t<w.start||t>=w.end)return;
-    if(!pred(l))return;
-    const v=Number(l.amt)||0;
-    sum+=useAbs?Math.abs(v):v;
-  });
-  return round2(sum);
-}
-function countLogsInWindow(w,pred){
-  let n=0;
-  (state.logs||[]).forEach(function(l){
-    const t=Number(l.time)||0;
-    if(t<w.start||t>=w.end)return;
-    if(pred(l))n++;
-  });
-  return n;
-}
-// 项目流水的领域归属：优先领域字段，缺失时经 affairId 反查项目
-function logAffairDomain(l){
-  const dids=logDomainsOf(l);
-  if(dids.length)return dids[0];
-  if(l.affairId){
-    const a=(state.affairs||[]).find(function(x){return x.id===l.affairId;});
-    if(a&&a.domainId)return a.domainId;
-  }
-  return '';
-}
-function affairWindowValue(metric,it,w,range){
-  const tt=it.targetType||'all';
-  const target=it.target||'';
-  const domainOk=function(a){return tt!=='domain'||!target||a.domainId===target;};
-  const inWin=function(ts){return ts&&ts>=w.start&&ts<w.end;};
-  if(metric==='affair_completed'){
-    return (state.affairs||[]).filter(function(a){
-      return domainOk(a)&&(range==='total'?!!a.doneAt:inWin(a.doneAt));
-    }).length;
-  }
-  if(metric==='affair_steps'){
-    let n=0;
-    (state.affairs||[]).filter(domainOk).forEach(function(a){
-      (a.steps||[]).forEach(function(s){
-        if(!s||!s.text)return;
-        if(range==='total'?!!s.doneAt:inWin(s.doneAt))n++;
-      });
-    });
-    return n;
-  }
-  const logDomainOk=function(l){return tt!=='domain'||!target||logAffairDomain(l)===target;};
-  if(metric==='affair_progress'){
-    // 累计口径读实体字段（不受日志截断影响）；窗口口径只能读流水
-    if(range==='total'){
-      return round2((state.affairs||[]).filter(function(a){return domainOk(a)&&a.domainId;}).reduce(function(s,a){return s+(Number(a.alreadyGiven)||0);},0));
-    }
-    return sumLogsInWindow(w,function(l){return l.src==='affair'&&l.st==='progress'&&logDomainOk(l);},true);
-  }
-  if(metric==='affair_achievement'){
-    if(range==='total'){
-      return round2((state.affairs||[]).filter(function(a){return domainOk(a)&&a.doneAt&&a.ach&&a.ach.enabled;}).reduce(function(s,a){return s+(Number(a.ach.amount)||0);},0));
-    }
-    return sumLogsInWindow(w,function(l){return l.src==='affair'&&l.st==='achievement'&&logDomainOk(l);},true);
-  }
-  return 0;
-}
-function choreWindowValue(metric,w,range){
-  if(metric==='chore_completed'){
-    return (state.chores||[]).filter(function(c){
-      return c.doneAt&&(range==='total'?true:(c.doneAt>=w.start&&c.doneAt<w.end));
-    }).length;
-  }
-  if(metric==='chore_decay')return sumLogsInWindow(w,function(l){return l.src==='chore-decay';},true);
-  if(metric==='chore_batches')return countLogsInWindow(w,function(l){return l.src==='chore-batch';});
-  return 0;
-}
-// 计数类指标：新增任务/新增领域数量（主体 all/domain）
-function evalCountMetric(it,w){
-  const v=Number(it.value)||0;
-  const isDomain=(it.targetType==='domain');
-  const target=it.target||'';
-  let val;
-  if(it.metric==='new_tasks'){
-    if(isDomain)val=state.tasks.filter(t=>t.createdAt&&t.createdAt>=w.start&&t.createdAt<w.end&&getTaskDomainIds(t).indexOf(target)>=0).length;
-    else val=state.tasks.filter(t=>t.createdAt&&t.createdAt>=w.start&&t.createdAt<w.end).length;
-  }else{
-    if(isDomain)val=state.domains.some(d=>d.id===target&&d.createdAt&&d.createdAt>=w.start&&d.createdAt<w.end)?1:0;
-    else val=state.domains.filter(d=>d.createdAt&&d.createdAt>=w.start&&d.createdAt<w.end).length;
-  }
-  return opSatisfied(val,it.op,v);
-}
-function evalCondItem(it,act,ts){
-  const v=Number(it.value)||0;
-  const range=validRange(it.range)?it.range:'period';
-  // 预算指标：只读当前预算周期上下文（由 BudgetEngine 注入 act.budgetCtx）
-  // budget_remaining 是点态指标（读分类剩余额度），不走预算规则上下文
-  if(it.metric.indexOf('budget_')===0&&it.metric!=='budget_remaining'){
-    const bc=(act&&act.budgetCtx)||{};
-    let val=0;
-    if(it.metric==='budget_entry_amount')val=Number(bc.entryAmount)||0;
-    else if(it.metric==='budget_period_spent')val=Number(bc.spent)||0;
-    else if(it.metric==='budget_period_overspend')val=Number(bc.overspend)||0;
-    else if(it.metric==='budget_entry_count')val=Number(bc.entryCount)||0;
-    return opSatisfied(val,it.op,v);
-  }
-  const w=range==='total'?{start:0,end:ts+1}:condWindowByRange(range,act,ts,it.days);
-  // 阶段 3：领域活跃度读活跃度索引（不遍历日志，不受日志截断影响）
-  if(it.metric==='domain_activity'){
-    const did=(it.targetType==='domain')?(it.target||''):'';
-    if(!did)return false;
-    const days=range==='recent'?Math.max(1,Math.round(Number(it.days)||7)):Math.max(1,dayDiff(w.end,w.start));
-    return opSatisfied(activityCountForDomain(did,days),it.op,v);
-  }
-  // 阶段 1：点态指标（不活跃天数/超期件数）与项目、杂事指标
-  if(isPointMetric(it.metric))return opSatisfied(pointMetricValue(it.metric,it,ts),it.op,v);
-  if(isAffairMetric(it.metric))return opSatisfied(affairWindowValue(it.metric,it,w,range),it.op,v);
-  if(isChoreMetric(it.metric))return opSatisfied(choreWindowValue(it.metric,w,range),it.op,v);
-  // 成果点：全局累计，无主体/新增/聚合概念
-  if(it.metric==='achievement'){
-    const val=range==='total'?(state.scores.achievement||0):rangeStats(w.start,w.end).achievement;
-    return opSatisfied(val,it.op,v);
-  }
-  // 计数类指标：新增任务/新增领域数量
-  if(it.metric==='new_tasks'||it.metric==='new_domains')return evalCountMetric(it,w);
-  // 值类指标：主体 × 新增筛选 × 聚合。全局累计总和用累计字段（vitality 含无任务归属的日志），避免遗漏
-  const isGlobalAll=(it.targetType||'all')==='all'&&(it.newFilter||'none')==='none'&&it.aggregate!=='any';
-  if(isGlobalAll){
-    let val;
-    if(range==='total'){
-      if(it.metric==='checkins')val=state.tasks.reduce((s,t)=>s+(t.checkInCount||0),0);
-      else if(it.metric==='progress')val=totalProgress();
-      else val=state.scores.vitality||0;
-    }else{
-      const st=rangeStats(w.start,w.end);
-      val=it.metric==='checkins'?st.checkins:it.metric==='progress'?st.progressTotal:st.vitality;
-    }
-    return opSatisfied(val,it.op,v);
-  }
-  const entities=condLeafEntities(it,w);
-  if(!entities.length)return false;
-  const vals=entities.map(e=>entityMetricValue(it.metric,e,w,range));
-  if(it.aggregate==='any')return vals.some(mv=>opSatisfied(mv,it.op,v));
-  return opSatisfied(vals.reduce((s,x)=>s+x,0),it.op,v);
-}
 // ===== 结构操作：按“不活跃天数”归档实体 =====
 // 动作自身携带阈值：条件只决定“何时执行”，动作决定“归档谁”。
 // 从未活跃过的任务保持原样（与旧 processMetabolism 语义一致，交还用户处理）。
@@ -270,18 +58,51 @@ function archiveIdleEntities(entity,idleDays,ts,actName,dryRun){
   });
   return n;
 }
+// ===== 资产发放核心：活动发卡与动作流 atom 共用的唯一上限/裁剪入口 =====
+// mode='activity'：保留既有活动语义（单活动 cap 裁剪；余额已达上限返回 ok:false，不抛错）
+// mode='flow'：严格失败语义（超出资产定义 maxBalance 返回 FLOW_ASSET_CAP，绝不静默裁剪）
+// 只负责余额上限判断与写入；金额合法性（整数/单步上限）由调用方先行校验。
+function assetGrantPlan(input){
+  const mode=input.mode==='flow'?'flow':'activity';
+  const raw=(state.cards&&state.cards[input.assetId])||0;
+  const before=mode==='activity'?raw:(Number(raw)||0);
+  const amount=Math.max(0,Math.round(Number(input.amount)||0));
+  if(mode==='activity'){
+    const cap=Math.max(1,Math.round(input.cap||1));
+    if(!(amount>0&&before<cap))return{ok:false,granted:0,before:before,after:before,code:'CARD_AT_CAP'};
+    const granted=Math.min(cap,before+amount)-before;
+    if(granted<=0)return{ok:false,granted:0,before:before,after:before,code:'CARD_AT_CAP'};
+    return{ok:true,granted:granted,before:before,after:before+granted};
+  }
+  if(!(amount>0))return{ok:false,granted:0,before:before,after:before,code:'FLOW_INVALID_AMOUNT'};
+  const max=input.maxBalance;
+  if(max!==null&&max!==undefined&&before+amount>Number(max)){
+    return{ok:false,granted:0,before:before,after:before,code:'FLOW_ASSET_CAP'};
+  }
+  return{ok:true,granted:amount,before:before,after:before+amount};
+}
+function assetGrantCore(input){
+  const plan=assetGrantPlan(input);
+  if(!plan.ok)return plan;
+  const r=Ledger.post({
+    op:'grant',account:'card:'+input.assetId,delta:plan.granted,
+    entry:input.entry?input.entry(plan.granted):undefined,
+    reason:input.reason||{src:'card-grant'}
+  });
+  return Object.assign({},plan,{entryId:(r&&r.entryId)||null});
+}
 // 周期活动的动作分发：奖励类发放资产，结构类修改实体状态；两者共用同一事务与回滚边界
 const RESULT_ACTION_HANDLERS={
   card:function(act,it){
     const card=it.card||'exemption';
     const cap=Math.max(1,Math.round(it.cap||1));
     const amount=Math.max(0,Math.round(it.amount||0));
-    const before=state.cards[card]||0;
-    if(!(amount>0&&before<cap))return false;
-    const granted=Math.min(cap,before+amount)-before;
-    if(granted<=0)return false;
-    Ledger.post({op:'grant',account:'card:'+card,delta:granted,entry:{st:'card',amt:granted,desc:'周期活动「'+act.name+'」发放 '+granted+' 张'+cardName(card),src:'card-grant',dom:'',card:card,actId:act.id,granted:granted},reason:{src:'card-grant'}});
-    return true;
+    const r=assetGrantCore({
+      mode:'activity',assetId:card,amount:amount,cap:cap,
+      entry:function(granted){return {st:'card',amt:granted,desc:'周期活动「'+act.name+'」发放 '+granted+' 张'+cardName(card),src:'card-grant',dom:'',card:card,actId:act.id,granted:granted};},
+      reason:{src:'card-grant'}
+    });
+    return r.ok;
   },
   progress:function(act,it){
     const amt=Number(it.amount)||0;
@@ -326,9 +147,69 @@ function applyResult(act,ts){
   },{label:'activity-reward',save:'none',render:false});
   return txr.ok;
 }
-function processActivities(silent=false){
+// ===== 影子模式：只读预览（不发放、不写账目、不改 lastRun）=====
+// 返回「若此刻触发各活动会发放什么」：金额与账户口径和真实 handler 保持一致，
+// 但所有分支都是只读的；结构类动作走 dryRun 计数，绝不修改实体。
+function previewResultItems(act,ts){
+  const items=(act.result&&act.result.items)||[];
+  const out=[];
+  items.forEach(function(it){
+    if(!it)return;
+    if(it.type==='card'){
+      const card=it.card||'exemption';
+      const cap=Math.max(1,Math.round(it.cap||1));
+      const amount=Math.max(0,Math.round(it.amount||0));
+      const plan=assetGrantPlan({mode:'activity',assetId:card,amount:amount,cap:cap});
+      if(plan.ok&&plan.granted>0)out.push({type:'card',account:'card:'+card,card:card,amount:plan.granted,cap:cap});
+      return;
+    }
+    if(it.type==='progress'){
+      const amt=Number(it.amount)||0;
+      if(amt<=0)return;
+      out.push({type:'progress',account:'progress:'+(it.domainId||'*'),domainId:it.domainId||'',amount:amt});
+      return;
+    }
+    if(it.type==='vitality'){
+      const amt=Number(it.amount)||0;
+      if(amt<=0)return;
+      out.push({type:'vitality',account:'vitality',taskId:it.taskId||'',amount:amt});
+      return;
+    }
+    if(it.type==='achievement'){
+      const amt=Number(it.amount)||0;
+      if(amt<=0)return;
+      out.push({type:'achievement',account:'achievement',amount:amt});
+      return;
+    }
+    if(it.type==='archive'){
+      const n=archiveIdleEntities(it.entity,it.idleDays,ts,act.name,true);
+      if(n>0)out.push({type:'archive',entity:it.entity,idleDays:it.idleDays,count:n});
+    }
+  });
+  return out;
+}
+// 只读预览所有启用活动：gateOpen 表示 lastRun 是否允许本期触发；
+// matched 表示条件此刻是否成立；items 是条件成立时的假想发放明细。
+function previewActivities(ts){
+  ts=(ts===undefined||ts===null)?Date.now():(Number(ts)||0);
+  const budgetCtx=BudgetEngine.activityContext(ts);
+  return (state.activities||[]).filter(function(act){return act&&act.enabled;}).map(function(act){
+    const key=periodKey(act,ts);
+    const gateOpen=act.lastRun!==key;
+    const matched=evalCondition(Object.assign({},act,{budgetCtx:budgetCtx}),ts);
+    return{
+      id:act.id,
+      name:act.name,
+      periodKey:key,
+      gateOpen:gateOpen,
+      matched:matched,
+      items:matched?previewResultItems(act,ts):[]
+    };
+  });
+}
+function processActivities(silent=false,tsOverride){
   if(!state.activities)state.activities=[];
-  const ts=Date.now();
+  const ts=(tsOverride===undefined||tsOverride===null)?Date.now():(Number(tsOverride)||0);
   // 预算类指标（budget_*）与预算规则共用同一套条件语法：
   // 活动侧同样注入预算上下文，避免“能配但永远为 0”的静默失效。
   const budgetCtx=BudgetEngine.activityContext(ts);
@@ -357,6 +238,8 @@ function schedulerTick(){
   ensureMetabolismRule();
   // 统一以 silent 模式执行各处理器，最后只写盘一次
   processActivities(true);
+  // 动作流与周期活动同位置求值；条件不成立时由引擎自行保持 lastRun 不变
+  FlowEngine.processDue(undefined, true);
   processDailyTaskDebts(true);
   processLoansWithDecayReserve();
   processChoreDecay(true);
@@ -368,4 +251,5 @@ function schedulerTick(){
 
 export function setLastTickDay(v){_lastTickDay=v;}
 
-export { affairActive, pointMetricValue, sumLogsInWindow, countLogsInWindow, logAffairDomain, affairWindowValue, choreWindowValue, evalCountMetric, evalCondItem, archiveIdleEntities, RESULT_ACTION_HANDLERS, applyResult, processActivities, _lastTickDay, schedulerTick };
+export { affairActive, pointMetricValue, sumLogsInWindow, countLogsInWindow, logAffairDomain, affairWindowValue, choreWindowValue, evalCountMetric, evalCondItem } from './cond-eval.js';
+export { archiveIdleEntities, assetGrantPlan, assetGrantCore, RESULT_ACTION_HANDLERS, applyResult, previewResultItems, previewActivities, processActivities, _lastTickDay, schedulerTick };

@@ -1,0 +1,83 @@
+{
+  "dump-scenario": {
+    "hash": "69755ad195b1fe12f4eda3eef78d5a8d63fee98dcda75a12503debce3d81e4c7",
+    "sections": {
+      "scores": "afc816c1cb0a650cf11035abb42c64ef5ee3956b9fce781ecfbd6198b87a54a0",
+      "scores.vitality": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+      "scores.progress": "953b4ccd7a74d5e757ee63367869523268c165e10ceee1616041110f06f55381",
+      "scores.achievement": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+      "logs": "96214073ff433ef29f83f07618f0f2a3ca464ca2172cbe2053415551f09de752",
+      "shadow": "37f8036983dcd627e078695b233dde757172f62c4814a63eaec106db4ed1baec",
+      "tasks": "2ae55cfe6bac4b8b5c55dfa527fc12646ac319629a996269c40ed99bc3cfc93f",
+      "loans": "e945f1bc27a6e00179dab3a82cd984b5c5cbcfee232102f4abd715ea965a4320",
+      "products": "e77305537009b2f861c35ac53958775bbbe7e461231875a86726d74ad274df62",
+      "budgets": "e5e5e5f4b160b1e1317dd547829d2d4577b8afb6e7fdf66c5b3d2311ff9a8351",
+      "budgets.categories": "45c48739c538541f7650f75d0e5507a0a1c534a810e3cee8dde17b03a1492824",
+      "budgets.periods": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "budgets.ledger": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "stats": "ef6804e0256e104fc2a3b58bc34add70eb89d8248cd0a4ac060b57559a8afa5b",
+      "stats.lifetimeVitalityIn": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+      "stats.lifetimeVitalityOut": "4523540f1504cd17100c4835e85b7eefd49911580f8efff0599a8f283be6b9e3",
+      "stats.lifetimeProgressIn": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+      "stats.lifetimeAchievementIn": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+      "stats.lifetimeAchievementEarned": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+      "stats.totalCheckins": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+      "stats.invisible": "8cf1e792b301065454793dfe3c443537640526e2768ac03cf01be5c8e4a47bc2",
+      "stats.evicted": "5a3b07c1bb60c1dbfda07b71cb0d011ee64dff403d039663092c97e1d6a7c30d",
+      "activities": "72a6486eb1e5ecd17bfb3f4d41d7b78ad23e34316775cc9abab2826f07073821"
+    }
+  },
+  "dump-scenario2": {
+    "hash": "1235a980e9cbe3fa7271808fd95de94244df27b5694062ca3fad30b691c099b1",
+    "sections": {
+      "segA": "4a76a05f05e0ded157cba10041c97ae5cfa49e556d3c9bf6bb91483d2a801f46",
+      "segA.scores": "fcaf77f9123f12c7ebff1e66d833b1d480cae59248d3346211cc394ef0c418a8",
+      "segA.logs": "800838b0be04aa8ada05c4e160cca347859201bfb8dcb3c7e46f081096707970",
+      "segA.affairs": "70b34cf77a9cf421a7ad94f37089e883b4779199827d1d190fc7793313b1a39b",
+      "segA.chores": "512526f4fa3bd0d3e4d30dc75bdd5ff1e83cbe85289104fa0999fbe8c581d4e4",
+      "segA.budgets": "fdc882b8e422784b81f028b2d1c9caa8c7f9e57e182f3eced37b4a49d9d1193a",
+      "segA.stats": "67b72b3ea4e1a190d608b0a58125829b3c10a56e063b19dee03d3c7822126ab6",
+      "segB": "c7a224d4264d3c8862287fbd63aea3b6ce260a07c8a8501562f5e2c856169a33",
+      "segB.scores": "d94cfe1d1b7b683565945f1c88979ac7bc4a3c254ea7e0018ee0077f389f951f",
+      "segB.logs": "4e79fe613a018428ea9dedfb952447399db4bb5d4421f6c974d98f205aedcd44",
+      "segB.affairs": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "segB.chores": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "segB.budgets": "ca430339c14e596be88b238428d44b55915bf6c00caadac0553560a28547627a",
+      "segB.stats": "43e373855556299e80e496c878f19974aca514dbfe148ab9e974725945a5f927",
+      "segB.settledChanged": "b5bea41b6c623f7c09f1bf24dcae58ebab3c0cdd90ad966bc43a45b44867e12b",
+      "segB.settledAgain": "fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa",
+      "segC": "456003efeb0a3038a5fad2791a377db9563a4ded1909fd9df31f6b72258eb61a",
+      "segC.scores": "8351f104f160f257349215037af6750d67342c43081a5f66bfd2c161493a9d1d",
+      "segC.logs": "3145150a24e0e9b47c38fdfcb8623d8abc5f41f28393ae369802f385f29ef08a",
+      "segC.affairs": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "segC.chores": "9dd0f5d05a81a7ec8353149aacf4b7a89c05d171600b8aa5f8d65f198aee0339",
+      "segC.budgets": "f8bedb351b7aea685150ee4c85e78d7adba3bd7a97edb1120c997ff1ec3d83a0",
+      "segC.stats": "dfcb39e755360045fc8a3db0ea5d87de700c38e7cc18571653116cbad9813ef1",
+      "segC.batchGain": "4e07408562bedb8b60ce05c1decfe3ad16b72230967de01f640b7e4729b49fce"
+    }
+  },
+  "dump-stage4": {
+    "hash": "462240efb47d99034c03c2da7550421239967a9ecf9e84e12c649da673bc521a",
+    "sections": {
+      "segA": "fcc18adf8677a477deea2929288e2dfe42087099f0be6154f62ba99791f41c25",
+      "segA.initial": "dbab50bb8733fb2aa183a8a0973ff580a49d46d7e091f679195cc1bcf08984eb",
+      "segA.afterRun": "7fbd723bc9c323bf612f1c7cd7b0af09a20eb813d7affd37fa95f293faf4a0ae",
+      "segA.afterUndo": "17fb6c8cfc0d6d032a06f76304ca3a871861a999ddca67c74cb8f4098ee474aa",
+      "segA.afterRerun": "df5125b860a73f47535dfd13fa70bcd2f5b606149b1489588b55dc2d08b3502f",
+      "segA.dryRun": "27ed89198b2c90a7110ad21df64d4cd58b2f7066c970d2dda88aaba8c7ffc5a2",
+      "segA.run1": "b0385264e232e4c2296ab31ee27c5174ee7b892685433417eb1bf88f42eba61d",
+      "segA.undo": "12228083f4f7937eec45d84dbd726b1c4c417a89df640d1462fd8516ffcd6e79",
+      "segA.run2": "b0385264e232e4c2296ab31ee27c5174ee7b892685433417eb1bf88f42eba61d",
+      "segA.flags": "2e7eddb9b32d30c400902558db1e7cabb0bebfae388d792dc4236bc840fdfa79",
+      "segB": "fac3738f8c3b65cf273fc4aef99bf875fe65f87a09e1c5232b7c51b287bdf357",
+      "segB.initial": "08285da079b9a19ebd5f07442408ec74796476e740d638e91c47f4d6f7524f87",
+      "segB.afterRun1": "89fdf9986ac4f17b2980d7359fdd832c6a4c39fa177e244316d24cfa9599527e",
+      "segB.afterQuotaRefused": "89fdf9986ac4f17b2980d7359fdd832c6a4c39fa177e244316d24cfa9599527e",
+      "segB.afterNextPeriodRun": "b3902ca5dfc473e0df0f194c49335ac4768474acb1d2d7a0f26db3c475438cae",
+      "segB.run1": "035785dd9ce21530b6cb6290a7487b267152a4f8fcb7bc984f6170a98a281260",
+      "segB.run2": "d0d8de6e91f1b6524032abe2714469e0cb50cbd02c0b0410424aaff63b8993fe",
+      "segB.run3": "035785dd9ce21530b6cb6290a7487b267152a4f8fcb7bc984f6170a98a281260",
+      "segB.flags": "75502f303bdc75e8dfd3bb69debcb5f280c0edbeeb67ab18f9a42d1d26ba40d9"
+    }
+  }
+}

@@ -113,18 +113,13 @@ function choreToAffair(id) {
   return { ok: true, id: c.id, logId: ev && ev.id };
 }
 
-// 项目 → 杂事：有损字段先确认；取消则整体不动作
-function affairToChore(id, opts) {
+// 项目 → 杂事：有损字段直接拒绝（不询问、不写任何状态，避免用户误丢进度与成果点）
+function affairToChore(id) {
   const a = (state.affairs || []).find(function (x) { return x.id === id; });
   if (!a) return { ok: false, reason: '项目不存在' };
   if (a.archived) return { ok: false, reason: '已归档的项目不能转为杂事' };
-  const lossy = lossyFieldsOf(a);
-  if (lossy.length) {
-    const ask = (opts && typeof opts.confirm === 'function') ? opts.confirm : (typeof confirm === 'function' ? confirm : null);
-    if (ask) {
-      const yes = ask('转为杂事会丢失：' + lossy.join('、') + '。\n确定继续？');
-      if (!yes) return { ok: false, canceled: true };
-    }
+  if (lossyFieldsOf(a).length) {
+    return { ok: false, reason: '项目已有步骤、进度或已发奖励，不能降级为杂事' };
   }
   const ts = now();
   const c = {

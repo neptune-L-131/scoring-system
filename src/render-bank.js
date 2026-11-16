@@ -1,16 +1,20 @@
+import { renderAssetDefs } from './asset-ui.js';
 import { registerRenderer } from './render.js';
 import { eachStatsBucket, weekScore } from './conditions.js';
 import { LOG_DISPLAY } from './constants.js';
 import { delDomain, delMetric, openMetricModal, renameDomain } from './library.js';
 import { openAchModal } from './modals.js';
-import { dayKey, weekStartTs, logAmt, esc, fmt, fmtTime, now } from './pure.js';
+import { dayKey, weekStartTs, esc, fmt, fmtTime, now } from './pure.js';
 import { achCardHTML, setScoreCell } from './render-work.js';
+import { registerPanelTarget } from './render-targets.js';
 import { state } from './state.js';
 import { accountLabel, shadowLabel } from './stats.js';
 import { addDays, dayDiff, dayStart as dayStartOf, weekStart } from './time.js';
 import { drag, toggleCollapse } from './ui-events.js';
 import { UNDO_ADAPTERS, undoLog } from './undo.js';
 import { domainName, domainProgress, metricValue, totalProgress } from './utils.js';
+import { logRowView, shadowRowView } from './view-models.js';
+import { collBodyHTML, collGroupHTML, collHeaderHTML, dragHandleHTML, logItemHTML } from './view-primitives.js';
 // render-bank.js —— 渲染：银行页（图表/雷达）
 // 由 app.js 按功能拆分（第五轮可维护性重构），行为不变。
 
@@ -84,23 +88,14 @@ function renderBank(){
       if(achs.length===0)return;
       const isCollapsed=(state.collapsedAchDoms||[]).includes(d.id);
       const showHeader=state.domains.length>1;
-      ahtml+='<div class="ach-dom-group'+(isCollapsed?' collapsed':'')+'" data-dom-id="'+d.id+'">';
-      if(showHeader){
-        ahtml+='<div class="coll-header" onclick="toggleCollapse(\'ach-domain\',\''+d.id+'\')">';
-        ahtml+='<div class="coll-name"><span class="coll-toggle">▼</span>'+esc(d.name)+' <span class="coll-count">'+achs.length+'个里程碑</span></div>';
-        ahtml+='<div class="coll-actions" onclick="event.stopPropagation()">';
-        ahtml+='<span class="drag-handle" title="拖拽领域">⋮⋮</span>';
-        if(d.id!=='d_default'){
-          ahtml+='<button onclick="renameDomain(\''+d.id+'\')">重命名</button><button onclick="delDomain(\''+d.id+'\')">删除</button>';
-        }
-        ahtml+='<button onclick="openAchModal(null,\''+d.id+'\')">+ 里程碑</button>';
-        ahtml+='</div>';
-        ahtml+='</div>';
+      let actions=dragHandleHTML('拖拽领域');
+      if(d.id!=='d_default'){
+        actions+='<button onclick="renameDomain(\''+d.id+'\')">重命名</button><button onclick="delDomain(\''+d.id+'\')">删除</button>';
       }
-      ahtml+='<div class="coll-body">';
-      ahtml+=achs.map(a=>achCardHTML(a,d.id)).join('');
-      ahtml+='</div>';
-      ahtml+='</div>';
+      actions+='<button onclick="openAchModal(null,\''+d.id+'\')">+ 里程碑</button>';
+      ahtml+=collGroupHTML('ach-dom-group','data-dom-id="'+d.id+'"',isCollapsed,
+        (showHeader?collHeaderHTML({onclick:"toggleCollapse('ach-domain','"+d.id+"')",name:esc(d.name),count:achs.length,countLabel:'个里程碑',actions:actions}):'')
+        +collBodyHTML(achs.map(a=>achCardHTML(a,d.id)).join('')));
     });
     ag.innerHTML=ahtml;
   }
@@ -109,7 +104,13 @@ function renderBank(){
   drawVitalityFlowChart();
   drawWeekCompareChart();
 
-  // Logs
+  renderBankLogs();
+  renderShadowList();
+  renderAssetDefs();
+}
+
+// 流水面板：最近记录行（bank.logs 的独立入口）
+function renderBankLogs(){
   const logTotal=state.logs.length;
   document.getElementById('logMeta').textContent=logTotal+' 条'+(logTotal>LOG_DISPLAY?'（仅显示最近 '+LOG_DISPLAY+' 条）':'');
   const ll=document.getElementById('logList');
@@ -119,31 +120,11 @@ function renderBank(){
     // 可撤销白名单直接来自适配器注册表：新增一种可撤销类型只需在 UNDO_ADAPTERS 加 key
     const undoableSrc=Object.keys(UNDO_ADAPTERS);
     ll.innerHTML=state.logs.slice(0,LOG_DISPLAY).map(l=>{
-      const isBoth=l.st==='both';
-      const cls=l.amt>0?'pos'+(isBoth||l.st==='progress'?' p':l.st==='achievement'?' a':''):l.amt<0?'neg':'zero';
-      const dotCls=isBoth?'p':l.st==='vitality'?'v':l.st==='progress'?'p':l.st==='achievement'?'a':'s';
-      let amtTxt='',unit='';
-      if(isBoth){
-        // both 型打卡两个分值可能不同：分别显示，避免只看净活力误解进度收入
-        const av=logAmt(l,'vitality'),ap=logAmt(l,'progress');
-        amtTxt=(av>0?'+':'')+fmt(av)+' 活力 / '+(ap>0?'+':'')+fmt(ap)+' 进度';
-      }else{
-        const sign=l.amt>0?'+':'';
-        amtTxt=l.amt!==0?sign+fmt(l.amt):'—';
-        unit=l.st==='vitality'?' 活力':l.st==='progress'?' 进度':l.st==='achievement'?' 成果':l.st==='card'?' 张':'';
-      }
-      const canUndo=undoableSrc.includes(l.src);
-      return '<div class="log-item">'
-        +'<div class="log-dot '+dotCls+'"></div>'
-        +'<div class="log-desc">'+esc(l.desc)+'</div>'
-        +'<div class="log-amt '+cls+'">'+amtTxt+unit+'</div>'
-        +'<div class="log-time">'+fmtTime(l.time)+'</div>'
-        +(canUndo?'<button class="log-undo" onclick="undoLog(\''+l.id+'\')">撤销</button>':'')
-        +'</div>';
+      const v=logRowView(l,undoableSrc);
+      return logItemHTML({dot:v.dot,desc:esc(v.desc),amt:v.amount,amtCls:v.amtCls,time:fmtTime(v.time),
+        action:v.canUndo?'<button class="log-undo" onclick="undoLog(\''+v.id+'\')">撤销</button>':''});
     }).join('');
   }
-
-  renderShadowList();
 }
 // 余额调整记录：visible:false 的账户增减在这里留痕（贷款放款、撤销、活动回收、删除搬运、重算等）
 function toggleShadowList(){
@@ -162,17 +143,10 @@ function renderShadowList(){
     return;
   }
   el.innerHTML=list.map(function(r){
-    const d=Number(r.delta)||0;
-    const unit=r.acct==='vitality'?' 活力':r.acct==='achievement'?' 成果':r.acct.indexOf('progress:')===0?' 进度':r.acct.indexOf('card:')===0?' 张':'';
-    const amt=(d>0?'+':'')+fmt(d)+unit;
-    const cls=d>0?'pos':d<0?'neg':'zero';
-    const range=(r.before!==null&&r.before!==undefined)?(' · '+fmt(r.before)+' → '+fmt(r.after)):'';
-    return '<div class="log-item">'
-      +'<div class="log-dot s"></div>'
-      +'<div class="log-desc">'+esc(r.label||shadowLabel(r.src,''))+'<span style="color:var(--text-3);font-size:11px"> · '+esc(accountLabel(r.acct||''))+range+'</span></div>'
-      +'<div class="log-amt '+cls+'">'+amt+'</div>'
-      +'<div class="log-time">'+fmtTime(r.ts)+'</div>'
-      +'</div>';
+    const v=shadowRowView(r);
+    return logItemHTML({dot:v.dot,
+      desc:esc(r.label||shadowLabel(r.src,''))+'<span style="color:var(--text-3);font-size:11px"> · '+esc(accountLabel(r.acct||''))+v.range+'</span>',
+      amt:v.amount,amtCls:v.amtCls,time:fmtTime(v.time)});
   }).join('');
 }
 
@@ -580,3 +554,7 @@ function renderMetricChips(){
 export { renderBank, toggleShadowList, renderShadowList, chartState, toggleChartSeries, toggleTrendMode, showChartTip, hideChartTip, drawChart, drawVitalityFlowChart, drawWeekCompareChart, renderRadar, renderMetricChips };
 
 registerRenderer('bank', renderBank);
+
+// 面板级重绘入口（S3-B：能力已可用，现有调用点仍只走全量 render()）
+registerPanelTarget('bank', renderBank);
+registerPanelTarget('bank.logs', renderBankLogs);

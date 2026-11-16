@@ -142,6 +142,13 @@
   </div>
   <div class="metric-chips" id="metricChips"></div>
 
+  <div class="sec-head" style="margin-top:8px">
+    <div class="sec-title">资产定义</div>
+    <button class="btn btn-sm" onclick="openAssetModal()">+ 新建资产</button>
+  </div>
+  <div class="asset-note-line">停用 / 归档前余额必须为 0，系统不会自动回收已发余额；停用后不再发放或消耗，引用该资产的动作流步骤会失败。「清除数据成果」只把资产余额清零，资产定义与动作流配置保留。</div>
+  <div id="assetDefsList"></div>
+
   <div class="loan-box" id="loanBox" style="display:none"></div>
 
   <div class="sec-head"><div class="sec-title">收支总览</div></div>
@@ -264,6 +271,22 @@
     </div>
   </div>
   <div id="cycleActivities"></div>
+
+  <div class="sec-head sec-head-major mt-lg">
+    <div class="sec-title">动作流</div>
+    <div style="display:flex;gap:6px">
+      <div class="sec-meta" style="align-self:center">有序步骤 + 条件；保存只落配置，试跑不写盘，执行需手动发起</div>
+      <button class="btn btn-sm" onclick="openFlowModal()">+ 新建动作流</button>
+    </div>
+  </div>
+  <div id="flowList"></div>
+
+  <div class="sec-head mt-lg">
+    <div class="sec-title">试跑与运行历史</div>
+    <div class="sec-meta">试跑与真实执行使用同一执行器；历史仅保留最近 50 次</div>
+  </div>
+  <div id="flowDryPanel"></div>
+  <div id="flowRunList"></div>
 
   <div class="sec-head sec-head-major mt-lg">
     <div class="sec-title">断更豁免卡</div>
@@ -749,11 +772,114 @@
   </div>
 </div>
 
+<!-- ===== Asset Def Modal（资产定义） ===== -->
+<div class="modal-bg" id="assetModal">
+  <div class="modal">
+    <h2 id="assetModalTitle">新建资产</h2>
+    <input type="hidden" id="assetOriginalId">
+    <div class="fg">
+      <label>资产 ID <span class="h">小写字母开头，3–32 位小写字母/数字/下划线；创建后不可修改</span></label>
+      <input type="text" id="assetId" placeholder="例如：star" maxlength="32" autocomplete="off">
+    </div>
+    <div class="fg">
+      <label>资产名称</label>
+      <input type="text" id="assetName" placeholder="例如：星星" maxlength="20" autocomplete="off">
+    </div>
+    <div class="fg-row">
+      <div class="fg"><label>单位</label><input type="text" id="assetUnit" value="张" maxlength="8" autocomplete="off"></div>
+      <div class="fg"><label>余额上限 <span class="h">留空 = 不限</span></label><input type="number" id="assetMaxBalance" min="0" step="1" placeholder="不限"></div>
+    </div>
+    <div class="fg-row">
+      <div class="fg"><label>单期发放上限 <span class="h">留空 = 不限</span></label><input type="number" id="assetMaxIssued" min="0" step="1" placeholder="不限"></div>
+      <div class="fg"><label>发放周期</label><select id="assetCycle"><option value="week">每周</option><option value="month">每月</option></select></div>
+    </div>
+    <div class="fg">
+      <label>周期起始日 <span class="h">每周按该起始日划分；每月不使用</span></label>
+      <select id="assetAnchor">
+        <option value="1">周一</option><option value="2">周二</option><option value="3">周三</option>
+        <option value="4">周四</option><option value="5">周五</option><option value="6">周六</option><option value="7">周日</option>
+      </select>
+    </div>
+    <div class="asset-form-hint" id="assetFormHint"></div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeModal('assetModal')">取消</button>
+      <button class="btn" id="assetSaveBtn">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Flow Modal（动作流编辑器） ===== -->
+<div class="modal-bg" id="flowModal">
+  <div class="modal modal-wide">
+    <h2 id="flowModalTitle">动作流</h2>
+    <div class="fg">
+      <label>名称</label>
+      <input type="text" id="flowName" maxlength="40" placeholder="例如：每周活力结算" autocomplete="off">
+    </div>
+    <div class="fg-row">
+      <div class="fg"><label>触发方式</label>
+        <select id="flowTriggerType" onchange="flowTriggerChanged()">
+          <option value="period">按周期自动</option>
+          <option value="manual">仅手动</option>
+        </select>
+      </div>
+      <div class="fg" id="flowPeriodWrap"><label>周期</label>
+        <select id="flowPeriod">
+          <option value="day">每天</option>
+          <option value="week">每周</option>
+          <option value="month">每月</option>
+        </select>
+      </div>
+      <div class="fg" id="flowAnchorWrap"><label>周期锚点</label>
+        <select id="flowAnchor">
+          <option value="1">周一 / 1 号</option>
+          <option value="2">周二 / 2 号</option>
+          <option value="3">周三 / 3 号</option>
+          <option value="4">周四 / 4 号</option>
+          <option value="5">周五 / 5 号</option>
+          <option value="6">周六 / 6 号</option>
+          <option value="7">周日 / 7 号</option>
+        </select>
+      </div>
+    </div>
+    <div class="fg">
+      <label class="flow-check"><input type="checkbox" id="flowEnabled"> 启用（启用后才会按周期自动执行；新建默认停用）</label>
+    </div>
+
+    <div class="sec-head">
+      <div class="sec-title">条件</div>
+      <div style="display:flex;gap:6px">
+        <select id="flowCondMode" onchange="flowCondModeChange()">
+          <option value="all">全部满足</option>
+          <option value="any">任一满足</option>
+        </select>
+        <button class="btn btn-xs" onclick="addCondItem('')">+ 条件</button>
+        <button class="btn btn-xs" onclick="addCondGroup('')">+ 条件组</button>
+      </div>
+    </div>
+    <div id="flowCondItems" class="cond-tree"></div>
+    <div id="flowCondPreview" class="sec-note"></div>
+
+    <div class="sec-head">
+      <div class="sec-title">有序步骤</div>
+      <div class="sec-meta">只能选择已开放的 7 个原子；金额与数量在保存时校验</div>
+    </div>
+    <div id="flowStepList"></div>
+
+    <div class="asset-form-hint" id="flowFormHint"></div>
+    <div class="modal-foot">
+      <button class="btn" onclick="closeFlowModal()">取消</button>
+      <button class="btn" id="flowSaveBtn">保存配置（不执行）</button>
+    </div>
+  </div>
+</div>
+
 <!-- ===== Clear Data Modal ===== -->
 <div class="modal-bg" id="clearDataModal">
   <div class="modal">
     <h2>清除数据</h2>
-    <p style="font-size:13px;color:var(--text-2);line-height:1.7;margin-bottom:18px">请选择清除范围。此操作不可撤销，建议先导出备份。</p>
+    <p style="font-size:13px;color:var(--text-2);line-height:1.7;margin-bottom:8px">请选择清除范围。此操作不可撤销，建议先导出备份。</p>
+    <p class="asset-note-line" style="margin-bottom:18px">「清除数据成果」会保留资产定义与动作流配置，只把资产余额清零；「清除一切设置与数据」才会连定义一起重置。</p>
     <div style="display:flex;flex-direction:column;gap:10px">
       <button class="btn" onclick="clearDataResults()">清除数据成果（保留所有设定）</button>
       <button class="btn btn-danger" onclick="clearEverything()">清除一切设置与数据</button>

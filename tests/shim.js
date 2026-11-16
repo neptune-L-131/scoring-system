@@ -49,6 +49,9 @@ const EXPORT_NAMES = [
   'normalizeProductGate', 'normalizeProduct', 'dateKeyOffset', 'normalizeActivityIndex',
   'normalizeStatsDaily', 'normalizeAccountSums', 'normalizeAchievementCounted',
   'normalizePresetNums', 'normalizeLoanNums', 'normalizeLogNums', 'normalizeCards',
+  'isValidAssetId', 'normalizeAssetDef', 'normalizeAssetDefs', 'normalizeFlow',
+  'normalizeFlows', 'normalizeAssetMeters', 'normalizeFlowRunRecord', 'normalizeFlowRuns',
+  'defaultAssetDef', 'defaultAssetDefs',
   'normalizeWatermark', 'normalizeBudgetSettings', 'normalizeBudgetRule',
   'normalizeBudgetCategory', 'normalizeBudgetPeriod', 'normalizeBudgetLedgerEntry',
   'normalizeBudgets', 'normalizeProductBudget', 'normalizeExt', 'applyMigrations', 'parseState',
@@ -72,11 +75,32 @@ const EXPORT_NAMES = [
   'affairSteps', 'affairTotalSteps', 'affairDoneSteps', 'affairLastAdvance', 'affairCurve',
   'affairCurveType', 'affairTargetAt', 'affairIsDone', 'migrateAffair',
   // 跨域 / 结构操作
-  'archiveIdleEntities', 'applyResult', 'processActivities', 'schedulerTick',
+  'archiveIdleEntities', 'assetGrantPlan', 'assetGrantCore', 'applyResult', 'previewActivities', 'previewResultItems', 'processActivities', 'schedulerTick',
   'ensureMetabolismRule', 'processLoans', 'processChoreDecay', 'processDailyTaskDebts',
   'settleChoreBatches', 'checkAchievements', 'runConsistencyChecks',
+  // 动作原子（阶段 4 S3）
+  'FLOW_ATOMS', 'FLOW_ATOM_IDS', 'runFlowAtom', 'describeFlowAtom',
+  'FLOW_ATOM_MAX_CURRENCY', 'FLOW_ATOM_MAX_ASSET', 'FLOW_ATOM_MAX_ARCHIVE',
+  'FLOW_ATOM_MAX_NOTES', 'FLOW_ATOM_NOTE_MAX_LEN', 'FLOW_ATOM_IDLE_DAYS_MAX',
+  // 动作流引擎（阶段 4 S4）
+  'FlowEngine', 'FLOW_IDEM_KEEP',
+  // 动作流干跑（阶段 4 S5）
+  'dryRun',
+  // 动作流整单撤销（阶段 4 S6）
+  'undoFlowRun', 'FLOW_REVERSERS',
+  // 资产定义管理 UI（阶段 4 S8）
+  'validateAssetDraft', 'assetReferencesOf', 'renderAssetDefs',
+  'openAssetModal', 'handleAssetSave', 'toggleAssetEnabled',
+  'archiveAssetDef', 'unarchiveAssetDef', 'delAssetDef',
+  // 动作流前台 UI（阶段 4 S9）
+  'validateFlowDraft', 'sanitizeFlowSteps', 'renderFlowPanel', 'flowUndoBlockReason',
+  'flowErrorText', 'flowUndoErrorText', 'openFlowModal', 'closeFlowModal',
+  'handleFlowSave', 'flowTriggerChanged', 'flowCondModeChange', 'flowStepAtomChanged',
+  'flowStepParamChanged', 'flowStepMove', 'flowStepDelete', 'flowAddStep',
+  'flowAddBranch', 'toggleFlowEnabled', 'dryRunFlow', 'executeFlow', 'undoFlowRunUI',
   // 常量（按值导出）
   'SCHEMA_VERSION', 'LOG_MAX', 'LOG_DISPLAY', 'SHADOW_MAX', 'AUDIT_MAX',
+  'ASSET_VERSION', 'FLOW_VERSION', 'FLOW_MAX_STEPS', 'FLOW_RUN_KEEP',
   'BUDGET_LEDGER_MAX', 'BUDGET_PERIOD_KEEP', 'ACTIVITY_MAX_DAYS', 'STATS_VERSION',
   'STATS_KEEP_DAYS', 'STAGE_NAMES', 'BUDGET_RULE_NAMES', 'BUDGET_TARGET_NAMES',
   'PROD_TIERS', 'PROD_TIER_NAMES', 'SHADOW_SRC_NAMES', 'WEEK_ANCHOR_NAMES',
@@ -214,9 +238,11 @@ async function loadFromModules() {
   const MODULES = [
     'constants.js', 'time.js', 'pure.js', 'entity-kit.js', 'defaults.js', 'toast.js', 'cond-model.js', 'modal-host.js',
     'state.js', 'theme.js', 'normalize.js', 'persist.js', 'utils.js', 'stats.js',
-    'ledger.js', 'gate.js', 'budget.js', 'budget-binding.js', 'conditions.js', 'entities.js', 'business.js',
-    'library.js', 'shell.js', 'render-work.js', 'entity-convert.js', 'render-bank.js', 'render-shop.js',
-    'render-budget.js', 'cycle.js', 'cond-ui.js', 'ui-events.js', 'undo.js',
+    'ledger.js', 'gate.js', 'budget.js', 'budget-binding.js', 'command.js', 'conditions.js', 'entities.js', 'business.js',
+    'flow-atoms.js',
+    'flow-engine.js',
+    'library.js', 'shell.js', 'render-work.js', 'entity-convert.js', 'render-bank.js', 'asset-ui.js', 'render-shop.js',
+    'render-budget.js', 'cycle.js', 'cond-ui.js', 'flow-ui.js', 'ui-events.js', 'undo.js',
     'modals.js', 'data.js', 'pwa.js', 'debug.js', 'startup.js',
   ];
   const api = {};

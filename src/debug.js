@@ -163,6 +163,74 @@ function runConsistencyChecks(verbose){
     add('成就计数 '+id,c+0.005>=logMax[id],'已计入 '+fmt(c)+' / 日志 '+fmt(logMax[id]));
   });
 
+  // 7) 阶段 4 资产 / 动作流：只对账「运行时 ↔ 定义」，字段整体缺失时跳过（避免旧存档误报）
+  const hasDefs=Array.isArray(state.assetDefs);
+  const defIds=hasDefs?new Set(state.assetDefs.filter(function(d){return d&&d.id;}).map(function(d){return d.id;})):new Set();
+  if(!hasDefs){
+    report.push({label:'资产定义 vs 卡片余额',ok:true,skip:true,detail:'无资产定义字段，跳过'});
+  }else{
+    const cards=state.cards||{};
+    const orphan=Object.keys(cards).filter(function(k){return !defIds.has(k);});
+    const neg=[];
+    const over=[];
+    state.assetDefs.forEach(function(d){
+      if(!d||!d.id)return;
+      const bal=Number(cards[d.id])||0;
+      if(bal<0)neg.push(d.id+'='+fmt(bal));
+      if(d.maxBalance!==null&&d.maxBalance!==undefined&&bal>Number(d.maxBalance)+0.005){
+        over.push(d.id+'='+fmt(bal)+'>'+fmt(d.maxBalance));
+      }
+    });
+    add('资产定义 vs 卡片余额',orphan.length===0&&neg.length===0&&over.length===0,
+      '无定义卡键 '+(orphan.length?orphan.join(','):'0')+'；负余额 '+(neg.length?neg.join(','):'0')+'；超上限 '+(over.length?over.join(','):'0'));
+  }
+
+  const meters=(state.ext&&state.ext.assetMeters)||null;
+  if(!meters||typeof meters!=='object'){
+    report.push({label:'资产计量 vs 资产定义',ok:true,skip:true,detail:'无资产计量字段，跳过'});
+  }else{
+    const by=(meters.byAsset&&typeof meters.byAsset==='object')?meters.byAsset:{};
+    const unknown=hasDefs?Object.keys(by).filter(function(id){return !defIds.has(id);}):[];
+    const broken=[];
+    Object.keys(by).forEach(function(id){
+      const m=by[id]||{};
+      Object.keys(m).forEach(function(pk){
+        const x=m[pk]||{};
+        const issued=Number(x.issued),spent=Number(x.spent);
+        if(!isFinite(issued)||!isFinite(spent)||issued<0||spent<0)broken.push(id+'/'+pk);
+      });
+    });
+    add('资产计量 vs 资产定义',unknown.length===0&&broken.length===0,
+      '无定义计量 '+(unknown.length?unknown.join(','):'0')+'；异常周期 '+(broken.length?broken.join(','):'0'));
+  }
+
+  const runs=(state.ext&&state.ext.flowRuns)||null;
+  if(!runs||typeof runs!=='object'){
+    report.push({label:'动作流运行记录完整性',ok:true,skip:true,detail:'无运行记录字段，跳过'});
+  }else{
+    const recent=Array.isArray(runs.recent)?runs.recent:[];
+    const byId=(runs.byId&&typeof runs.byId==='object')?runs.byId:{};
+    const recentSet=new Set(recent);
+    const missing=recent.filter(function(id){return !byId[id];});
+    const orphanRec=Object.keys(byId).filter(function(id){return !recentSet.has(id);});
+    const logIds=new Set((state.logs||[]).map(function(l){return l&&l.id;}).filter(Boolean));
+    const badRun=[];
+    const badRef=[];
+    Object.keys(byId).forEach(function(id){
+      const r=byId[id]||{};
+      if(!r.id||r.id!==id||!r.flowId)badRun.push(id);
+      if(truncatedLogs)return;
+      if(r.journalLogId&&!logIds.has(r.journalLogId))badRef.push(id+'.journal');
+      (Array.isArray(r.childLogIds)?r.childLogIds:[]).forEach(function(lid){
+        if(!logIds.has(lid))badRef.push(id+'.child');
+      });
+    });
+    add('动作流运行记录完整性',missing.length===0&&orphanRec.length===0&&badRun.length===0&&badRef.length===0,
+      '缺记录 '+(missing.length?missing.join(','):'0')+'；游离记录 '+(orphanRec.length?orphanRec.join(','):'0')
+      +'；字段缺失 '+(badRun.length?badRun.join(','):'0')+'；日志引用失效 '+(badRef.length?badRef.join(','):'0')
+      +(truncatedLogs?'（日志已截断，跳过日志引用比对）':''));
+  }
+
   const bad=report.filter(function(r){return !r.ok;});
   if(verbose||location.hash==='#debug'){
     if(bad.length)bad.forEach(function(r){console.warn('[自检] '+r.label+'：'+r.detail);});

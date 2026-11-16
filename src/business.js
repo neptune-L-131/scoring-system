@@ -2,6 +2,7 @@ import { exemptionActivity } from './conditions.js';
 import { noteCheckinActivity } from './gate.js';
 import { BudgetEngine } from './budget.js';
 import { budgetOf, budgetRefOf, openBudgetAmountDialog, rememberBudgetDraft, resolveActionBudget } from './budget-binding.js';
+import { runCommand } from './command.js';
 import { Ledger } from './ledger.js';
 import { processDailyTaskDebts, processLoansWithDecayReserve } from './library.js';
 import { save } from './persist.js';
@@ -20,16 +21,16 @@ import { domainProgress } from './utils.js';
 function checkIn(taskId,stageIdx,resolved){
   const t=state.tasks.find(x=>x.id===taskId);
   if(!t)return;
-  if(t.archived){toast('该任务已归档，请先解锁','err');return}
+  if(t.archived)return runCommand({reject:{reason:'archived',toast:{msg:'该任务已归档，请先解锁',type:'err'}}});
   // 同日重复打卡直接拒绝：在任何写入/计算之前返回，余额、次数、连胜、待扣债均不变
-  if(taskCheckedToday(t)){toast('「'+t.name+'」今日已打卡，明天再来','warn');return}
+  if(taskCheckedToday(t))return runCommand({reject:{reason:'checked-today',toast:{msg:'「'+t.name+'」今日已打卡，明天再来',type:'warn'}}});
   // 临时金额：必须在 Ledger.txn 之前拿到；取消则整个打卡动作不发生
   const bind=budgetOf(t);
   if(bind&&bind.mode==='prompt'&&(!resolved||resolved.amount==null)){
     openBudgetAmountDialog({
       kind:'task',id:t.id,entity:t,title:'打卡：'+t.name,
       onConfirm:function(amount){checkIn(taskId,stageIdx,{amount:amount});},
-      onCancel:function(){toast('已取消，本次未打卡','warn');}
+      onCancel:function(){runCommand({reject:{reason:'canceled',toast:{msg:'已取消，本次未打卡',type:'warn'}}});}
     });
     return;
   }
@@ -37,7 +38,8 @@ function checkIn(taskId,stageIdx,resolved){
     kind:'task',id:t.id,source:'task',ts:now(),
     amount:resolved?resolved.amount:undefined
   });
-  if(br.status==='skip')toast(br.reason,'warn');
+  // 超支等跳过提示不阻断打卡，但要在成功提示之前给出
+  const skipReason=br.status==='skip'?br.reason:'';
   const plan=br.status==='ok'?br.plan:null;
   const types=taskScoreTypes(t);
   const hasV=types.indexOf('vitality')>=0;
@@ -54,10 +56,11 @@ function checkIn(taskId,stageIdx,resolved){
   // 记录打卡前的档位，便于撤销时恢复
   const prevStageLast=(staged&&t.stageRewards&&typeof t.stageRewards.last==='number')?t.stageRewards.last:null;
 
-  let netV=0,netP=0,stageName=null;
+  let netV=0,netP=0,stageName=null,stageCell=null;
   if(staged){
     const cell=(typeof stageIdx==='number')?Math.max(0,Math.min(9,Math.round(stageIdx))):stageSel(t);
-    if(t.stageRewards)t.stageRewards.last=cell;
+    // 档位选择在事务外只算不写：写入放进事务内，保证打卡失败回滚时档位一起回退
+    stageCell=cell;
     netV=hasV?stageNetAt(t,'vitality',cell,c):0;
     netP=hasP?stageNetAt(t,'progress',cell,c):0;
     stageName=stageCellLabel(cell);
@@ -66,12 +69,29 @@ function checkIn(taskId,stageIdx,resolved){
     netP=hasP?c.net:0;
   }
 
+  const preToasts=[];
   // Allow check-in even with insufficient vitality (goes negative, consistent with loan system)
-  if(cost>0&&state.scores.vitality<cost){
-    toast('活力点不足，将进入负值（贷款）','warn');
-  }
+  if(cost>0&&state.scores.vitality<cost)preToasts.push({msg:'活力点不足，将进入负值（贷款）',type:'warn'});
+  if(skipReason)preToasts.push({msg:skipReason,type:'warn'});
 
-  const txr=Ledger.txn(function(){
+  let toastMsg;
+  if(staged&&stageName){
+    if(hasV&&hasP)toastMsg=t.name+' '+stageName+' +'+fmt(netV)+'活力 / +'+fmt(netP)+'进度';
+    else toastMsg=t.name+' '+stageName+' +'+fmt(hasP?netP:netV)+' '+name;
+  }else{
+    const sign=c.net>=0?'+':'';
+    toastMsg=t.name+' '+sign+fmt(c.net)+' '+name;
+  }
+  if(c.newStreak>1)toastMsg+=' (连胜'+c.newStreak+'天)';
+  if(c.broken)toastMsg+=' (连胜中断)';
+  if(cost>0)toastMsg+=' (-'+fmt(cost)+' 活力)';
+
+  // 命令层统一开事务、落盘、渲染与提示；这里只负责状态与账务写入
+  return runCommand({
+    label:'checkin',
+    failText:function(err){return '打卡失败：'+((err&&err.code)||'未知错误');},
+    onFail:function(){if(plan)rememberBudgetDraft('task',t.id,plan.amount);},
+    run:function(tx){
     // 事务内只读一次时钟：打卡时间、流水时间、活跃度桶、统计桶共用这一个时刻，
     // 避免事务执行期间跨过零点导致"今天打卡记到昨天"。
     const txNow=now();
@@ -92,12 +112,14 @@ function checkIn(taskId,stageIdx,resolved){
     // 现实预算：惩罚先于本笔收益入账（先扣后收），避免用本笔收入支付本笔超支惩罚
     let budgetRef=null;
     if(plan){
-      const got=BudgetEngine.commitEntry(null,plan,{checkinLogId:checkinLogId});
+      const got=BudgetEngine.commitEntry(tx,plan,{checkinLogId:checkinLogId});
       budgetRef=budgetRefOf(got.entry,plan);
       if(bind&&bind.mode==='prompt')t.budget.lastAmount=plan.amount;
     }
 
     const dids=getTaskDomainIds(t);
+    // 档位写入与其余状态同一事务：失败可随快照一起回滚
+    if(staged&&stageCell!==null&&t.stageRewards)t.stageRewards.last=stageCell;
     t.lastCheckIn=txNow;
     t.checkInCount=(t.checkInCount||0)+1;
     t.totalEarned=(t.totalEarned||0)+(hasP?netP:netV);
@@ -136,29 +158,9 @@ function checkIn(taskId,stageIdx,resolved){
     // 先跑各处理器（不各自写盘），最后统一保存一次
     processDailyTaskDebts(true);
     processLoansWithDecayReserve();
-  },{label:'checkin',save:'none',render:false});
-  if(!txr.ok){
-    // 整单回滚：余额、打卡记录、现实账目、惩罚全部不落盘
-    if(plan)rememberBudgetDraft('task',t.id,plan.amount);
-    const info=(txr.error&&txr.error.info)||{};
-    toast(info.reason||('打卡失败：'+((txr.error&&txr.error.code)||'未知错误')),'err');
-    return;
-  }
-  save();
-
-  let toastMsg;
-  if(staged&&stageName){
-    if(hasV&&hasP)toastMsg=t.name+' '+stageName+' +'+fmt(netV)+'活力 / +'+fmt(netP)+'进度';
-    else toastMsg=t.name+' '+stageName+' +'+fmt(hasP?netP:netV)+' '+name;
-  }else{
-    const sign=c.net>=0?'+':'';
-    toastMsg=t.name+' '+sign+fmt(c.net)+' '+name;
-  }
-  if(c.newStreak>1)toastMsg+=' (连胜'+c.newStreak+'天)';
-  if(c.broken)toastMsg+=' (连胜中断)';
-  if(cost>0)toastMsg+=' (-'+fmt(cost)+' 活力)';
-  toast(toastMsg);
-  render();
+    return {preToasts:preToasts,toast:{msg:toastMsg}};
+    }
+  });
 }
 
 function useExemption(taskId){
@@ -192,17 +194,23 @@ function useExemption(taskId){
   render();
 }
 
-function checkAchievements(domId){
+// 成就复核：opts.silent=true 时不弹 toast（干跑/动作流用）；
+// 返回本次新增的 achievement 流水 ID 数组（旧调用方忽略返回值，行为不变）。
+function checkAchievements(domId,opts){
+  const silent=!!(opts&&opts.silent);
+  const unlocked=[];
   state.achievements.forEach(a=>{
     if(domId&&a.domainId!==domId)return;
     const prog=domainProgress(a.domainId);
     if(!a.unlocked&&prog>=a.threshold){
       a.unlocked=true;
       a.unlockedAt=now();
-      Ledger.grant('achievement',a.points,{src:'achievement',desc:'里程碑「'+a.name+'」解锁',dom:a.domainId,achId:a.id});
-      toast('成就解锁：'+a.name+' (+'+a.points+' 成果点)','warn');
+      const r=Ledger.grant('achievement',a.points,{src:'achievement',desc:'里程碑「'+a.name+'」解锁',dom:a.domainId,achId:a.id});
+      if(r&&r.entryId)unlocked.push(r.entryId);
+      if(!silent)toast('成就解锁：'+a.name+' (+'+a.points+' 成果点)','warn');
     }
   });
+  return unlocked;
 }
 
 export { checkIn, useExemption, checkAchievements };

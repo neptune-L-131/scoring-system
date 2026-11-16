@@ -1,13 +1,12 @@
 import { BudgetEngine } from './budget.js';
 import { checkAchievements } from './business.js';
 import { reverseBoundBudget } from './budget-binding.js';
+import { runCommand } from './command.js';
 import { parseCardGrantAmt } from './cond-ui.js';
 import { noteCheckinActivity } from './gate.js';
 import { Ledger, applyCheckinGain, setReverseHandler } from './ledger.js';
 import { processDailyTaskDebts, processLoansWithDecayReserve, skipNextLoanAutoPay } from './library.js';
-import { save } from './persist.js';
 import { logAmt, clone, now } from './pure.js';
-import { render } from './render.js';
 import { state } from './state.js';
 import { toast } from './toast.js';
 // undo.js —— 撤销适配器与快照
@@ -89,7 +88,9 @@ const UNDO_ADAPTERS={
       const rp=cat?BudgetEngine.readPeriod(cat,now()):null;
       const curKey=cat?BudgetEngine.bounds(cat.cycle,now()).key:'';
       if(cat&&rp&&rp.period&&rp.period.end>now()&&budEntry.periodKey===curKey){
-        BudgetEngine.reverseEntry(budEntry.id);
+        // reverseEntry 不再自带提示：失败时在这里补一条，撤销购买本身继续
+        const rev=BudgetEngine.reverseEntry(budEntry.id);
+        if(!rev.ok)toast(rev.reason||'撤销失败','err');
       }
     }
     // Refund and restore stock. 贷款购买时只退自付部分，避免把贷款额一起退回。
@@ -327,26 +328,32 @@ const UNDO_ADAPTERS={
 };
 
 function undoLog(logId){
-  const txr=Ledger.txn(function(){
-    const log=state.logs.find(l=>l.id===logId);
-    if(!log){toast('记录不存在','err');return;}
-    const ad=Object.prototype.hasOwnProperty.call(UNDO_ADAPTERS,log.src)?UNDO_ADAPTERS[log.src]:null;
-    if(!ad){toast('该记录不支持撤销','err');return;}
-    // 适配器返回 false：内层已处理并完成收尾（如 cost → 父打卡）
-    if(ad.reverse(log,{undo:undoLog})===false)return;
-    // 撤销里程碑解锁本身不能再触发重新解锁（否则点数与日志会被立刻补回来）
-    if(log.src!=='achievement')checkAchievements();
-    processDailyTaskDebts(true);
-    // 撤销「贷款还款」后余额恢复，必须只禁用本次收尾的自动还款；
-    // 否则刚恢复的贷款会被立即再次还掉，撤销等于没发生。
-    if(log.src==='loan-repay')skipNextLoanAutoPay();
-    processLoansWithDecayReserve();
-  },{label:'undo',save:'none',render:false});
-  if(!txr.ok){toast('撤销失败：'+(txr.error&&txr.error.info&&txr.error.info.reason||txr.error&&txr.error.code||'未知原因'),'err');console.warn('undo aborted',logId,txr.error);return;}
-  // 嵌套撤销（cost 转父打卡）由最外层统一收尾，避免事务中途渲染
-  if(txr.nested)return;
-  save();
-  render();
+  const log=state.logs.find(l=>l.id===logId);
+  if(!log)return runCommand({reject:{reason:'missing',toast:{msg:'记录不存在',type:'err'}}});
+  if(!Object.prototype.hasOwnProperty.call(UNDO_ADAPTERS,log.src)){
+    return runCommand({reject:{reason:'unsupported',toast:{msg:'该记录不支持撤销',type:'err'}}});
+  }
+  return runCommand({
+    label:'undo',
+    failText:function(err){
+      const info=(err&&err.info)||{};
+      return '撤销失败：'+(info.reason||(err&&err.code)||'未知原因');
+    },
+    onFail:function(err){console.warn('undo aborted',logId,err);},
+    run:function(){
+      const ad=Object.prototype.hasOwnProperty.call(UNDO_ADAPTERS,log.src)?UNDO_ADAPTERS[log.src]:null;
+      if(!ad)return;
+      // 适配器返回 false：内层已处理并完成收尾（如 cost → 父打卡）
+      if(ad.reverse(log,{undo:undoLog})===false)return;
+      // 撤销里程碑解锁本身不能再触发重新解锁（否则点数与日志会被立刻补回来）
+      if(log.src!=='achievement')checkAchievements();
+      processDailyTaskDebts(true);
+      // 撤销「贷款还款」后余额恢复，必须只禁用本次收尾的自动还款；
+      // 否则刚恢复的贷款会被立即再次还掉，撤销等于没发生。
+      if(log.src==='loan-repay')skipNextLoanAutoPay();
+      processLoansWithDecayReserve();
+    }
+  });
 }
 
 // 把撤销实现注入账务引擎（账务 → 撤销 的调用改为运行时注入，消除 ledger ↔ undo 循环）

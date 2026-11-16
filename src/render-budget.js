@@ -154,7 +154,12 @@ function renderBudget(){
   if(meta)meta.textContent=(state.ext.budgets.ledger||[]).length+' 条 · 上限 '+BudgetEngine.settings().ledgerMax;
 }
 function confirmReverseBudgetEntry(id){
-  if(confirm('撤销这笔现实账目？\n惩罚/反哺流水会一并退回；扩容在不会立刻制造超支时退回。'))BudgetEngine.reverseEntry(id);
+  if(!confirm('撤销这笔现实账目？\n惩罚/反哺流水会一并退回；扩容在不会立刻制造超支时退回。'))return;
+  // reverseEntry 不再自己落盘/渲染/提示，由这里按原有顺序收尾（save → render → toast）
+  const r=BudgetEngine.reverseEntry(id);
+  if(!r.ok){toast(r.reason||'撤销失败','err');return;}
+  save();render();
+  toast('已撤销预算账目');
 }
 function fillBudgetDomainSelect(selected){
   const sel=document.getElementById('budgetCatDefaultDomain');

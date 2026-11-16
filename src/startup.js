@@ -1,6 +1,7 @@
 import { BudgetEngine } from './budget.js';
 import { checkAchievements } from './business.js';
 import { processActivities, setLastTickDay } from './entities.js';
+import { FlowEngine } from './flow-engine.js';
 import { ensureMetabolismRule, processDailyTaskDebts, processLoansWithDecayReserve } from './library.js';
 import { dayKey } from './pure.js';
 import { processChoreDecay } from './render-work.js';
@@ -16,6 +17,8 @@ function runStartupProcessors(){
   processDailyTaskDebts(true);
   processLoansWithDecayReserve();
   processActivities(true);
+  // 动作流周期求值：条件不成立不推进 lastRun，同一周期条件满足后仍可再次触发
+  FlowEngine.processDue(undefined, true);
   processChoreDecay(true);
   // 启动时补结算：上次运行遗留的已结束周期在此结清
   BudgetEngine.reconcileAll();

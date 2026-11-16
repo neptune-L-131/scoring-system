@@ -121,14 +121,14 @@ export function reverseBoundBudget(ref){
   const curKey=(rp&&rp.b&&rp.b.key)||'';
   const samePeriod=!!(entry&&curKey&&entry.periodKey===curKey&&rp.period&&rp.period.end>now());
   if(samePeriod){
-    const ok=BudgetEngine.reverseEntry(entry.id);
-    if(!ok)throw budgetFail('BUDGET_REVERSE_FAILED','撤销现实账目失败');
+    const rev=BudgetEngine.reverseEntry(entry.id);
+    if(!rev.ok)throw budgetFail('BUDGET_REVERSE_FAILED','撤销现实账目失败');
     return{ok:true,mode:'reverse'};
   }
-  const ok=BudgetEngine.compensateEntry({
+  const cmp=BudgetEngine.compensateEntry({
     entryId:r.entryId,catId:cat.id,amount:r.amount,periodKey:r.periodKey
   });
-  if(!ok)throw budgetFail('BUDGET_COMPENSATE_FAILED','跨期冲正现实账目失败');
+  if(!cmp.ok||!cmp.entry)throw budgetFail('BUDGET_COMPENSATE_FAILED','跨期冲正现实账目失败');
   return{ok:true,mode:'compensate'};
 }
 

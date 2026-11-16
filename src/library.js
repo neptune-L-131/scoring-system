@@ -1,5 +1,6 @@
 import { BudgetEngine } from './budget.js';
 import { checkAchievements } from './business.js';
+import { runCommand } from './command.js';
 import { BACKUP_KEY, STAGE_PRESET_KEY } from './constants.js';
 import { defaults, newExtState, tierCurrency } from './defaults.js';
 import { setLastTickDay } from './entities.js';
@@ -76,7 +77,7 @@ function addDomain(){
 function delDomain(id){
   const d=state.domains.find(x=>x.id===id);
   if(!d)return;
-  if(id==='d_default'){toast('默认领域不可删除','err');return}
+  if(id==='d_default'){return runCommand({reject:{reason:'default',toast:{msg:'默认领域不可删除',type:'err'}}});}
   if(!confirm('删除领域「'+d.name+'」？\n（进度值将合并至默认领域，可在银行流水撤销此操作）'))return;
   const domIndex=state.domains.indexOf(d);
   const domCopy=clone(d);
@@ -85,7 +86,10 @@ function delDomain(id){
 
   // 领域删除是一个整体动作：任务/里程碑改挂、进度合并、活跃度清理、预算引用清理、
   // 成果点复核必须同事务提交，否则中途失败会留下“领域没了但进度没合并”的错账。
-  const txr=Ledger.txn(function(){
+  // 失败保持迁移前的静默语义（不提示、不落盘、不渲染）。
+  runCommand({
+    label:'delete-domain',silentFail:true,
+    run:function(){
     // Save affected tasks for undo
     const affectedTasks=[];
     state.tasks.forEach(t=>{
@@ -164,11 +168,9 @@ function delDomain(id){
     });
     const ev=state.logs.find(function(l){return l.src==='delete-domain'&&l.time&&l.domCopy&&l.domCopy.id===id;});
     if(ev){ev.triggeredAchs=triggeredAchs;ev.achLogIds=achLogIds;}
-  },{label:'delete-domain',save:'none',render:false});
-  if(!txr.ok)return;
-  save();
-  toast('领域已删除，进度已合并至默认');
-  render();
+    return {toast:{msg:'领域已删除，进度已合并至默认'}};
+    }
+  });
 }
 function renameDomain(id){
   const d=state.domains.find(x=>x.id===id);
@@ -440,7 +442,10 @@ function delTask(id){
   const taskCopy=clone(t);
 
   // 删除任务涉及的进度搬运、任务移除、成果点复核必须整体提交或整体回滚
-  const txr=Ledger.txn(function(){
+  // 迁移前只落盘不渲染不提示，这里保持（render:false + silentFail）。
+  runCommand({
+    label:'delete-task',render:false,silentFail:true,
+    run:function(){
     // Move earned progress to default domain so it isn't orphaned
     let progressMoved=null;
     if(taskHasType(t,'progress')&&(t.totalEarned||0)!==0){
@@ -461,9 +466,8 @@ function delTask(id){
     checkAchievements();
     processDailyTaskDebts(true);
     processLoansWithDecayReserve();
-  },{label:'delete-task',save:'none',render:false});
-  if(!txr.ok)return;
-  save();
+    }
+  });
 }
 
 // ===== Achievement CRUD =====
@@ -620,7 +624,7 @@ function delProd(id){
 function buyProduct(id){
   const p=state.products.find(x=>x.id===id);
   if(!p)return;
-  if(p.stock===0){toast('已售罄','err');return}
+  if(p.stock===0){return runCommand({reject:{reason:'sold-out',toast:{msg:'已售罄',type:'err'}}});}
   const tier=validProductTier(p.tier);
   const cur=tierCurrency(tier);
   const cn=cur==='vitality'?'活力点':'成果点';
@@ -631,7 +635,16 @@ function buyProduct(id){
   const loanId=uid();
 
   let budgetMsg='';
-  const txr=Ledger.txn(function(tx){
+  runCommand({
+    label:'buyProduct',
+    // 迁移前口径：有 reason 提示 reason；条件不满足提示固定文案；其余失败静默
+    failText:function(err){
+      const info=(err&&err.info)||{};
+      if(info.reason)return info.reason;
+      if(err&&err.code==='PURCHASE_DENIED')return '购买条件未满足';
+      return '';
+    },
+    run:function(tx){
     // 唯一门槛判定点：策略拒绝抛事务错误，由 txn 统一回滚
     Ledger.checkPurchase(p);
     // 商品绑定现实预算：预检 → 计划（余额不足直接抛错，整笔回滚）→ 虚拟扣款 → 同事务写现实账
@@ -667,16 +680,9 @@ function buyProduct(id){
     }
     processDailyTaskDebts(true);
     processLoansWithDecayReserve();
-  },{label:'buyProduct',save:'none',render:false});
-  if(!txr.ok){
-    const info=(txr.error&&txr.error.info)||{};
-    if(info.reason)toast(info.reason,'err');
-    else if(txr.error&&txr.error.code==='PURCHASE_DENIED')toast('购买条件未满足','err');
-    return;
-  }
-  save();
-  toast('已购买：'+p.name+' (-'+fmt(p.price)+' '+cn+')'+(willLoan?' · 贷款'+fmt(loanAmt):'')+budgetMsg);
-  render();
+    return {toast:{msg:'已购买：'+p.name+' (-'+fmt(p.price)+' '+cn+')'+(willLoan?' · 贷款'+fmt(loanAmt):'')+budgetMsg}};
+    }
+  });
 }
 
 // ===== Daily task debt processing =====
@@ -847,14 +853,23 @@ function manualAdjustBalance(){
 // ===== 清除数据 =====
 // 只清除数据成果，保留任务/项目/杂事/商品/周期/领域/集合等全部设定
 function clearDataResults(){
+  const emptyExt=newExtState();
   state.scores={vitality:0,progress:{},achievement:0};
   state.loans=[];
   state.logs=[];
-  state.cards={exemption:0};
+  // 资产：定义（assetDefs）与动作流（flows）属于用户配置，保留；
+  // 余额（cards）、周期计量（assetMeters）、运行记录（flowRuns）属于运行时状态，归零。
+  const zeroCards={exemption:0};
+  (Array.isArray(state.assetDefs)?state.assetDefs:[]).forEach(function(d){if(d&&d.id)zeroCards[d.id]=0;});
+  Object.keys(state.cards||{}).forEach(function(k){if(!(k in zeroCards))zeroCards[k]=0;});
+  state.cards=zeroCards;
+  state.ext.assetMeters=emptyExt.assetMeters;
+  state.ext.flowRuns=emptyExt.flowRuns;
+  (Array.isArray(state.flows)?state.flows:[]).forEach(function(f){if(f)f.lastRun=null;});
   state.lastDebtDate=null;
   state.affairUndo={};
-  state.ext.stats=newExtState().stats;
-  state.ext.watermarks=newExtState().watermarks;
+  state.ext.stats=emptyExt.stats;
+  state.ext.watermarks=emptyExt.watermarks;
   // 预算：重置周期实例与账本，保留分类定义与设置
   state.ext.budgets.current={};
   state.ext.budgets.periods={};

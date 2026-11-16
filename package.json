@@ -5,7 +5,8 @@
   "description": "计分系统（纯静态 ES modules，无构建步骤）",
   "scripts": {
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "baseline": "node tests/tools/check-baseline.mjs"
   },
   "devDependencies": {
     "vitest": "^3.2.4"

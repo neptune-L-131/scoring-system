@@ -34,9 +34,11 @@ function importData(ev){
     const raw=e.target.result;
     try{
       const probe=JSON.parse(raw);
-      // 只接受当前 schema 的导出：低版本数据不再导入时迁移，避免两套迁移口径漂移
-      if(!probe||typeof probe!=='object'||Array.isArray(probe)||!probe.scores||!probe.schema||probe.schema.v!==SCHEMA_VERSION)throw 0;
-    }catch(err){toast('导入失败：仅支持当前版本（v'+SCHEMA_VERSION+'）导出的数据','err');return;}
+      // 导入闸门：接受 v3（上一代）到当前版本，统一走 parseState 归一，避免两套迁移口径漂移；
+      // 高版本（可能来自更新版本）与更老版本一律拒绝。
+      const iv=probe&&probe.schema?probe.schema.v:0;
+      if(!probe||typeof probe!=='object'||Array.isArray(probe)||!probe.scores||typeof iv!=='number'||iv<3||iv>SCHEMA_VERSION)throw 0;
+    }catch(err){toast('导入失败：仅支持 v3～v'+SCHEMA_VERSION+' 导出的数据','err');return;}
     // 统一走 parseState 的迁移口径，避免导入/加载两套迁移规则漂移
     setLoadIssue(null);
     const s=parseState(raw);

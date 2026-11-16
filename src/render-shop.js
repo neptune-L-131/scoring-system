@@ -13,6 +13,7 @@ import { state } from './state.js';
 import { toast } from './toast.js';
 import { drag, toggleCollapse } from './ui-events.js';
 import { undoLog } from './undo.js';
+import { actionsRowHTML, collBodyHTML, collGroupHTML, collHeaderHTML, dragHandleHTML, logItemHTML } from './view-primitives.js';
 // render-shop.js —— 渲染：商店页
 // 由 app.js 按功能拆分（第五轮可维护性重构），行为不变。
 
@@ -27,40 +28,24 @@ function renderShop(){
     // Filter out sold-out products (stock===0) — they go to the sold-out section
     const prods=state.products.filter(p=>(p.categoryId||'sc_default')===cat.id&&p.stock!==0);
     const isCollapsed=(state.collapsedShopCats||[]).includes(cat.id);
-    html+='<div class="shop-cat-group'+(isCollapsed?' collapsed':'')+'" data-cat-id="'+cat.id+'">';
-    // Category header (clickable to toggle collapse)
-    html+='<div class="coll-header" onclick="toggleCollapse(\'shop-category\',\''+cat.id+'\')">';
-    html+='<div class="coll-name"><span class="coll-toggle">▼</span>'+esc(cat.name)+' <span class="coll-count">'+prods.length+'件</span></div>';
-    html+='<div class="coll-actions" onclick="event.stopPropagation()">';
-    html+='<span class="drag-handle" title="拖拽分类">⋮⋮</span>';
-    html+='<button onclick="openProdModal(null,\''+cat.id+'\')">+ 商品</button>';
+    let actions=dragHandleHTML('拖拽分类');
+    actions+='<button onclick="openProdModal(null,\''+cat.id+'\')">+ 商品</button>';
     if(cat.id!=='sc_default'){
-      html+='<button onclick="renameShopCategory(\''+cat.id+'\')">重命名</button><button onclick="delShopCategory(\''+cat.id+'\')">删除</button>';
+      actions+='<button onclick="renameShopCategory(\''+cat.id+'\')">重命名</button><button onclick="delShopCategory(\''+cat.id+'\')">删除</button>';
     }
-    html+='</div>';
-    html+='</div>';
-    // Body (collapsible)
-    html+='<div class="coll-body">';
-    if(prods.length===0){
-      html+='<div class="empty" style="padding:16px"><p style="margin:0;color:var(--text-3)">暂无商品 · 拖拽 ⋮⋮ 按钮可排序或跨分类移动</p></div>';
-    }else{
-      html+='<div class="shop-grid">'+prods.map(p=>shopCardHTML(p,cat.id)).join('')+'</div>';
-    }
-    html+='</div>';
-    html+='</div>';
+    const body=prods.length===0
+      ?'<div class="empty" style="padding:16px"><p style="margin:0;color:var(--text-3)">暂无商品 · 拖拽 ⋮⋮ 按钮可排序或跨分类移动</p></div>'
+      :'<div class="shop-grid">'+prods.map(p=>shopCardHTML(p,cat.id)).join('')+'</div>';
+    html+=collGroupHTML('shop-cat-group','data-cat-id="'+cat.id+'"',isCollapsed,
+      collHeaderHTML({onclick:"toggleCollapse('shop-category','"+cat.id+"')",name:esc(cat.name),count:prods.length,countLabel:'件',actions:actions})
+      +collBodyHTML(body));
   });
 
   // Sold-out section
   const soldoutProds=state.products.filter(p=>p.stock===0);
   if(soldoutProds.length>0){
     const isSoldCollapsed=(state.collapsedShopCats||[]).includes('sc_soldout');
-    html+='<div class="shop-cat-group'+(isSoldCollapsed?' collapsed':'')+'" data-cat-id="sc_soldout">';
-    html+='<div class="coll-header" onclick="toggleCollapse(\'shop-category\',\'sc_soldout\')">';
-    html+='<div class="coll-name"><span class="coll-toggle">▼</span>售罄 <span class="coll-count">'+soldoutProds.length+'件</span></div>';
-    html+='<div class="coll-actions" onclick="event.stopPropagation()">';
-    html+='</div>';
-    html+='</div>';
-    html+='<div class="coll-body">';
+    let sbody='';
 
     // Group sold-out products by their original categoryId
     const soldByCat={};
@@ -81,17 +66,18 @@ function renderShop(){
         return '<option value="'+c.id+'"'+(c.id===catId?' selected':'')+'>'+esc(c.name)+'</option>';
       }).join('');
 
-      html+='<div class="soldout-sub" data-prev-cat-id="'+catId+'">';
-      html+='<div class="soldout-sub-header">';
-      html+='<div class="ss-name"><span class="drag-handle" title="拖拽排序">⋮⋮</span>'+esc(catName)+'</div>';
-      html+='<select onchange="changeSoldoutCat(this,\''+catId+'\')">'+catOptions+'</select>';
-      html+='</div>';
-      html+='<div class="shop-grid">'+prods.map(function(p){return shopCardHTML(p,'sc_soldout',catId);}).join('')+'</div>';
-      html+='</div>';
+      sbody+='<div class="soldout-sub" data-prev-cat-id="'+catId+'">';
+      sbody+='<div class="soldout-sub-header">';
+      sbody+='<div class="ss-name">'+dragHandleHTML('拖拽排序')+esc(catName)+'</div>';
+      sbody+='<select onchange="changeSoldoutCat(this,\''+catId+'\')">'+catOptions+'</select>';
+      sbody+='</div>';
+      sbody+='<div class="shop-grid">'+prods.map(function(p){return shopCardHTML(p,'sc_soldout',catId);}).join('')+'</div>';
+      sbody+='</div>';
     });
 
-    html+='</div>';
-    html+='</div>';
+    html+=collGroupHTML('shop-cat-group','data-cat-id="sc_soldout"',isSoldCollapsed,
+      collHeaderHTML({onclick:"toggleCollapse('shop-category','sc_soldout')",name:'售罄',count:soldoutProds.length,countLabel:'件',actions:''})
+      +collBodyHTML(sbody));
   }
 
   sl.innerHTML=html;
@@ -103,7 +89,8 @@ function renderShop(){
   }else{
     pl.innerHTML=purchases.slice(0,50).map(l=>{
       const dotCls=l.st==='vitality'?'v':'a';
-      return '<div class="log-item"><div class="log-dot '+dotCls+'"></div><div class="log-desc">'+esc(l.desc)+'</div><div class="log-amt neg">'+fmt(l.amt)+'</div><div class="log-time">'+fmtTime(l.time)+'</div><button class="log-undo" onclick="undoLog(\''+l.id+'\')">撤销</button></div>';
+      return logItemHTML({dot:dotCls,desc:esc(l.desc),amtCls:'neg',amt:fmt(l.amt),time:fmtTime(l.time),
+        action:'<button class="log-undo" onclick="undoLog(\''+l.id+'\')">撤销</button>'});
     }).join('');
   }
 }
@@ -134,7 +121,7 @@ function shopCardHTML(p,catId,prevCatId){
       :'<button class="btn btn-sm sh-buy" onclick="buyProduct(\''+p.id+'\')">'+(willLoan?'贷款购买':'购买')+'</button>';
   return '<div class="shop-card'+soldoutCls+lockedCls+'" data-prod-id="'+p.id+'" data-cat-id="'+catId+'"'+dataPrevCat+'>'
     +'<div class="card-top" style="margin-bottom:0"><div class="sh-name">'+esc(p.name)+'</div>'
-    +'<div class="card-actions"><span class="drag-handle" title="拖拽排序或跨分类移动">⋮⋮</span><button onclick="openProdModal(\''+p.id+'\')">编辑</button><button class="del" onclick="confirmDelProd(\''+p.id+'\')">删除</button></div></div>'
+    +actionsRowHTML('card-actions',dragHandleHTML('拖拽排序或跨分类移动')+'<button onclick="openProdModal(\''+p.id+'\')">编辑</button><button class="del" onclick="confirmDelProd(\''+p.id+'\')">删除</button>')+'</div>'
     +(p.desc?'<div class="sh-desc">'+esc(p.desc)+'</div>':'')
     +((p.budget&&p.budget.categoryId&&Number(p.budget.amount)>0)
       ?'<div class="sh-budget">预算·'+esc((BudgetEngine.category(p.budget.categoryId)||{name:'已删除分类'}).name)+' '+fmt(p.budget.amount)+'</div>':'')

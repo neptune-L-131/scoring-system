@@ -1,8 +1,8 @@
 import { normalizeCondition } from './cond-model.js';
 import { gateConditionOf } from './cond-model.js';
 import { normalizeBudgetBinding, normalizeBudgetRef } from './budget-binding.js';
-import { ACTIVITY_MAX_DAYS, AUDIT_MAX, BUDGET_LEDGER_MAX, BUDGET_PERIOD_KEEP, BUDGET_RULE_KINDS, PROD_TIERS, SCHEMA_VERSION, SHADOW_MAX, STATS_ENTITY_MAPS, STATS_KEEP_DAYS, STATS_SCALARS, STATS_VERSION, COND_METRIC_KEYS } from './constants.js';
-import { defaultBudgetsState, defaultChoreConfig, defaultProductGate, migrateChore, normalizeChoreConfig, tierCurrency, defaultActivities, defaults } from './defaults.js';
+import { ACTIVITY_MAX_DAYS, ASSET_VERSION, AUDIT_MAX, BUDGET_LEDGER_MAX, BUDGET_PERIOD_KEEP, BUDGET_RULE_KINDS, FLOW_MAX_STEPS, FLOW_RUN_KEEP, FLOW_VERSION, LOG_MAX, PROD_TIERS, SCHEMA_VERSION, SHADOW_MAX, STATS_ENTITY_MAPS, STATS_KEEP_DAYS, STATS_SCALARS, STATS_VERSION, COND_METRIC_KEYS } from './constants.js';
+import { defaultAssetDefs, defaultBudgetsState, defaultChoreConfig, defaultProductGate, migrateChore, normalizeChoreConfig, tierCurrency, defaultActivities, defaults } from './defaults.js';
 import { budgetBounds, dayKey, periodKey, migrateAffair, esc, now, uid, validRange, normOp, toNum, toTs, asArray, dateKeyOffset, round2 } from './pure.js';
 import { emptyAccountSums } from './stats.js';
 import { totalProgress } from './utils.js';
@@ -245,6 +245,231 @@ function normalizeCards(c){
   if(c&&typeof c==='object')Object.keys(c).forEach(function(k){o[k]=toNum(c[k]);});
   return o;
 }
+// ===== 阶段 4：资产定义 / 动作流 / 运行层归一 =====
+// state.cards 仍是「资产 ID → 余额」的扁平表；定义、配置、运行计量各放一层。
+const ASSET_ID_RE=/^[a-z][a-z0-9_]{2,31}$/;
+function isValidAssetId(id){return typeof id==='string'&&ASSET_ID_RE.test(id);}
+function normalizeAssetDef(d){
+  if(!d||typeof d!=='object'||Array.isArray(d))return null;
+  const id=String(d.id||'');
+  if(!id)return null;
+  const ip=(d.issuePeriod&&typeof d.issuePeriod==='object'&&!Array.isArray(d.issuePeriod))?d.issuePeriod:{};
+  const origin=['builtin','user','migrated'].indexOf(d.origin)>=0?d.origin:'user';
+  const maxBalance=(d.maxBalance===null||d.maxBalance===undefined||d.maxBalance==='')?null:Math.max(0,Math.ceil(toNum(d.maxBalance)));
+  const maxIssued=(d.maxIssuedPerPeriod===null||d.maxIssuedPerPeriod===undefined||d.maxIssuedPerPeriod==='')?null:Math.max(0,Math.round(toNum(d.maxIssuedPerPeriod)));
+  return{
+    v:Math.max(1,Math.round(toNum(d.v,ASSET_VERSION))),
+    id:id,
+    name:String(d.name||id).slice(0,24),
+    unit:String(d.unit||'张').slice(0,4),
+    maxBalance:maxBalance,
+    maxIssuedPerPeriod:maxIssued,
+    issuePeriod:{
+      cycle:(ip.cycle==='month')?'month':'week',
+      anchor:Math.min(7,Math.max(1,Math.round(toNum(ip.anchor,1))))
+    },
+    // 非法 id 的旧卡键不删余额，只把定义停用，等 UI/自检提示用户修正
+    enabled:d.enabled!==false&&isValidAssetId(id),
+    archived:!!d.archived,
+    origin:origin,
+    createdAt:toTs(d.createdAt)||0,
+    updatedAt:toTs(d.updatedAt)||0
+  };
+}
+function normalizeAssetDefs(list,cards){
+  const out=[];
+  const seen=new Set();
+  asArray(list).forEach(function(d){
+    const n=normalizeAssetDef(d);
+    if(!n||seen.has(n.id))return;
+    seen.add(n.id);
+    out.push(n);
+  });
+  // 内置豁免卡必须存在，且语义字段（名称/上限/来源）不允许被存档改写
+  const builtin=normalizeAssetDef(defaultAssetDefs()[0]);
+  const bi=out.findIndex(function(d){return d.id==='exemption';});
+  if(bi<0)out.unshift(builtin);
+  else out[bi]=builtin;
+  seen.add('exemption');
+  // v3 → v4 最小迁移：旧 cards 里没有定义的自定义卡键，直接按 id + 当前余额补定义
+  if(cards&&typeof cards==='object'&&!Array.isArray(cards)){
+    Object.keys(cards).forEach(function(id){
+      if(seen.has(id))return;
+      seen.add(id);
+      out.push(normalizeAssetDef({
+        id:id,name:id,unit:'张',
+        maxBalance:Math.max(0,Math.ceil(toNum(cards[id]))),
+        maxIssuedPerPeriod:null,
+        enabled:true,archived:false,origin:'migrated',v:ASSET_VERSION
+      }));
+    });
+  }
+  return out;
+}
+function defaultFlowLimits(){
+  return{maxSteps:FLOW_MAX_STEPS,maxRunsPerPeriod:1,maxGrantPerRun:20,maxSpendPerRun:20,maxAssetGrantPerRun:3,maxAssetSpendPerRun:3};
+}
+function normalizeFlowLimits(l){
+  const d=defaultFlowLimits();
+  l=(l&&typeof l==='object'&&!Array.isArray(l))?l:{};
+  return{
+    maxSteps:Math.min(FLOW_MAX_STEPS,Math.max(1,Math.round(toNum(l.maxSteps,d.maxSteps)))),
+    maxRunsPerPeriod:Math.min(10,Math.max(1,Math.round(toNum(l.maxRunsPerPeriod,d.maxRunsPerPeriod)))),
+    maxGrantPerRun:Math.min(100,Math.max(0,toNum(l.maxGrantPerRun,d.maxGrantPerRun))),
+    maxSpendPerRun:Math.min(100,Math.max(0,toNum(l.maxSpendPerRun,d.maxSpendPerRun))),
+    maxAssetGrantPerRun:Math.min(20,Math.max(0,Math.round(toNum(l.maxAssetGrantPerRun,d.maxAssetGrantPerRun)))),
+    maxAssetSpendPerRun:Math.min(20,Math.max(0,Math.round(toNum(l.maxAssetSpendPerRun,d.maxAssetSpendPerRun))))
+  };
+}
+function normalizeFlow(f){
+  if(!f||typeof f!=='object'||Array.isArray(f))return null;
+  const t=(f.trigger&&typeof f.trigger==='object'&&!Array.isArray(f.trigger))?f.trigger:{};
+  const v=Math.max(1,Math.round(toNum(f.v,FLOW_VERSION)));
+  // 高于当前流版本的定义保留但禁用：不静默删除用户配置，执行器（后续阶段）拒绝编译
+  const overVersion=v>FLOW_VERSION;
+  return{
+    v:v,
+    id:String(f.id||uid()),
+    name:String(f.name||'未命名动作流').slice(0,40),
+    enabled:f.enabled!==false&&!overVersion,
+    invalid:overVersion||f.invalid===true,
+    trigger:{
+      type:(t.type==='manual')?'manual':'period',
+      period:(t.period==='day'||t.period==='month')?t.period:'week',
+      anchor:Math.min(7,Math.max(1,Math.round(toNum(t.anchor,1))))
+    },
+    condition:normalizeCondition(f.condition),
+    limits:normalizeFlowLimits(f.limits),
+    // 步骤在 S4 编译期再逐项校验；这里只保证是对象数组，避免归一化吞掉用户配置
+    steps:asArray(f.steps).filter(function(s){return s&&typeof s==='object'&&!Array.isArray(s);}),
+    lastRun:f.lastRun||null,
+    createdAt:toTs(f.createdAt)||0,
+    updatedAt:toTs(f.updatedAt)||0
+  };
+}
+function normalizeFlows(list){
+  return asArray(list).map(normalizeFlow).filter(Boolean);
+}
+function normalizeAssetMeters(x){
+  const out={v:ASSET_VERSION,byAsset:{},idem:{}};
+  if(!x||typeof x!=='object'||Array.isArray(x))return out;
+  const by=(x.byAsset&&typeof x.byAsset==='object'&&!Array.isArray(x.byAsset))?x.byAsset:{};
+  Object.keys(by).forEach(function(aid){
+    const src=by[aid];
+    if(!src||typeof src!=='object'||Array.isArray(src))return;
+    const dst={};
+    Object.keys(src).forEach(function(pk){
+      const m=src[pk];
+      if(!m||typeof m!=='object'||Array.isArray(m))return;
+      dst[String(pk)]={
+        issued:Math.max(0,toNum(m.issued)),
+        spent:Math.max(0,toNum(m.spent)),
+        runs:Math.max(0,Math.round(toNum(m.runs)))
+      };
+    });
+    out.byAsset[String(aid)]=dst;
+  });
+  const idem=(x.idem&&typeof x.idem==='object'&&!Array.isArray(x.idem))?x.idem:{};
+  Object.keys(idem).forEach(function(k){
+    const r=idem[k];
+    if(!r||typeof r!=='object'||Array.isArray(r))return;
+    out.idem[String(k)]={flowId:String(r.flowId||''),runId:String(r.runId||''),at:toTs(r.at)};
+  });
+  return out;
+}
+// journal 的 IO 只保留原始值，避免导入外部 JSON 时把任意嵌套结构带进存档
+function normalizeJournalIO(x){
+  if(!x||typeof x!=='object'||Array.isArray(x))return{};
+  const out={};
+  Object.keys(x).slice(0,24).forEach(function(k){
+    const v=x[k];
+    if(v===null||typeof v==='number'||typeof v==='boolean'||typeof v==='string')out[k]=v;
+    else if(Array.isArray(v))out[k]=v.slice(0,LOG_MAX).map(String);
+  });
+  return out;
+}
+// 流运行 journal：撤销所需的证据，随运行记录一起裁剪（只保留 recent 窗口内的记录）
+function normalizeFlowRunJournal(j){
+  if(!j||typeof j!=='object'||Array.isArray(j))return null;
+  const steps=asArray(j.steps).slice(0,FLOW_MAX_STEPS).map(function(s){
+    s=(s&&typeof s==='object'&&!Array.isArray(s))?s:{};
+    return{
+      stepId:String(s.stepId||''),
+      atom:String(s.atom||''),
+      kind:s.kind==='branch'?'branch':'atom',
+      pass:s.pass===true,
+      input:normalizeJournalIO(s.input),
+      output:normalizeJournalIO(s.output),
+      logIds:asArray(s.logIds).map(String).filter(Boolean).slice(0,LOG_MAX),
+    };
+  });
+  return{
+    v:1,
+    runKey:String(j.runKey||''),
+    trigger:j.trigger==='manual'?'manual':'period',
+    periodKey:String(j.periodKey||''),
+    startedAt:toTs(j.startedAt),
+    finishedAt:toTs(j.finishedAt),
+    steps:steps,
+    logIds:asArray(j.logIds).map(String).filter(Boolean).slice(0,LOG_MAX),
+    accounts:asArray(j.accounts).slice(0,64).map(function(a){
+      a=(a&&typeof a==='object'&&!Array.isArray(a))?a:{};
+      return{key:String(a.key||''),before:toNum(a.before),after:toNum(a.after),delta:toNum(a.delta)};
+    }),
+    assets:asArray(j.assets).slice(0,32).map(function(a){
+      a=(a&&typeof a==='object'&&!Array.isArray(a))?a:{};
+      return{
+        assetId:String(a.assetId||''),periodKey:String(a.periodKey||''),
+        before:toNum(a.before),after:toNum(a.after),delta:toNum(a.delta),
+        issuedBefore:toNum(a.issuedBefore),spentBefore:toNum(a.spentBefore),runsBefore:toNum(a.runsBefore),
+        meterExisted:a.meterExisted===true,
+      };
+    }),
+    totals:normalizeJournalIO(j.totals),
+  };
+}
+function normalizeFlowRunRecord(r){
+  if(!r||typeof r!=='object'||Array.isArray(r))return null;
+  const id=String(r.id||'');
+  if(!id)return null;
+  return{
+    id:id,
+    flowId:String(r.flowId||''),
+    flowName:String(r.flowName||'').slice(0,40),
+    runKey:String(r.runKey||''),
+    trigger:r.trigger==='manual'?'manual':'period',
+    periodKey:String(r.periodKey||''),
+    startedAt:toTs(r.startedAt),
+    finishedAt:toTs(r.finishedAt),
+    status:r.status==='reversed'?'reversed':'active',
+    journalLogId:String(r.journalLogId||''),
+    childLogIds:asArray(r.childLogIds).map(String).filter(Boolean),
+    deltas:normalizeAccountSums(r.deltas),
+    stepOutputs:(r.stepOutputs&&typeof r.stepOutputs==='object'&&!Array.isArray(r.stepOutputs))?r.stepOutputs:{},
+    journal:normalizeFlowRunJournal(r.journal)
+  };
+}
+function normalizeFlowRuns(x){
+  const out={v:FLOW_VERSION,seq:0,byId:{},recent:[]};
+  if(!x||typeof x!=='object'||Array.isArray(x))return out;
+  out.seq=Math.max(0,Math.round(toNum(x.seq)));
+  // recent 是唯一保留窗口：最多 FLOW_RUN_KEEP 条（按写入顺序，新的在前）
+  const seen=new Set();
+  asArray(x.recent).forEach(function(rid){
+    if(out.recent.length>=FLOW_RUN_KEEP)return;
+    const id=String(rid||'');
+    if(!id||seen.has(id))return;
+    seen.add(id);
+    out.recent.push(id);
+  });
+  // byId 只保留仍被 recent 引用的记录，防止无界增长
+  const by=(x.byId&&typeof x.byId==='object'&&!Array.isArray(x.byId))?x.byId:{};
+  out.recent.forEach(function(id){
+    const rec=normalizeFlowRunRecord(by[id]);
+    if(rec)out.byId[id]=rec;
+  });
+  return out;
+}
 function normalizeWatermark(w){
   w=w&&typeof w==='object'?w:{};
   return{best:toNum(w.best),at:toTs(w.at)};
@@ -464,18 +689,26 @@ function normalizeExt(x,ctx){
     achievementCounted:normalizeAchievementCounted(x.achievementCounted),
     shadow:asArray(x.shadow).filter(Boolean).slice(0,SHADOW_MAX),
     metabolismSeeded:x.metabolismSeeded===true,
-    features:{audit:(x.features&&x.features.audit!==false)}
+    features:{audit:(x.features&&x.features.audit!==false)},
+    // 阶段 4 运行层：缺省即空结构，旧存档读入后行为不变
+    assetMeters:normalizeAssetMeters(x.assetMeters),
+    flowRuns:normalizeFlowRuns(x.flowRuns)
   };
   const pr=wm.progress&&typeof wm.progress==='object'?wm.progress:{};
   Object.keys(pr).forEach(function(k){out.watermarks.progress[k]=normalizeWatermark(pr[k]);});
   return out;
 }
 // 只接受当前 schema：低版本存档不再逐版本迁移，统一交给 normalizeXxx 的形状守卫补默认值；
-// 高于当前版本视为不可信（可能来自更新版本），走 salvage 保留原始内容。
+// 高于当前版本视为不可信（可能来自更新版本）：拒载并暂停写盘，绝不用旧结构覆盖原存档。
 function applyMigrations(p){
   const from=(p.schema&&typeof p.schema.v==='number')?p.schema.v:0;
-  if(from>SCHEMA_VERSION){loadIssue={type:'salvaged'};return;}
+  if(from>SCHEMA_VERSION){
+    loadIssue={type:'future',from:from};
+    setPersistBlocked(true);
+    return false;
+  }
   p.schema={v:SCHEMA_VERSION,migratedAt:now()};
+  return true;
 }
 function parseState(raw){
   // 每次解析都是独立一次读档：先归零上一次的结果，避免失败状态残留到下一次成功解析
@@ -491,7 +724,7 @@ function parseState(raw){
   }
   try{
     if(!p||typeof p!=='object'||Array.isArray(p)){loadIssue={type:'corrupt'};return defaults();}
-    applyMigrations(p);
+    if(!applyMigrations(p))return defaults();
     const tasks=asArray(p.tasks).filter(Boolean).map(function(t){
       if(!Array.isArray(t.domainIds)||!t.domainIds.length)t.domainIds=['d_default'];
       if(!Array.isArray(t.scoreTypes)||!t.scoreTypes.length)t.scoreTypes=['vitality'];
@@ -523,6 +756,9 @@ function parseState(raw){
       c.budget=normalizeBudgetBinding(c.budget,budCtx);
       c.budgetRef=normalizeBudgetRef(c.budgetRef);
     });
+    // 资产余额先归一，再由余额反推 v3 存档里的孤立卡定义（最小迁移）
+    const cards=normalizeCards(p.cards);
+    const assetDefs=normalizeAssetDefs(p.assetDefs,cards);
     return{
       schema:{v:SCHEMA_VERSION,migratedAt:toTs(p.schema&&p.schema.migratedAt)},
       scores:normalizeScores(p.scores),
@@ -548,7 +784,9 @@ function parseState(raw){
       lastDebtDate:toTs(p.lastDebtDate),
       filterDomain:p.filterDomain||null,
       metrics:asArray(p.metrics).filter(Boolean),
-      cards:normalizeCards(p.cards),
+      cards:cards,
+      assetDefs:assetDefs,
+      flows:normalizeFlows(p.flows),
       activities:migrateActivities(p),
       ext:extNorm
     };
@@ -558,4 +796,4 @@ function parseState(raw){
 export function setPersistBlocked(v){_persistBlocked=!!v;}
 export function setLoadIssue(v){loadIssue=v;}
 
-export { normalizeRewardItem, normalizeResult, normalizeActivity, migrateActivities, loadIssue, _persistBlocked, salvageJSON, normalizeScores, normalizeTaskNums, normalizeAchNums, normalizeProdNums, normalizeProductGate, normalizeProduct, normalizeActivityIndex, normalizeStatsDaily, normalizeAccountSums, normalizeAchievementCounted, normalizePresetNums, normalizeLoanNums, normalizeLogNums, normalizeCards, normalizeWatermark, normalizeBudgetSettings, normalizeBudgetRule, normalizeBudgetCategory, normalizeBudgetPeriod, normalizeBudgetLedgerEntry, normalizeBudgets, normalizeProductBudget, normalizeExt, applyMigrations, parseState };
+export { normalizeRewardItem, normalizeResult, normalizeActivity, migrateActivities, loadIssue, _persistBlocked, salvageJSON, normalizeScores, normalizeTaskNums, normalizeAchNums, normalizeProdNums, normalizeProductGate, normalizeProduct, normalizeActivityIndex, normalizeStatsDaily, normalizeAccountSums, normalizeAchievementCounted, normalizePresetNums, normalizeLoanNums, normalizeLogNums, normalizeCards, isValidAssetId, normalizeAssetDef, normalizeAssetDefs, normalizeFlow, normalizeFlows, normalizeAssetMeters, normalizeFlowRunRecord, normalizeFlowRuns, normalizeWatermark, normalizeBudgetSettings, normalizeBudgetRule, normalizeBudgetCategory, normalizeBudgetPeriod, normalizeBudgetLedgerEntry, normalizeBudgets, normalizeProductBudget, normalizeExt, applyMigrations, parseState };

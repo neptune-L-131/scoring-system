@@ -209,7 +209,8 @@ describe('跨期保护', () => {
     let s = api.getState();
     const entryId = s.ext.budgets.ledger[0].id;
     const key = Object.keys(s.ext.budgets.periods.bc1)[0];
-    expect(api.BudgetEngine.reverseEntry(entryId)).toBe(false);
+    // reverseEntry 改为返回结果对象（副作用交给命令层）
+    expect(api.BudgetEngine.reverseEntry(entryId).ok).toBe(false);
     s = api.getState();
     expect(s.ext.budgets.ledger[0].status).toBe('active');
     expect(s.ext.budgets.periods.bc1[key].spent).toBe(40);
@@ -236,7 +237,7 @@ describe('跨期保护', () => {
       st.ext.budgets.current.bc1 = b.key;
       st.logs.forEach(l => { if (l.budCatId) l.budPeriodKey = b.key; });
     });
-    expect(api.BudgetEngine.reverseEntry(entryId)).toBe(true);
+    expect(api.BudgetEngine.reverseEntry(entryId).ok).toBe(true);
     s = api.getState();
     const p = s.ext.budgets.periods.bc1[s.ext.budgets.current.bc1];
     expect(s.ext.budgets.ledger[0].status).toBe('reversed');

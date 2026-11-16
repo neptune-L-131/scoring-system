@@ -16,7 +16,7 @@
 // tests/sw-assets.test.js 会校验：清单与仓库实际文件一致、VERSION 与缓存名一致。
 'use strict';
 
-const VERSION = '2026-11-12.5';
+const VERSION = '2026-11-16.6';
 const CACHE = 'score-sys-' + VERSION;
 
 // 整版清单（相对 sw.js 所在目录）
@@ -32,12 +32,15 @@ const PRECACHE = [
   './src/defaults.js',
   './src/toast.js',
   './src/cond-model.js',
+  './src/cond-kernel.js',
+  './src/cond-eval.js',
   './src/modal-host.js',
   './src/render.js',
   './src/state.js',
   './src/theme.js',
   './src/normalize.js',
   './src/persist.js',
+  './src/command.js',
   './src/utils.js',
   './src/stats.js',
   './src/ledger.js',
@@ -46,11 +49,18 @@ const PRECACHE = [
   './src/budget-binding.js',
   './src/conditions.js',
   './src/entities.js',
+  './src/flow-atoms.js',
+  './src/flow-engine.js',
   './src/business.js',
   './src/library.js',
   './src/shell.js',
+  './src/view-primitives.js',
+  './src/view-models.js',
+  './src/render-targets.js',
   './src/render-work.js',
   './src/render-bank.js',
+  './src/asset-ui.js',
+  './src/flow-ui.js',
   './src/render-shop.js',
   './src/render-budget.js',
   './src/cycle.js',

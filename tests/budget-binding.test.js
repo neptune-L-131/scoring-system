@@ -316,3 +316,54 @@ describe('重算历史不清空 budgetRef', () => {
     expect(currentPeriod(after).spent).toBe(0);
   });
 });
+
+describe('现实账目的 txnId 落库', () => {
+  it('打卡：预算账目 txnId = 事务 label（checkin）', () => {
+    seed({}, { budget: { categoryId: 'bc1', mode: 'fixed', amount: 30 } });
+    api.checkIn('t1');
+    const e = api.getState().ext.budgets.ledger[0];
+    expect(e.txnId).toBe('checkin');
+  });
+
+  it('项目推进：预算账目 txnId = affair-progress', () => {
+    api.resetState({
+      domains: [{ id: 'd_default', name: '默认' }],
+      scores: { vitality: 100, progress: {}, achievement: 100 },
+    });
+    api.patchState(s => {
+      s.ext.budgets.categories.push(api.normalizeBudgetCategory(Object.assign({}, BASE_CAT), { domainIds: new Set(['d_default']) }));
+      s.affairs.push({
+        id: 'a1', name: '项目', domainId: null, totalReward: 1, curve: { type: 'even', values: [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1] },
+        currentCell: 0, alreadyGiven: 0, steps: [], ach: { enabled: false, amount: 0 },
+        createdAt: at(2026, 5, 1), plannedAt: null, doneAt: null, archived: false,
+        budget: { categoryId: 'bc1', mode: 'fixed', amount: 30 }, budgetRef: null,
+      });
+    });
+    const a = api.getLive().affairs[0];
+    const br = api.resolveActionBudget(a, { kind: 'affair', id: 'a1', source: 'affair', ts: at(2026, 5, 10) });
+    expect(br.status).toBe('ok');
+    api.affairApplyProgress(a, 1, { plan: br.plan });
+    const e = api.getState().ext.budgets.ledger[0];
+    expect(e.amount).toBe(30);
+    expect(e.txnId).toBe('affair-progress');
+  });
+
+  it('杂事勾选：预算账目 txnId = chore-check', () => {
+    api.resetState({
+      domains: [{ id: 'd_default', name: '默认' }],
+      scores: { vitality: 100, progress: {}, achievement: 100 },
+    });
+    api.patchState(s => {
+      s.ext.budgets.categories.push(api.normalizeBudgetCategory(Object.assign({}, BASE_CAT), { domainIds: new Set(['d_default']) }));
+      s.chores.push({
+        id: 'c1', name: '杂事', done: false, doneAt: null, plannedAt: null, createdAt: at(2026, 5, 1),
+        settled: false, freshDays: null, decayKey: null,
+        budget: { categoryId: 'bc1', mode: 'fixed', amount: 12 }, budgetRef: null,
+      });
+    });
+    api.toggleChoreDone('c1');
+    const e = api.getState().ext.budgets.ledger[0];
+    expect(e.amount).toBe(12);
+    expect(e.txnId).toBe('chore-check');
+  });
+});

@@ -1,13 +1,11 @@
 import { evalNode } from './conditions.js';
+import { registerPointMetricProvider } from './cond-eval.js';
 import { BUDGET_LEDGER_MAX, BUDGET_PERIOD_KEEP, BUDGET_TARGET_NAMES } from './constants.js';
 import { newExtState, defaultBudgetSettings, defaultBudgetsState } from './defaults.js';
 import { Ledger } from './ledger.js';
 import { buyProduct } from './library.js';
-import { save } from './persist.js';
 import { dayKey, periodKey, fmt, now, uid, budgetBounds, round4 } from './pure.js';
-import { render } from './render.js';
 import { state } from './state.js';
-import { toast } from './toast.js';
 import { domainName } from './utils.js';
 // budget.js —— 现实预算规则引擎（BudgetEngine）
 // 由 app.js 按功能拆分（第五轮可维护性重构），行为不变。
@@ -556,7 +554,6 @@ const BudgetEngine=(function(){
   // 冲正只影响“是否还算超支”，不进入结余计算，避免用撤销旧消费的方式凭空多领结余奖励。
   function compensateEntry(ref){
     ref=ref||{};
-    const nested=Ledger.inTxn();
     const run=function(){
       const cat=category(ref.catId);
       if(!cat)return null;
@@ -598,20 +595,17 @@ const BudgetEngine=(function(){
       prunePeriods(cat);
       return entry;
     };
-    if(nested){const got=run();if(!got)return false;return true;}
+    // 落盘/渲染/提示属于副作用，统一由调用方的命令层收口；这里只返回结果对象。
     const r=Ledger.txn(run,{label:'budget-compensate',save:'none',render:false});
     if(!r.ok){
       const info=(r.error&&r.error.info)||{};
-      toast(info.reason||'冲正失败','err');
-      return false;
+      return {ok:false,code:(r.error&&r.error.code)||'BUDGET_COMPENSATE_FAILED',reason:info.reason||'冲正失败'};
     }
-    save();render();
-    toast('已跨期冲正现实账目（历史周期与已发奖惩不变）');
-    return true;
+    return {ok:true,entry:r.value||null};
   }
   // 撤销一笔现实账目：只允许当期；按原始惩罚/反哺流水精确退回，水位按快照重算
+  // 同上：副作用由调用方命令层收口，这里只返回结果对象。
   function reverseEntry(entryId){
-    const nested=Ledger.inTxn();
     const r=Ledger.txn(function(){
       const bd=budgets();
       const e=bd.ledger.find(function(x){return x.id===entryId;});
@@ -643,14 +637,9 @@ const BudgetEngine=(function(){
     },{label:'budget-reverse',save:'none',render:false});
     if(!r.ok){
       const info=(r.error&&r.error.info)||{};
-      toast(info.reason||'撤销失败','err');
-      return false;
+      return {ok:false,code:(r.error&&r.error.code)||'BUDGET_REVERSE_FAILED',reason:info.reason||'撤销失败'};
     }
-    // 嵌套在别的撤销事务里时，由最外层统一 save/render/toast，避免事务中途刷新
-    if(nested)return true;
-    save();render();
-    toast('已撤销预算账目');
-    return true;
+    return {ok:true,entry:r.value||null};
   }
   // 校验一条规则：target=progress 且分类无默认领域时拒绝保存，并指明第几条
   function validateRule(cat,rule,index){
@@ -700,5 +689,17 @@ export function registerBudgetPreflightPolicy(){Ledger.registerPolicy({phase:'be
     return true;
   }
 });}
+
+// 条件指标 budget_remaining 的取值依赖预算引擎自身口径（基础限额 + 当期扩容）。
+// 由预算模块向条件求值层注册取值器，避免 cond-eval 反向 import budget.js 形成循环。
+registerPointMetricProvider('budget_remaining',function(it,ts){
+  const target=it.target||'';
+  if(!target)return 0;
+  const cat=BudgetEngine.category(target);
+  if(!cat||!cat.enabled||cat.archived)return 0;
+  const p=BudgetEngine.readPeriod(cat,ts).period;
+  // 剩余额度按“基础限额 + 本期扩容”计算，与超支惩罚同一口径
+  return round4(BudgetEngine.effectiveLimit(cat,p)-(Number(p&&p.spent)||0));
+});
 
 export { BudgetEngine };

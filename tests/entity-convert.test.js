@@ -19,6 +19,10 @@ function seed() {
       id: 'a2', name: '空项目', domainId: null, createdAt: at(2, 9), plannedAt: null,
       steps: [], currentCell: 0, alreadyGiven: 0, doneAt: at(9, 9), archived: false,
       ach: { enabled: false, amount: 0 }, budget: null, budgetRef: null,
+    }, {
+      id: 'a3', name: '搬家', domainId: 'd2', createdAt: at(3, 9), plannedAt: at(10, 9),
+      steps: [], currentCell: 0, alreadyGiven: 0, doneAt: null, archived: false,
+      ach: { enabled: false, amount: 0 }, budget: { mode: 'fixed', amount: 50 }, budgetRef: null,
     }],
     chores: [{
       id: 'c1', name: '交水费', createdAt: at(1, 9), plannedAt: at(10, 8), done: false, doneAt: null,
@@ -80,36 +84,30 @@ describe('entity-convert：杂事 → 项目（同 id 换表）', () => {
   });
 });
 
-describe('entity-convert：项目 → 杂事（有损确认）', () => {
-  it('存在有损字段时必须确认；取消则整体不动作', () => {
+describe('entity-convert：项目 → 杂事（有损直接拒绝）', () => {
+  it('存在有损字段时直接拒绝，不询问用户且零写入', () => {
     const before = JSON.stringify(api.getState());
-    const asked = [];
-    globalThis.confirm = msg => { asked.push(msg); return false; };
+    globalThis.confirm = () => { throw new Error('不应再询问用户'); };
     const r = api.affairToChore('a1');
     expect(r.ok).toBe(false);
-    expect(r.canceled).toBe(true);
-    expect(asked.length).toBe(1);
-    expect(asked[0]).toContain('步骤 2 步');
-    expect(asked[0]).toContain('进度轴');
-    expect(asked[0]).toContain('已发放进度 30');
-    expect(asked[0]).toContain('完成成果点 7');
+    expect(r.reason).toBe('项目已有步骤、进度或已发奖励，不能降级为杂事');
+    expect(r.canceled).toBeUndefined();
     expect(JSON.stringify(api.getState())).toBe(before);
   });
 
-  it('确认后换表为杂事；有损字段不残留，完成项目标记为已结算', () => {
-    globalThis.confirm = () => true;
-    const r = api.affairToChore('a1');
+  it('无有损字段时换表为杂事；有损字段不残留，完成项目标记为已结算', () => {
+    const r = api.affairToChore('a3');
     expect(r.ok).toBe(true);
     const s = api.getState();
-    expect(s.affairs.some(x => x.id === 'a1')).toBe(false);
-    const c = s.chores.find(x => x.id === 'a1');
-    expect(c.name).toBe('装修');
+    expect(s.affairs.some(x => x.id === 'a3')).toBe(false);
+    const c = s.chores.find(x => x.id === 'a3');
+    expect(c.name).toBe('搬家');
     expect(c.steps).toBeUndefined();
     expect(c.currentCell).toBeUndefined();
     expect(c.done).toBe(false);
     expect(c.settled).toBe(false);
-    expect(c.budget).toEqual({ mode: 'fixed', amount: 100 });
-    expect(c.createdAt).toBe(at(1, 9));
+    expect(c.budget).toEqual({ mode: 'fixed', amount: 50 });
+    expect(c.createdAt).toBe(at(3, 9));
   });
 
   it('无有损字段时不弹确认', () => {
@@ -155,14 +153,13 @@ describe('entity-convert：撤销边界', () => {
   });
 
   it('只认最近一次转换：撤销一次后不能再撤销更早的那次', () => {
-    globalThis.confirm = () => true;
     api.choreToAffair('c1');
-    api.affairToChore('a1');
-    expect(api.lastConversion().entityId).toBe('a1');
+    api.affairToChore('a3');
+    expect(api.lastConversion().entityId).toBe('a3');
     expect(api.undoConversion().ok).toBe(true);
-    // a1 已还原为项目；再撤销应因“撤销本身写了新流水”而失败
+    // a3 已还原为项目；再撤销应因“撤销本身写了新流水”而失败
     expect(api.canUndoConversion()).toBe(false);
-    expect(api.getState().affairs.some(x => x.id === 'a1')).toBe(true);
+    expect(api.getState().affairs.some(x => x.id === 'a3')).toBe(true);
     expect(api.getState().affairs.some(x => x.id === 'c1')).toBe(true);
   });
 });
@@ -170,13 +167,12 @@ describe('entity-convert：撤销边界', () => {
 describe('entity-convert：affairUndo 快照迁移', () => {
   it('项目转杂事时把旧撤销栈移出 affairUndo，撤销转换后原样恢复', () => {
     const snap = [{ cell: 1, given: 10 }];
-    api.patchState(s => { s.affairUndo = { a1: JSON.parse(JSON.stringify(snap)) }; });
-    globalThis.confirm = () => true;
-    api.affairToChore('a1');
-    expect(api.getState().affairUndo.a1).toBeUndefined();
+    api.patchState(s => { s.affairUndo = { a3: JSON.parse(JSON.stringify(snap)) }; });
+    api.affairToChore('a3');
+    expect(api.getState().affairUndo.a3).toBeUndefined();
     expect(api.lastConversion().affairUndo).toEqual(snap);
     expect(api.undoConversion().ok).toBe(true);
-    expect(api.getState().affairUndo.a1).toEqual(snap);
+    expect(api.getState().affairUndo.a3).toEqual(snap);
   });
 
   it('杂事转项目不会凭空产生 affairUndo 栈', () => {
