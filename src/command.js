@@ -1,4 +1,5 @@
 import { Ledger } from './ledger.js';
+import { emitPostCommit } from './post-commit.js';
 import { save } from './persist.js';
 import { render } from './render.js';
 import { toast } from './toast.js';
@@ -81,6 +82,10 @@ function runCommand(opts) {
   if (o.toast) showToast(o.toast);
   if (out && out.toast) showToast(out.toast);
   if (txr.nested) return { ok: true, value: out, nested: true };
+  // 事件派发必须在经验证提交之后：此刻 Ledger 事务已关闭，事件流各自开独立事务，
+  // 失败只写自己的运行记录/事件留痕，不会回滚发起方的打卡或购买。
+  const events = (out && Array.isArray(out.events)) ? out.events : [];
+  if (events.length) emitPostCommit(events, { nested: false });
   if (o.save !== false) save();
   if (o.render !== false) render();
   return { ok: true, value: out };

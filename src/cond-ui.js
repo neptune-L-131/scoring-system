@@ -1,10 +1,13 @@
 import { registerRenderer } from './render.js';
+import { applyMigration, buildMigrationPlan, restoreActivity, undoMigration } from './activity-migrate.js';
 import { BudgetEngine } from './budget.js';
 import { useExemption } from './business.js';
+import { legacyExemptAvailable, usableExemptAssets, useExemptionFromPanel } from './asset-use.js';
 import { exemptionActivity } from './conditions.js';
 import { COND_RANGES } from './constants.js';
-import { COND_AGGREGATES, COND_METRICS, COND_NEW_FILTERS, COND_TARGET_TYPES, actMetaLabel, condNewFilterOptions, condTargetTypesFor, cycleNextGrant, fmtDate, metricLabel, opLabel, openActivityModal, periodLabel, rangeLabel, readRewardItems, updateActivitySummary, updateCondPreview } from './cycle.js';
-import { processActivities } from './entities.js';
+import { normalizeCondition } from './cond-model.js';
+import { COND_AGGREGATES, COND_METRICS, COND_NEW_FILTERS, COND_TARGET_TYPES, actMetaLabel, condNewFilterOptions, condTargetTypesFor, condNLNode, cycleNextGrant, fmtDate, metricLabel, opLabel, periodLabel, rangeLabel, rewardItemLabel } from './cycle.js';
+import { processActivities, archiveIdleEntities } from './entities.js';
 import { Ledger } from './ledger.js';
 import { closeModal, openModal } from './modal-host.js';
 import { commit, save } from './persist.js';
@@ -19,6 +22,13 @@ import { toast } from './toast.js';
 let condDraft={mode:'all',items:[]};
 let condDraftUI={box:'activityCondItems',previewId:'condPreview',previewFn:null,afterChange:null};
 let condPanel={visible:false,kind:'metric',path:'',step:'range',range:'period',days:7,metric:'checkins',targetType:'all',newFilter:'none',target:'',aggregate:'sum'};
+// 事件触发模式：条件编辑器提前禁用点态指标与「本周期」范围（与编译期拒绝保持一致）
+let condEventMode=false;
+export function setCondEventMode(v){condEventMode=!!v;}
+export function isCondEventMode(){return condEventMode;}
+export function refreshCondPanel(){
+  if(condPanel&&condPanel.visible){renderCondPanel();positionCondPanel(condPanel.anchor);}
+}
 // ===== 条件芯片编辑器（嵌套条件组 + 点选面板）=====
 function countCondLeaves(items){
   return (items||[]).reduce((s,node)=>{
@@ -108,8 +118,10 @@ function setCondDraftContext(draft,box,previewId,previewFn,afterChange){
 function resetCondDraftUI(){
   condDraftUI={box:'activityCondItems',previewId:'condPreview',previewFn:null,afterChange:null};
 }
-function addCondItem(parentPath){condListAt(parentPath).push({range:'period',metric:'checkins',op:'>=',value:1,targetType:'all'});renderCondTree();}
-function addCondGroup(parentPath){condListAt(parentPath).push({group:true,mode:'all',items:[{range:'period',metric:'checkins',op:'>=',value:1,targetType:'all'}]});renderCondTree();}
+// 事件模式下新增条件默认「今天」，避免一加就落在不可用的「本周期」上
+function defaultCondLeaf(){return {range:condEventMode?'today':'period',metric:'checkins',op:'>=',value:1,targetType:'all'};}
+function addCondItem(parentPath){condListAt(parentPath).push(defaultCondLeaf());renderCondTree();}
+function addCondGroup(parentPath){condListAt(parentPath).push({group:true,mode:'all',items:[defaultCondLeaf()]});renderCondTree();}
 function removeCondNode(path){
   if(!path)return;
   const parts=path.split('/').map(Number);
@@ -176,9 +188,12 @@ function renderCondPanel(){
     });
     html+='</div>';
   }else if(p.step==='range'){
-    html='<div class="cp-title">时间范围</div><div class="cp-opts">';
+    html='<div class="cp-title">时间范围</div>';
+    if(condEventMode)html+='<div class="cp-note">事件触发按事件发生时刻求值：「本周期」等不到正确窗口，已禁用。</div>';
+    html+='<div class="cp-opts">';
     COND_RANGES.forEach(r=>{
-      html+='<button class="cp-opt" onclick="pickCondRange(\''+r.v+'\')">'+r.n+'</button>';
+      const blocked=condEventMode&&r.v==='period';
+      html+='<button class="cp-opt"'+(blocked?' disabled title="事件触发无法确定“本周期”的窗口"':' onclick="pickCondRange(\''+r.v+'\')"')+'>'+r.n+(blocked?'（事件不可用）':'')+'</button>';
     });
     html+='</div>';
   }else if(p.step==='days'){
@@ -186,9 +201,12 @@ function renderCondPanel(){
       +'<input type="number" id="condPanelDays" value="'+p.days+'" min="1" step="1">'
       +'<button class="btn btn-sm" onclick="confirmCondDays()">确定</button></div>';
   }else if(p.step==='metric'){
-    html='<div class="cp-title">指标</div><div class="cp-opts">';
+    html='<div class="cp-title">指标</div>';
+    if(condEventMode)html+='<div class="cp-note">事件触发不能使用点态指标（如任务闲置、周期状态）：这些值只在当前时刻快照中有意义，事件发生后无法复现。</div>';
+    html+='<div class="cp-opts">';
     COND_METRICS.forEach(m=>{
-      html+='<button class="cp-opt" onclick="pickCondMetric(\''+m.v+'\')">'+m.n+'</button>';
+      const blocked=condEventMode&&isPointMetric(m.v);
+      html+='<button class="cp-opt"'+(blocked?' disabled title="事件触发不能用点态指标"':' onclick="pickCondMetric(\''+m.v+'\')"')+'>'+m.n+(blocked?'（事件不可用）':'')+'</button>';
     });
     html+='</div>';
   }else if(p.step==='targetType'){
@@ -253,6 +271,7 @@ function openCondOpPanel(path,anchor){
   positionCondPanel(anchor);
 }
 function pickCondRange(range){
+  if(condEventMode&&range==='period'){toast('事件触发不能用「本周期」范围，请改用「总计」或「最近 N 天」','warn');return;}
   condPanel.range=range;
   condPanel.step=(range==='recent')?'days':'metric';
   renderCondPanel();
@@ -266,6 +285,7 @@ function confirmCondDays(){
   positionCondPanel(condPanel.anchor);
 }
 function pickCondMetric(metric){
+  if(condEventMode&&isPointMetric(metric)){toast('事件触发不能用点态指标：该值在事件发生时刻无法复现','warn');return;}
   condPanel.metric=metric;
   // 成果点/预算进账指标仅支持「全部 + 本周期」，直接提交
   if(metric==='achievement'||(metric.indexOf('budget_')===0&&metric!=='budget_remaining')){
@@ -507,7 +527,11 @@ function handleActivitySave(){
     const idx=state.activities.findIndex(x=>x.id===id);
     if(idx<0){toast('活动不存在','err');return}
     const prev=state.activities[idx];
-    state.activities[idx]={id:id,name:name,enabled:prev.enabled,period:period,anchor:anchor,condition:condition,result:result,lastRun:prev.lastRun};
+    state.activities[idx]={
+      id:id,name:name,enabled:prev.enabled,period:period,anchor:anchor,condition:condition,result:result,lastRun:prev.lastRun,
+      // 迁移标记必须保留，否则编辑一次就会丢失「活动 → 流」关联
+      migratedToFlowId:prev.migratedToFlowId||'',migratedAt:prev.migratedAt||0,migratedWasEnabled:prev.migratedWasEnabled!==false
+    };
   }else{
     state.activities.push({id:uid(),name:name,enabled:true,period:period,anchor:anchor,condition:condition,result:result,lastRun:null});
   }
@@ -518,6 +542,10 @@ function handleActivitySave(){
 function toggleActivity(id,enabled){
   const a=state.activities.find(x=>x.id===id);
   if(!a)return;
+  if(enabled&&a.migratedToFlowId){
+    toast('该活动已迁移为动作流，请先「恢复为独立活动」再启用','err');
+    return;
+  }
   a.enabled=enabled;
   processActivities(true);
   commit(enabled?'活动已开始运行':'活动已停止');
@@ -541,6 +569,10 @@ function doDeleteActivity(revoke){
   closeModal('activityDeleteModal');
   const a=state.activities.find(x=>x.id===id);
   if(!a)return;
+  if(a.migratedToFlowId){
+    toast('该活动已迁移为动作流，请先恢复或删除对应的动作流','err');
+    return;
+  }
   if(revoke)revokeActivityGrants(id);
   state.activities=state.activities.filter(x=>x.id!==id);
   commit(revoke?'活动已删除，历史获得已撤销':'活动已删除');
@@ -586,8 +618,9 @@ function renderExemptPanel(){
   const box=document.getElementById('exemptUsePanel');
   if(!box)return;
   const cards=state.cards.exemption||0;
-  const exAct=exemptionActivity();
-  const ruleEnabled=!!(exAct&&exAct.enabled);
+  const assets=usableExemptAssets();
+  const assetMode=assets.length>0;
+  const legacy=legacyExemptAvailable();
   const todayStart=dayStart(now());
   const eligible=state.tasks.filter(t=>{
     if(t.archived)return false;
@@ -602,13 +635,29 @@ function renderExemptPanel(){
     const label=t.name+(gapDays>=2?'  ·  已断更'+(gapDays-1)+'天':'');
     return '<option value="'+t.id+'">'+esc(label)+'</option>';
   }).join('');
-  const canUse=ruleEnabled&&cards>0&&eligible.length>0;
+  const canUse=eligible.length>0&&(assetMode||(legacy&&cards>0));
+  const assetSel=assetMode&&assets.length>1
+    ?'<select id="exemptAssetSel" style="flex:1">'+assets.map(d=>{
+      const bal=(state.cards&&state.cards[d.id])||0;
+      return '<option value="'+d.id+'">'+esc(d.name+' ×'+bal)+'</option>';
+    }).join('')+'</select>'
+    :'';
+  const headText=assetMode?'豁免（资产驱动） <span class="badge">可用资产 '+assets.length+' 个</span>'
+    :'断更豁免卡 <span class="badge">剩余 '+cards+' 张</span>';
+  let note='';
+  if(assetMode){
+    note='<div class="sec-note">本次将消耗「'+assets.map(d=>d.name).join(' / ')+'」各 1 个；运行会留下记录，可在「周期 → 动作流 → 运行记录」整单撤销。</div>';
+  }else if(!legacy){
+    note='<div class="sec-note" style="color:var(--danger)">当前没有可用的豁免资产：请在「资产定义」里为资产配置「任务豁免」使用配方，或启用发放豁免卡的周期活动。</div>';
+  }else if(cards<=0){
+    note='<div class="sec-note">暂无可用豁免卡，待周期结算自动发放后即可使用。</div>';
+  }
   box.innerHTML=
-    '<div class="act-head"><div class="act-name">断更豁免卡 <span class="badge">剩余 '+cards+' 张</span></div></div>'
-    +(ruleEnabled?'':'<div class="sec-note" style="color:var(--danger)">当前没有「发放豁免卡」的运行中活动，请先在上方新建并启用一个奖励豁免卡的周期活动。</div>')
-    +(ruleEnabled&&cards<=0?'<div class="sec-note">暂无可用豁免卡，待周期结算自动发放后即可使用。</div>':'')
+    '<div class="act-head"><div class="act-name">'+headText+'</div></div>'
+    +note
     +'<div class="reward-row" style="margin-top:10px">'
     +'<select id="exemptTaskSel" style="flex:1">'+(selOpts||'<option value="">暂无可豁免任务</option>')+'</select>'
+    +assetSel
     +'<button class="btn btn-sm btn-exempt" style="width:auto" onclick="useExemptionFromSel()" '+(canUse?'':'disabled')+'>使用豁免</button>'
     +'</div>'
     +'<div class="sec-note">事前「请假」：今天不打卡仍延续连胜利率；事后「补救」：已断更则清零待扣债。使用不消耗活力、不增加进度。</div>';
@@ -616,6 +665,13 @@ function renderExemptPanel(){
 function useExemptionFromSel(){
   const sel=document.getElementById('exemptTaskSel');
   if(!sel||!sel.value){toast('请先选择要豁免的任务','warn');return;}
+  const assets=usableExemptAssets();
+  if(assets.length){
+    const assetSel=document.getElementById('exemptAssetSel');
+    const assetId=assetSel?assetSel.value:(assets[0]&&assets[0].id)||'';
+    useExemptionFromPanel(sel.value,assetId);
+    return;
+  }
   useExemption(sel.value);
 }
 function renderCycle(){
@@ -649,28 +705,207 @@ function renderCycle(){
     box.innerHTML='<div class="empty"><p>尚未创建周期活动</p><button class="btn btn-sm" onclick="openActivityModal()">新建活动</button></div>';
   }else{
     box.innerHTML=acts.map(a=>{
-      const stateTxt=a.enabled?'运行中':'已停用';
-      const stateColor=a.enabled?'var(--progress)':'var(--text-3)';
+      const migrated=!!a.migratedToFlowId;
+      const stateTxt=migrated?'已迁移':(a.enabled?'运行中':'已停用');
+      const stateColor=migrated?'var(--text-3)':(a.enabled?'var(--progress)':'var(--text-3)');
+      const ctrls=migrated
+        ?'<button class="btn btn-sm" onclick="restoreMigratedActivity(\''+a.id+'\')">恢复为独立活动</button>'
+        :'<label class="switch" title="运行／停止" onclick="event.stopPropagation()"><input type="checkbox" '+(a.enabled?'checked':'')+' onchange="toggleActivity(\''+a.id+'\',this.checked)"><span class="slider"></span></label>'
+          +'<span class="act-switch-lbl">'+(a.enabled?'运行':'停止')+'</span>'
+          +'<button class="btn btn-sm" onclick="openActivityModal(\''+a.id+'\')">编辑详情</button>';
       return '<div class="rule-card">'
         +'<div class="act-head">'
         +'<div class="act-name">'+esc(a.name)+' <span class="badge">'+periodLabel(a.period)+'</span>'
+        +(migrated?'<span class="badge">已迁移</span>':'')
         +'<span style="font-size:10px;color:'+stateColor+'">'+stateTxt+'</span></div>'
-        +'<div class="act-ctrls">'
-        +'<label class="switch" title="运行／停止" onclick="event.stopPropagation()"><input type="checkbox" '+(a.enabled?'checked':'')+' onchange="toggleActivity(\''+a.id+'\',this.checked)"><span class="slider"></span></label>'
-        +'<span class="act-switch-lbl">'+(a.enabled?'运行':'停止')+'</span>'
-        +'<button class="btn btn-sm" onclick="openActivityModal(\''+a.id+'\')">编辑详情</button>'
+        +'<div class="act-ctrls">'+ctrls+'</div>'
         +'</div>'
-        +'</div>'
-        +'<div class="act-meta">'+actMetaLabel(a)+'</div>'
+        +'<div class="act-meta">'+actMetaLabel(a)+(migrated?' · 旧活动停用保留，可恢复':'')+'</div>'
         +'</div>';
     }).join('');
   }
 
   renderExemptPanel();
+  renderActivityMigration();
+}
+
+// ===== 周期活动 → 动作流迁移面板 =====
+function renderActivityMigration(){
+  const box=document.getElementById('activityMigrationPanel');
+  if(!box)return;
+  const plan=buildMigrationPlan();
+  const canCount=plan.candidates.length;
+  const blockCount=plan.blocked.length;
+  const doneCount=plan.migrated.length;
+  const head='<div class="act-head"><div class="act-name">从周期活动迁移 '
+    +'<span class="badge">可迁移 '+canCount+'</span> '
+    +'<span class="badge">需修复 '+blockCount+'</span> '
+    +'<span class="badge">已迁移 '+doneCount+'</span></div>'
+    +'<div class="act-ctrls">'
+    +'<button class="btn btn-sm btn-primary" onclick="migrateActivities()" '+(canCount?'':'disabled')+'>迁移全部可迁移活动</button>'
+    +'<button class="btn btn-sm" onclick="undoActivityMigration()" '+(doneCount?'':'disabled')+'>撤销本次迁移</button>'
+    +'</div></div>';
+  const note='<div class="sec-note">迁移只把可等价的奖励与归档编译成动作流；迁移出的流默认停用、简易模式，旧活动停用保留、可恢复。仅迁移后的运行可撤销。</div>';
+  const cand=canCount?('<div class="sec-note">可迁移：</div>'+plan.candidates.map(c=>{
+    const st=(c.flow.steps||[]).length;
+    const warn=(c.warnings||[]).map(w=>'<div class="sec-note" style="color:var(--text-2)">· '+esc(w)+'</div>').join('');
+    return '<div class="act-meta">· '+esc(c.activity.name)+' → '+st+' 步'+(c.warnings&&c.warnings.length?'（含 '+c.warnings.length+' 条提示）':'')+'</div>'+warn;
+  }).join('')):'';
+  const blocked=blockCount?('<div class="sec-note">未迁移（原因）：</div>'+plan.blocked.map(b=>{
+    return '<div class="act-meta">· '+esc(b.name||b.id)+'</div>'
+      +(b.reasons||[]).map(r=>'<div class="sec-note" style="color:var(--danger)">· '+esc(r)+'</div>').join('')
+      +(b.warnings||[]).map(w=>'<div class="sec-note" style="color:var(--text-2)">· '+esc(w)+'</div>').join('');
+  }).join('')):'';
+  const done=doneCount?('<div class="sec-note">已迁移（旧活动停用保留）：</div>'+plan.migrated.map(m=>{
+    return '<div class="act-meta">· '+esc(m.activity.name)+' → 动作流「'+esc(m.flow.name||m.flow.id)+'」'
+      +' <button class="btn btn-sm" onclick="restoreMigratedActivity(\''+m.activity.id+'\')">恢复</button></div>';
+  }).join('')):'';
+  box.innerHTML=head+note+cand+blocked+done;
+}
+export function migrateActivities(){
+  const plan=buildMigrationPlan();
+  if(!plan.candidates.length){toast('没有可迁移的周期活动','warn');return}
+  if(typeof confirm==='function'&&!confirm('将迁移 '+plan.candidates.length+' 个活动为动作流。\n旧活动会停用保留，迁移出的流默认停用、简易模式。继续？'))return;
+  const r=applyMigration();
+  commit('已迁移 '+(r.created||0)+' 个活动为动作流'+(r.blocked&&r.blocked.length?('，'+r.blocked.length+' 个需修复'):''));
+}
+export function undoActivityMigration(){
+  const r=undoMigration();
+  if(r.kept&&r.kept.length){
+    toast('已恢复 '+r.restored+' 个；'+r.kept.length+' 个流已有运行记录，保留不动','warn');
+    render();
+    return;
+  }
+  commit('已撤销本次迁移，恢复 '+r.restored+' 个活动');
+}
+export function restoreMigratedActivity(id){
+  const r=restoreActivity(id);
+  if(!r.ok){
+    if(r.code==='FLOW_HAS_RUNS')toast('对应动作流已有运行记录，无法恢复；可保留运行记录或删除该流','err');
+    else toast('恢复失败：'+(r.code||'未知原因'),'err');
+    return;
+  }
+  commit('活动已恢复为独立运行');
+}
+
+function readRewardItems(){
+  const rewardItems=[];
+  document.querySelectorAll('#activityResultDetails .reward-row').forEach(row=>{
+    const type=row.querySelector('.rr-type').value;
+    if(type==='archive'){
+      const entSel=row.querySelector('.rr-entity');
+      const idleInp=row.querySelector('.rr-idle');
+      rewardItems.push({
+        type:'archive',
+        entity:entSel?entSel.value:'task',
+        idleDays:Math.max(1,Math.round(Number(idleInp&&idleInp.value)||14))
+      });
+      return;
+    }
+    const amount=Math.max(0,Number(row.querySelector('.rr-amount').value)||0);
+    if(amount<=0&&type!=='card')return;
+    if(type==='card'){
+      rewardItems.push({type:'card',card:'exemption',amount:Math.round(amount),cap:Math.max(1,Math.round(Number(row.querySelector('.rr-cap').value)||3))});
+    }else if(type==='progress'){
+      const did=row.querySelector('.rr-domain').value;
+      const r={type:'progress',amount:amount};
+      if(did)r.domainId=did;
+      rewardItems.push(r);
+    }else if(type==='vitality'){
+      const tid=row.querySelector('.rr-task').value;
+      const r={type:'vitality',amount:amount};
+      if(tid)r.taskId=tid;
+      rewardItems.push(r);
+    }else if(type==='achievement'){
+      rewardItems.push({type:'achievement',amount:amount});
+    }
+  });
+  return rewardItems;
+}
+function updateCondPreview(){
+  const el=document.getElementById(condDraftUI.previewId||'condPreview');
+  if(!el)return;
+  // 预算规则条件：交给预算侧的自定义预览，不读取周期活动字段
+  if(condDraftUI.previewFn){condDraftUI.previewFn(el,condDraft);return;}
+  const periodSel=document.getElementById('activityPeriod');
+  if(!periodSel)return;
+  const items=condDraft.items||[];
+  const mode=condDraft.mode==='any'?'any':'all';
+  const period=periodSel.value;
+  const anchor=parseInt(document.getElementById('activityAnchor').value,10)||1;
+  const anchorNames=['','周一','周二','周三','周四','周五','周六','周日'];
+  const when=period==='day'?'每天结算时':period==='month'?'每月结算时':('每'+anchorNames[anchor]+'结算时');
+  const actLike={period:period};
+  let condTxt;
+  if(!items.length)condTxt='无条件触发';
+  else condTxt=items.map(n=>condNLNode(n,actLike)).join(mode==='any'?' 或 ':' 且 ');
+  const rewards=readRewardItems();
+  let resTxt=rewards.length?rewards.map(rewardItemLabel).join('、'):'（未设置动作）';
+  // 结构操作在配置时就给出当前命中数量：让用户确认“触发会发生什么”
+  const arch=rewards.filter(r=>r.type==='archive');
+  if(arch.length){
+    let hit=0;
+    arch.forEach(r=>{hit+=archiveIdleEntities(r.entity,r.idleDays,Date.now(),'',true);});
+    resTxt+='（按当前状态将归档 '+hit+' 个）';
+  }
+  el.innerHTML='<span class="cp-badge">预览</span>'+esc(when)+'，若 '+esc(condTxt)+'，则 '+esc(resTxt)+'。';
+}
+function openActivityModal(id){
+  const a=id?state.activities.find(x=>x.id===id):null;
+  document.getElementById('activityId').value=id||'';
+  document.getElementById('activityModalTitle').textContent=id?'编辑周期活动':'新建周期活动';
+  document.getElementById('activityName').value=a?a.name:'';
+  document.getElementById('activityPeriod').value=a?a.period:'week';
+  document.getElementById('activityAnchor').value=a?(a.anchor||1):1;
+  resetCondDraftUI();
+  setCondDraft(normalizeCondition((a&&a.condition)||{mode:'all',items:[]}));
+  document.getElementById('activityCondMode').value=(condDraft.mode==='any')?'any':'all';
+  document.getElementById('activityDeleteBtn').style.display=id?'':'none';
+  renderActivityResultDetails(a?a.result:null);
+  renderCondTree();
+  activityPeriodChanged();
+  // 折叠分区：基本信息展开，前提与奖励默认收起以保持简洁（标题栏显示摘要）
+  setAcc('accBasic',true);
+  setAcc('accCond',false);
+  setAcc('accResult',false);
+  updateActivitySummary();
+  openModal('activityModal');
+  setTimeout(()=>document.getElementById('activityName').focus(),50);
+}
+function activityPeriodChanged(){
+  const p=document.getElementById('activityPeriod').value;
+  document.getElementById('activityAnchorFg').style.display=(p==='week')?'':'none';
+  updateCondPreview();
+  updateActivitySummary();
+}
+function toggleAcc(id){const el=document.getElementById(id);if(el)el.classList.toggle('open');}
+function setAcc(id,open){const el=document.getElementById(id);if(el)el.classList.toggle('open',open);}
+function updateActivitySummary(){
+  const periodSel=document.getElementById('activityPeriod');
+  if(periodSel){
+    const p=periodSel.value;
+    const anchorNames=['','周一','周二','周三','周四','周五','周六','周日'];
+    const a=parseInt(document.getElementById('activityAnchor').value,10)||1;
+    const basicSum=document.getElementById('accBasicSum');
+    if(basicSum)basicSum.textContent=p==='week'?('每周 · '+anchorNames[a]):periodLabel(p);
+  }
+  const condMode=document.getElementById('activityCondMode');
+  const condSum=document.getElementById('accCondSum');
+  if(condSum){
+    const n=countCondLeaves(condDraft.items||[]);
+    const m=(condMode&&condMode.value==='any')?'任一':'全部';
+    condSum.textContent=n?((m==='任一'?'任一满足':'全部满足')+' · '+n+' 项'):'无条件';
+  }
+  const resBox=document.getElementById('activityResultDetails');
+  const resSum=document.getElementById('accResultSum');
+  if(resSum&&resBox){
+    const n=resBox.querySelectorAll('.reward-row').length;
+    resSum.textContent=n?(n+' 项动作'):'未设置';
+  }
 }
 
 export function setCondDraft(v){condDraft=v;}
 
-export { condDraft, condDraftUI, condPanel, countCondLeaves, condListAt, condNodeAt, condMetricChipText, condItemRow, condGroupInnerHTML, condGroupHTML, renderCondNodes, renderCondTree, setCondDraftContext, resetCondDraftUI, addCondItem, addCondGroup, removeCondNode, changeGroupMode, onCondModeChange, getCondPanelEl, positionCondPanel, renderCondPanel, openCondMetricPanel, openCondOpPanel, pickCondRange, confirmCondDays, pickCondMetric, pickCondTargetType, pickCondNewFilter, pickCondDomain, pickCondTask, pickCondMilestone, pickCondBudgetCat, pickCondAggregate, commitCondValue, commitCondOp, closeCondPanel, editCondValue, rewardRowHTML, renderActivityResultDetails, addRewardRow, removeRewardRow, rrTypeChanged, validateDomain, handleActivitySave, toggleActivity, pendingDeleteActivityId, askDelActivity, askDelActivityFromModal, doDeleteActivity, revokeActivityGrants, parseCardGrantAmt, renderExemptPanel, useExemptionFromSel, renderCycle };
+export { condDraft, condDraftUI, condPanel, countCondLeaves, condListAt, condNodeAt, condMetricChipText, condItemRow, condGroupInnerHTML, condGroupHTML, renderCondNodes, renderCondTree, setCondDraftContext, resetCondDraftUI, addCondItem, addCondGroup, removeCondNode, changeGroupMode, onCondModeChange, getCondPanelEl, positionCondPanel, renderCondPanel, openCondMetricPanel, openCondOpPanel, pickCondRange, confirmCondDays, pickCondMetric, pickCondTargetType, pickCondNewFilter, pickCondDomain, pickCondTask, pickCondMilestone, pickCondBudgetCat, pickCondAggregate, commitCondValue, commitCondOp, closeCondPanel, editCondValue, rewardRowHTML, renderActivityResultDetails, addRewardRow, removeRewardRow, rrTypeChanged, validateDomain, handleActivitySave, toggleActivity, pendingDeleteActivityId, askDelActivity, askDelActivityFromModal, doDeleteActivity, revokeActivityGrants, parseCardGrantAmt, renderExemptPanel, useExemptionFromSel, renderCycle, readRewardItems, updateCondPreview, openActivityModal, activityPeriodChanged, toggleAcc, setAcc, updateActivitySummary };
 
 registerRenderer('cycle', renderCycle);

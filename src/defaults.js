@@ -102,7 +102,9 @@ function newExtState(){
     features:{audit:true},
     // 阶段 4 运行层：资产周期计量与动作流运行记录（缺省空结构，懒安全）
     assetMeters:{v:ASSET_VERSION,byAsset:{},idem:{}},
-    flowRuns:{v:FLOW_VERSION,seq:0,byId:{},recent:[]}
+    flowRuns:{v:FLOW_VERSION,seq:0,byId:{},recent:[]},
+    // 阶段 5 事件触发：只做事件记录的数据结构，不参与任何执行
+    events:{v:1,recent:[]}
   };
 }
 function defaults(){

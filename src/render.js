@@ -2,6 +2,7 @@
 // 由 shell.js 抽离（第六轮循环依赖治理），调用顺序与原先逐字一致。
 const R = {};
 function registerRenderer(name, fn) { R[name] = fn; }
+function getRenderer(name) { return R[name] || null; }
 // 顺序即原 render() 的调用顺序，不可随意调整
 const ORDER = ['work', 'bank', 'shop', 'budget', 'cycle', 'exempt', 'stageBars', 'affairAxes', 'flow'];
 function render() {
@@ -10,4 +11,4 @@ function render() {
     if (f) f();
   }
 }
-export { registerRenderer, render };
+export { registerRenderer, render, getRenderer };

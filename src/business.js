@@ -1,10 +1,9 @@
-import { exemptionActivity } from './conditions.js';
 import { noteCheckinActivity } from './gate.js';
 import { BudgetEngine } from './budget.js';
 import { budgetOf, budgetRefOf, openBudgetAmountDialog, rememberBudgetDraft, resolveActionBudget } from './budget-binding.js';
 import { runCommand } from './command.js';
 import { Ledger } from './ledger.js';
-import { processDailyTaskDebts, processLoansWithDecayReserve } from './library.js';
+import { processDailyTaskDebts, processLoansWithDecayReserve } from './debt.js';
 import { save } from './persist.js';
 import { stageCellLabel, stageNetAt, stageSel, taskIsStaged, effectiveLastTs, fmt, getTaskDomainIds, now, taskCheckedToday, taskScoreTypes, uid, calcCheckIn } from './pure.js';
 import { render } from './render.js';
@@ -158,39 +157,69 @@ function checkIn(taskId,stageIdx,resolved){
     // 先跑各处理器（不各自写盘），最后统一保存一次
     processDailyTaskDebts(true);
     processLoansWithDecayReserve();
-    return {preToasts:preToasts,toast:{msg:toastMsg}};
+    // 事件只在事务提交后由命令层派发；这里仅描述“打卡发生”这一事实
+    return {preToasts:preToasts,toast:{msg:toastMsg},events:[{
+      kind:'checkin',
+      sourceId:checkinLogId,
+      occurredAt:txNow,
+      payload:{
+        taskId:t.id,streak:c.newStreak,cost:cost,logId:checkinLogId,
+        budgetEntryId:(budgetRef&&(budgetRef.entryId||budgetRef.id))||''
+      }
+    }]};
     }
   });
 }
 
-function useExemption(taskId){
+// 豁免内核：登记字段 + 可见流水；是否扣卡 / 是否联动债务结算由调用方决定。
+// 动作流 task.exempt 以 consumeCard:false 调用（扣卡由同一事务里的 asset.spend 完成），
+// 旧入口 useExemption 以 consumeCard:true 调用，保持历史账目与撤销适配器不变。
+function exemptTaskCore(taskId,opts){
+  opts=opts||{};
   const t=state.tasks.find(x=>x.id===taskId);
-  if(!t)return;
-  const cfg=exemptionActivity();
-  if(!cfg||!cfg.enabled){toast('断更豁免卡活动已停用','err');return;}
-  if((state.cards.exemption||0)<=0){toast('没有可用豁免卡','err');return;}
-  const todayStart=dayStart(now());
+  const ts=Number.isFinite(Number(opts.ts))?Number(opts.ts):now();
+  if(!t)return {ok:false,code:'FLOW_TASK_UNKNOWN',reason:'任务不存在'};
+  if(t.archived)return {ok:false,code:'FLOW_TASK_ARCHIVED',reason:'任务已归档'};
+  const todayStart=dayStart(ts);
+  if(t.lastCheckIn&&t.lastCheckIn>=todayStart)return {ok:false,code:'FLOW_TASK_CHECKED',reason:'今日已打卡，无需豁免'};
+  if(t.lastExempt&&t.lastExempt>=todayStart)return {ok:false,code:'FLOW_TASK_EXEMPTED',reason:'今日已豁免'};
+  if(opts.consumeCard!==false&&(state.cards.exemption||0)<=0){
+    return {ok:false,code:'FLOW_INSUFFICIENT',reason:'没有可用豁免卡'};
+  }
   const lastEff=effectiveLastTs(t);
   const gapDays=dayDiff(todayStart,lastEff);
-  // Already checked in today?
-  if(t.lastCheckIn&&t.lastCheckIn>=todayStart){toast('今日已打卡，无需豁免','warn');return;}
-  // Already exempted today?
-  if(t.lastExempt&&t.lastExempt>=todayStart){toast('今日已豁免','warn');return;}
-
+  const wasBroken=gapDays>=2;
   const prevLastExempt=t.lastExempt||null;
   const prevPendingDebt=t.pendingDebt||0;
   const prevLastDebtDate=t.lastDebtDate||null;
-  const wasBroken=gapDays>=2;
 
-  Ledger.post({op:'spend',account:'card:exemption',delta:-1,visible:false,reason:{src:'exempt-use'}});
+  if(opts.consumeCard!==false){
+    Ledger.post({op:'spend',account:'card:exemption',delta:-1,visible:false,reason:{src:'exempt-use'}});
+  }
   t.lastExempt=addDays(todayStart,1)-1000; // end of today
   t.pendingDebt=0;
   delete t.lastDebtDate;
+  const desc=opts.desc||('「'+t.name+'」使用断更豁免卡'+(wasBroken?'（补救）':'（请假）'));
+  const entry=Ledger.event(desc,opts.src||'exempt',{
+    taskId:t.id,prevLastExempt:prevLastExempt,prevPendingDebt:prevPendingDebt,prevLastDebtDate:prevLastDebtDate,
+  });
+  // 动作流不需要全局债务联动：本步骤只改目标任务的待扣债，整单撤销范围才可控
+  if(opts.processDebts!==false)processDailyTaskDebts(true);
+  return {
+    ok:true,taskId:t.id,entryId:(entry&&entry.id)||null,
+    prevLastExempt:prevLastExempt,prevPendingDebt:prevPendingDebt,prevLastDebtDate:prevLastDebtDate,
+    wasBroken:wasBroken,gapDays:gapDays,
+  };
+}
 
-  Ledger.event('「'+t.name+'」使用断更豁免卡'+(wasBroken?'（补救）':'（请假）'),'exempt',{taskId:t.id,prevLastExempt:prevLastExempt,prevPendingDebt:prevPendingDebt,prevLastDebtDate:prevLastDebtDate});
-  processDailyTaskDebts(true);
+function useExemption(taskId){
+  const r=exemptTaskCore(taskId,{consumeCard:true});
+  if(!r.ok){
+    toast(r.reason,r.code==='FLOW_TASK_CHECKED'||r.code==='FLOW_TASK_EXEMPTED'?'warn':'err');
+    return;
+  }
   save();
-  toast('已使用断更豁免卡'+(wasBroken?'，待扣债已清零':''));
+  toast('已使用断更豁免卡'+(r.wasBroken?'，待扣债已清零':''));
   render();
 }
 
@@ -213,4 +242,4 @@ function checkAchievements(domId,opts){
   return unlocked;
 }
 
-export { checkIn, useExemption, checkAchievements };
+export { checkIn, useExemption, exemptTaskCore, checkAchievements };

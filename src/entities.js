@@ -2,11 +2,12 @@ import { affairActive, evalCondition } from './cond-eval.js';
 import { idleDaysSince, dayKey, periodKey, cardName, affairLastAdvance, effectiveLastTs, fmt, now } from './pure.js';
 import { BudgetEngine } from './budget.js';
 import { checkAchievements } from './business.js';
-import { FlowEngine } from './flow-engine.js';
+import { processDueFlows } from './flow-scheduler.js';
 import { Ledger } from './ledger.js';
-import { ensureMetabolismRule, processDailyTaskDebts, processLoansWithDecayReserve } from './library.js';
+import { processDailyTaskDebts, processLoansWithDecayReserve } from './debt.js';
+import { ensureMetabolismRule } from './metabolism.js';
 import { save, scheduleRender } from './persist.js';
-import { processChoreDecay } from './render-work.js';
+import { processChoreDecay } from './chore-core.js';
 import { state } from './state.js';
 import { domainName } from './utils.js';
 // entities.js —— 阶段 1 指标与结构操作（不活跃归档）
@@ -239,7 +240,7 @@ function schedulerTick(){
   // 统一以 silent 模式执行各处理器，最后只写盘一次
   processActivities(true);
   // 动作流与周期活动同位置求值；条件不成立时由引擎自行保持 lastRun 不变
-  FlowEngine.processDue(undefined, true);
+  processDueFlows(undefined, true);
   processDailyTaskDebts(true);
   processLoansWithDecayReserve();
   processChoreDecay(true);

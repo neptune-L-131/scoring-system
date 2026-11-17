@@ -5,8 +5,11 @@ import { ACTIVITY_MAX_DAYS, ASSET_VERSION, AUDIT_MAX, BUDGET_LEDGER_MAX, BUDGET_
 import { defaultAssetDefs, defaultBudgetsState, defaultChoreConfig, defaultProductGate, migrateChore, normalizeChoreConfig, tierCurrency, defaultActivities, defaults } from './defaults.js';
 import { budgetBounds, dayKey, periodKey, migrateAffair, esc, now, uid, validRange, normOp, toNum, toTs, asArray, dateKeyOffset, round2 } from './pure.js';
 import { emptyAccountSums } from './stats.js';
+import { normalizeEventStore, EVENT_KINDS } from './events.js';
 import { totalProgress } from './utils.js';
-// normalize.js —— 存档结构归一、迁移、解析（loadIssue / _persistBlocked 归此处）
+import { _persistBlocked, setPersistBlocked } from './persist-state.js';
+export { _persistBlocked, setPersistBlocked };
+
 // 由 app.js 按功能拆分（第五轮可维护性重构），行为不变。
 
 // 点态指标：不按时间窗口累计，取“此刻”的实体状态（任务/项目的最近活跃、杂事超期件数等）
@@ -45,7 +48,12 @@ function normalizeActivity(a){
     period:a.period||'week',anchor:a.anchor||1,
     condition:normalizeCondition(a.condition),
     result:normalizeResult(a.result),
-    lastRun:a.lastRun||null
+    lastRun:a.lastRun||null,
+    // 迁移标记：活动停用保留后仍能定位生成的流，刷新/编辑不丢
+    migratedToFlowId:(typeof a.migratedToFlowId==='string')?a.migratedToFlowId:'',
+    migratedAt:toTs(a.migratedAt)||0,
+    // 迁移前的启停状态：撤销/恢复时回到用户原本的设置，不擅自启用原本停用的活动
+    migratedWasEnabled:a.migratedWasEnabled!==false
   };
 }
 function migrateActivities(p){
@@ -56,7 +64,7 @@ function migrateActivities(p){
 // v1 为原点：新装/归一后的存档均带 schema.ext；MIGRATIONS 表留给后续版本使用。
 let loadIssue=null;
 // 读档未成功（超时 / 读取失败）时暂停写盘：避免用空白默认库覆盖真实存档
-let _persistBlocked=false;
+// 标记与 setter 已抽到 persist-state.js，persist 直接读取，避免 normalize↔persist 循环依赖
 // 尽力修复被截断/轻微损坏的 JSON（常见于 IndexedDB 写入中断）
 function salvageJSON(raw){
   if(!raw||typeof raw!=='string')return null;
@@ -145,6 +153,11 @@ function normalizeProduct(p,ctx){
   if(PROD_TIERS.indexOf(p.tier)<0)p.tier='daily';
   p.gate=normalizeProductGate(p.gate,ctx);
   p.budget=normalizeProductBudget(p.budget,ctx);
+  // 资产定价与赠送：老商品缺省为 null / []，行为不变
+  p.assetPrice=normalizeAssetPrice(p.assetPrice);
+  p.grants=normalizeProductGrants(p.grants);
+  // 资产定价商品禁用现实预算联动，避免“资产 + 现实”双重记账
+  if(p.assetPrice)p.budget={categoryId:'',amount:0};
   // 支付币种由层级决定：日常级活力点，品质/专属级成果点
   p.currency=tierCurrency(p.tier);
   return p;
@@ -249,6 +262,17 @@ function normalizeCards(c){
 // state.cards 仍是「资产 ID → 余额」的扁平表；定义、配置、运行计量各放一层。
 const ASSET_ID_RE=/^[a-z][a-z0-9_]{2,31}$/;
 function isValidAssetId(id){return typeof id==='string'&&ASSET_ID_RE.test(id);}
+// 资产「使用配方」：只保留可识别的类型，其余字段一律丢弃，避免存档注入
+const ASSET_USE_TYPES=['task-exempt'];
+function normalizeUseRecipe(r){
+  if(!r||typeof r!=='object'||Array.isArray(r))return null;
+  if(ASSET_USE_TYPES.indexOf(r.type)<0)return null;
+  return{
+    v:1,
+    type:r.type,
+    cost:Math.max(1,Math.min(10,Math.round(toNum(r.cost,1)))),
+  };
+}
 function normalizeAssetDef(d){
   if(!d||typeof d!=='object'||Array.isArray(d))return null;
   const id=String(d.id||'');
@@ -272,6 +296,7 @@ function normalizeAssetDef(d){
     enabled:d.enabled!==false&&isValidAssetId(id),
     archived:!!d.archived,
     origin:origin,
+    useRecipe:normalizeUseRecipe(d.useRecipe),
     createdAt:toTs(d.createdAt)||0,
     updatedAt:toTs(d.updatedAt)||0
   };
@@ -286,10 +311,14 @@ function normalizeAssetDefs(list,cards){
     out.push(n);
   });
   // 内置豁免卡必须存在，且语义字段（名称/上限/来源）不允许被存档改写
+  // 使用配方是用户配置项，允许对内置资产开启/关闭，归一化时从存档保留
   const builtin=normalizeAssetDef(defaultAssetDefs()[0]);
   const bi=out.findIndex(function(d){return d.id==='exemption';});
   if(bi<0)out.unshift(builtin);
-  else out[bi]=builtin;
+  else{
+    builtin.useRecipe=out[bi].useRecipe;
+    out[bi]=builtin;
+  }
   seen.add('exemption');
   // v3 → v4 最小迁移：旧 cards 里没有定义的自定义卡键，直接按 id + 当前余额补定义
   if(cards&&typeof cards==='object'&&!Array.isArray(cards)){
@@ -321,28 +350,41 @@ function normalizeFlowLimits(l){
     maxAssetSpendPerRun:Math.min(20,Math.max(0,Math.round(toNum(l.maxAssetSpendPerRun,d.maxAssetSpendPerRun))))
   };
 }
-function normalizeFlow(f){
+export function normalizeFlow(f){
   if(!f||typeof f!=='object'||Array.isArray(f))return null;
   const t=(f.trigger&&typeof f.trigger==='object'&&!Array.isArray(f.trigger))?f.trigger:{};
   const v=Math.max(1,Math.round(toNum(f.v,FLOW_VERSION)));
   // 高于当前流版本的定义保留但禁用：不静默删除用户配置，执行器（后续阶段）拒绝编译
   const overVersion=v>FLOW_VERSION;
+  // 事件触发（第二步起接通）：保留类型与事件键，启用状态沿用用户配置
+  const eventKind=(t.type==='event'&&t.event&&EVENT_KINDS.indexOf(t.event.kind)>=0)?t.event.kind:'';
   return{
     v:v,
     id:String(f.id||uid()),
     name:String(f.name||'未命名动作流').slice(0,40),
     enabled:f.enabled!==false&&!overVersion,
     invalid:overVersion||f.invalid===true,
-    trigger:{
+    trigger:eventKind?{type:'event',event:{kind:eventKind},period:'week',anchor:1}:{
       type:(t.type==='manual')?'manual':'period',
       period:(t.period==='day'||t.period==='month')?t.period:'week',
       anchor:Math.min(7,Math.max(1,Math.round(toNum(t.anchor,1))))
     },
     condition:normalizeCondition(f.condition),
+    // 迁移/每周期一次：默认关闭，旧流行为不变
+    settleWhenConditionFalse:f.settleWhenConditionFalse===true,
+    // 迁移出的流默认简易模式；普通流保持高级编辑器
+    editorMode:f.editorMode==='simple'?'simple':'advanced',
+    migratedFromActivity:(typeof f.migratedFromActivity==='string')?f.migratedFromActivity:'',
     limits:normalizeFlowLimits(f.limits),
+    // 运行输入：只允许任务 id 类型，最多 3 个；资产使用配方在运行时注入
+    inputs:asArray(f.inputs).filter(function(x){
+      return x&&typeof x==='object'&&x.type==='task'&&typeof x.name==='string'&&/^[a-z][a-z0-9_]{0,15}$/.test(x.name);
+    }).slice(0,3).map(function(x){return {name:x.name,type:'task'};}),
     // 步骤在 S4 编译期再逐项校验；这里只保证是对象数组，避免归一化吞掉用户配置
     steps:asArray(f.steps).filter(function(s){return s&&typeof s==='object'&&!Array.isArray(s);}),
     lastRun:f.lastRun||null,
+    // 事件触发幂等位：最近一次已派发的事件键（打卡/购买提交后写入，跨刷新不重放）
+    lastEventKey:(typeof f.lastEventKey==='string')?f.lastEventKey:'',
     createdAt:toTs(f.createdAt)||0,
     updatedAt:toTs(f.updatedAt)||0
   };
@@ -406,7 +448,7 @@ function normalizeFlowRunJournal(j){
   return{
     v:1,
     runKey:String(j.runKey||''),
-    trigger:j.trigger==='manual'?'manual':'period',
+    trigger:(j.trigger==='manual'||j.trigger==='event')?j.trigger:'period',
     periodKey:String(j.periodKey||''),
     startedAt:toTs(j.startedAt),
     finishedAt:toTs(j.finishedAt),
@@ -437,7 +479,7 @@ function normalizeFlowRunRecord(r){
     flowId:String(r.flowId||''),
     flowName:String(r.flowName||'').slice(0,40),
     runKey:String(r.runKey||''),
-    trigger:r.trigger==='manual'?'manual':'period',
+    trigger:(r.trigger==='manual'||r.trigger==='event')?r.trigger:'period',
     periodKey:String(r.periodKey||''),
     startedAt:toTs(r.startedAt),
     finishedAt:toTs(r.finishedAt),
@@ -653,6 +695,34 @@ function normalizeProductBudget(b,ctx){
   const ok=(!ctx||!ctx.catIds||ctx.catIds.has(catId));
   return{categoryId:ok?catId:'',amount:ok?Math.max(0,toNum(b.amount,0)):0};
 }
+// 资产定价：消耗自定义资产购买；有资产定价的商品禁用贷款与现实预算
+const PRODUCT_ASSET_PRICE_MAX=999;
+function normalizeAssetPrice(raw){
+  if(!raw||typeof raw!=='object'||Array.isArray(raw))return null;
+  const assetId=typeof raw.assetId==='string'?raw.assetId:'';
+  const amount=Math.round(toNum(raw.amount));
+  if(!isValidAssetId(assetId)||amount<=0)return null;
+  return{assetId:assetId,amount:Math.min(PRODUCT_ASSET_PRICE_MAX,amount)};
+}
+const PRODUCT_GRANT_CURRENCIES=['vitality','achievement'];
+// 购买赠送：最多 3 条，资产/货币两种；金额必须为正有限数
+function normalizeProductGrants(list){
+  const out=[];
+  asArray(list).slice(0,3).forEach(function(g){
+    if(!g||typeof g!=='object'||Array.isArray(g))return;
+    const amount=toNum(g.amount);
+    if(!(amount>0)||!isFinite(amount))return;
+    if(g.kind==='asset'&&typeof g.assetId==='string'&&isValidAssetId(g.assetId)){
+      const n=Math.round(amount);
+      if(n>0)out.push({kind:'asset',assetId:g.assetId,amount:Math.min(999,n)});
+      return;
+    }
+    if(g.kind==='currency'&&PRODUCT_GRANT_CURRENCIES.indexOf(g.account)>=0){
+      out.push({kind:'currency',account:g.account,amount:round2(amount)});
+    }
+  });
+  return out;
+}
 function normalizeExt(x,ctx){
   x=x&&typeof x==='object'?x:{};
   const s=x.stats&&typeof x.stats==='object'?x.stats:{};
@@ -692,7 +762,9 @@ function normalizeExt(x,ctx){
     features:{audit:(x.features&&x.features.audit!==false)},
     // 阶段 4 运行层：缺省即空结构，旧存档读入后行为不变
     assetMeters:normalizeAssetMeters(x.assetMeters),
-    flowRuns:normalizeFlowRuns(x.flowRuns)
+    flowRuns:normalizeFlowRuns(x.flowRuns),
+    // 阶段 5 事件触发：只持久化事件记录（数据结构），不参与任何执行
+    events:normalizeEventStore(x.events)
   };
   const pr=wm.progress&&typeof wm.progress==='object'?wm.progress:{};
   Object.keys(pr).forEach(function(k){out.watermarks.progress[k]=normalizeWatermark(pr[k]);});
@@ -700,6 +772,18 @@ function normalizeExt(x,ctx){
 }
 // 只接受当前 schema：低版本存档不再逐版本迁移，统一交给 normalizeXxx 的形状守卫补默认值；
 // 高于当前版本视为不可信（可能来自更新版本）：拒载并暂停写盘，绝不用旧结构覆盖原存档。
+function normalizeMigrations(raw){
+  const out={activityToFlow:{v:1,at:0,map:{}}};
+  const a=(raw&&typeof raw==='object'&&!Array.isArray(raw))?raw.activityToFlow:null;
+  if(!a||typeof a!=='object'||Array.isArray(a))return out;
+  out.activityToFlow.v=Math.max(1,Math.round(toNum(a.v,1)));
+  out.activityToFlow.at=toTs(a.at)||0;
+  const map=(a.map&&typeof a.map==='object'&&!Array.isArray(a.map))?a.map:{};
+  Object.keys(map).forEach(function(k){
+    if(typeof map[k]==='string'&&map[k])out.activityToFlow.map[k]=map[k];
+  });
+  return out;
+}
 function applyMigrations(p){
   const from=(p.schema&&typeof p.schema.v==='number')?p.schema.v:0;
   if(from>SCHEMA_VERSION){
@@ -707,7 +791,9 @@ function applyMigrations(p){
     setPersistBlocked(true);
     return false;
   }
-  p.schema={v:SCHEMA_VERSION,migratedAt:now()};
+  // schema 重建前先保留迁移标记，否则每次读档都会丢失「活动 → 流」映射
+  const migrations=p.schema&&p.schema.migrations;
+  p.schema={v:SCHEMA_VERSION,migratedAt:now(),migrations:migrations};
   return true;
 }
 function parseState(raw){
@@ -760,7 +846,7 @@ function parseState(raw){
     const cards=normalizeCards(p.cards);
     const assetDefs=normalizeAssetDefs(p.assetDefs,cards);
     return{
-      schema:{v:SCHEMA_VERSION,migratedAt:toTs(p.schema&&p.schema.migratedAt)},
+      schema:{v:SCHEMA_VERSION,migratedAt:toTs(p.schema&&p.schema.migratedAt),migrations:normalizeMigrations(p.schema&&p.schema.migrations)},
       scores:normalizeScores(p.scores),
       domains:domains,
       collections:collections,
@@ -793,7 +879,6 @@ function parseState(raw){
   }catch(e){loadIssue={type:'corrupt'};return defaults();}
 }
 
-export function setPersistBlocked(v){_persistBlocked=!!v;}
 export function setLoadIssue(v){loadIssue=v;}
 
-export { normalizeRewardItem, normalizeResult, normalizeActivity, migrateActivities, loadIssue, _persistBlocked, salvageJSON, normalizeScores, normalizeTaskNums, normalizeAchNums, normalizeProdNums, normalizeProductGate, normalizeProduct, normalizeActivityIndex, normalizeStatsDaily, normalizeAccountSums, normalizeAchievementCounted, normalizePresetNums, normalizeLoanNums, normalizeLogNums, normalizeCards, isValidAssetId, normalizeAssetDef, normalizeAssetDefs, normalizeFlow, normalizeFlows, normalizeAssetMeters, normalizeFlowRunRecord, normalizeFlowRuns, normalizeWatermark, normalizeBudgetSettings, normalizeBudgetRule, normalizeBudgetCategory, normalizeBudgetPeriod, normalizeBudgetLedgerEntry, normalizeBudgets, normalizeProductBudget, normalizeExt, applyMigrations, parseState };
+export { normalizeRewardItem, normalizeResult, normalizeActivity, migrateActivities, loadIssue, salvageJSON, normalizeScores, normalizeTaskNums, normalizeAchNums, normalizeProdNums, normalizeProductGate, normalizeProduct, normalizeActivityIndex, normalizeStatsDaily, normalizeAccountSums, normalizeAchievementCounted, normalizePresetNums, normalizeLoanNums, normalizeLogNums, normalizeCards, isValidAssetId, normalizeAssetDef, normalizeAssetDefs, normalizeUseRecipe, normalizeFlows, normalizeAssetMeters, normalizeFlowRunRecord, normalizeFlowRuns, normalizeWatermark, normalizeBudgetSettings, normalizeBudgetRule, normalizeBudgetCategory, normalizeBudgetPeriod, normalizeBudgetLedgerEntry, normalizeBudgets, normalizeProductBudget, normalizeAssetPrice, normalizeProductGrants, normalizeExt, applyMigrations, parseState };

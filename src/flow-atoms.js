@@ -10,7 +10,7 @@ import {
   FLOW_ATOM_IDLE_DAYS_MAX, FLOW_ATOM_MAX_ARCHIVE, FLOW_ATOM_MAX_ASSET,
   FLOW_ATOM_MAX_CURRENCY, FLOW_ATOM_MAX_NOTES, FLOW_ATOM_NOTE_MAX_LEN, FLOW_MAX_STEPS,
 } from './constants.js';
-import { checkAchievements } from './business.js';
+import { checkAchievements, exemptTaskCore } from './business.js';
 import { archiveIdleEntities, assetGrantCore } from './entities.js';
 import { Ledger } from './ledger.js';
 import { state } from './state.js';
@@ -144,19 +144,40 @@ function assetMeter(assetId, pk) {
 
 // ===== A. currency.grant =====
 function currencyGrant(ctx, params) {
-  const acct = resolveAccount(params.account);
   const amount = currencyAmount(params.amount);
   const limits = limitsOf(ctx);
   const totals = totalsOf(ctx);
   if (totals.granted + amount > limits.maxGrantPerRun) {
     fail('FLOW_RUN_LIMIT', { kind: 'grant', used: totals.granted, amount: amount, max: limits.maxGrantPerRun });
   }
+  // 迁移专用：进度未指定领域时按当前全部领域均分（复刻周期活动语义）
+  if (params.split === 'allDomains') {
+    if (params.account !== 'progress') fail('FLOW_BAD_PARAMS', { field: 'split' });
+    const dids = (state.domains || []).map(d => d && d.id).filter(Boolean);
+    if (!dids.length) fail('FLOW_INVALID_ACCOUNT', { account: 'progress' });
+    const desc = descOf(params, '动作流发放 进度（全部领域均分）');
+    const r = Ledger.postSplits({
+      splits: [{ domainIds: dids, delta: amount }],
+      entry: {
+        st: 'progress', amt: amount, desc: desc, src: 'flow-currency-grant', dom: '',
+        flowRunId: ctx.runId || '', stepId: ctx.stepId || '',
+      },
+      reason: { src: 'flow-currency-grant', desc: desc },
+    });
+    totals.granted += amount;
+    return { ok: true, amount: amount, entryId: (r && r.entryId) || null, split: true };
+  }
+  if (params.split !== undefined) fail('FLOW_BAD_PARAMS', { field: 'split' });
+  const acct = resolveAccount(params.account);
+  if (params.taskId !== undefined && acct.st !== 'vitality') fail('FLOW_BAD_PARAMS', { field: 'taskId' });
   const st = acct.st;
   const dom = acct.dom;
   const desc = descOf(params, '动作流发放 ' + params.account);
+  const entry = { st: st, amt: amount, desc: desc, src: 'flow-currency-grant', dom: dom, flowRunId: ctx.runId || '', stepId: ctx.stepId || '' };
+  if (typeof params.taskId === 'string' && params.taskId) entry.taskId = params.taskId;
   const r = Ledger.post({
     op: 'grant', account: params.account, delta: amount, idemKey: idemOf(ctx),
-    entry: { st: st, amt: amount, desc: desc, src: 'flow-currency-grant', dom: dom, flowRunId: ctx.runId || '', stepId: ctx.stepId || '' },
+    entry: entry,
     reason: { src: 'flow-currency-grant', desc: desc, dom: dom },
   });
   totals.granted += amount;
@@ -192,9 +213,13 @@ function assetGrant(ctx, params) {
   const def = findAsset(assetId);
   ensureAssetUsable(def);
   const amount = assetAmount(params.amount);
-  // 单步上限 = min(10, 资产周期上限)；余额硬顶由 assetGrantCore 严格判定（不裁剪）
+  // 迁移专用 cap：复刻周期活动「按上限静默裁剪、到顶本次发放 0 但步骤成功」
+  const hasCap = params.cap !== undefined && params.cap !== null && String(params.cap).trim() !== '';
+  const cap = hasCap ? Math.round(Number(params.cap)) : null;
+  if (hasCap && (!isFinite(cap) || cap < 1)) fail('FLOW_BAD_PARAMS', { field: 'cap' });
+  // 单步上限 = min(10, 资产周期上限)；带 cap 时不再受资产周期上限压缩（与活动一致）
   const periodMax = (def.maxIssuedPerPeriod === null || def.maxIssuedPerPeriod === undefined) ? null : Number(def.maxIssuedPerPeriod);
-  const stepMax = Math.min(FLOW_ATOM_MAX_ASSET, periodMax === null ? FLOW_ATOM_MAX_ASSET : periodMax);
+  const stepMax = hasCap ? FLOW_ATOM_MAX_ASSET : Math.min(FLOW_ATOM_MAX_ASSET, periodMax === null ? FLOW_ATOM_MAX_ASSET : periodMax);
   if (amount > stepMax) fail('FLOW_AMOUNT_LIMIT', { assetId: assetId, amount: amount, max: stepMax });
   const limits = limitsOf(ctx);
   const totals = totalsOf(ctx);
@@ -203,19 +228,32 @@ function assetGrant(ctx, params) {
   }
   const pk = assetPeriodKey(def, ctx.ts);
   const meter = assetMeter(assetId, pk);
-  if (periodMax !== null && meter.issued + amount > periodMax) {
+  if (!hasCap && periodMax !== null && meter.issued + amount > periodMax) {
     fail('FLOW_ASSET_PERIOD_CAP', { assetId: assetId, periodKey: pk, issued: meter.issued, amount: amount, max: periodMax });
   }
   const desc = descOf(params, '动作流发放 ' + assetId);
-  const plan = assetGrantCore({
-    mode: 'flow', assetId: assetId, amount: amount, maxBalance: def.maxBalance,
-    entry: granted => ({
-      st: 'card', amt: granted, desc: desc, src: 'flow-asset-grant', dom: '',
-      card: assetId, flowRunId: ctx.runId || '', stepId: ctx.stepId || '', granted: granted,
-    }),
-    reason: { src: 'flow-asset-grant', desc: desc },
-  });
+  const plan = hasCap
+    ? assetGrantCore({
+      mode: 'activity', assetId: assetId, amount: amount, cap: cap,
+      entry: granted => ({
+        st: 'card', amt: granted, desc: desc, src: 'flow-asset-grant', dom: '',
+        card: assetId, flowRunId: ctx.runId || '', stepId: ctx.stepId || '', granted: granted,
+      }),
+      reason: { src: 'flow-asset-grant', desc: desc },
+    })
+    : assetGrantCore({
+      mode: 'flow', assetId: assetId, amount: amount, maxBalance: def.maxBalance,
+      entry: granted => ({
+        st: 'card', amt: granted, desc: desc, src: 'flow-asset-grant', dom: '',
+        card: assetId, flowRunId: ctx.runId || '', stepId: ctx.stepId || '', granted: granted,
+      }),
+      reason: { src: 'flow-asset-grant', desc: desc },
+    });
   if (!plan.ok) {
+    if (hasCap && plan.code === 'CARD_AT_CAP') {
+      // 已达上限：不写流水、不计计量，步骤仍成功
+      return { ok: true, granted: 0, amount: 0, skipped: true, entryId: null };
+    }
     if (plan.code === 'FLOW_ASSET_CAP') {
       fail('FLOW_ASSET_CAP', { assetId: assetId, before: plan.before, amount: amount, maxBalance: def.maxBalance });
     }
@@ -303,18 +341,38 @@ function recheckAchievements(ctx, params) {
   return { ok: true, count: ids.length, entryIds: ids };
 }
 
+// ===== H. task.exempt =====
+// 任务豁免：只登记任务字段与可见流水，不扣卡；扣卡由同一运行里的 asset.spend 完成。
+// 这样“消耗什么资产”由资产使用配方声明，豁免本身不再绑死某个活动配置。
+function taskExempt(ctx, params) {
+  const taskId = params.taskId;
+  if (typeof taskId !== 'string' || !taskId) fail('FLOW_BAD_PARAMS', { field: 'taskId' });
+  const ts = (ctx.ts === undefined || ctx.ts === null) ? Date.now() : (Number(ctx.ts) || 0);
+  const label = descOf(params, ctx.flowName || '动作流豁免');
+  const r = exemptTaskCore(taskId, {
+    ts: ts, consumeCard: false, processDebts: false, src: 'flow-task-exempt', desc: label,
+  });
+  if (!r.ok) fail(r.code || 'FLOW_TASK_EXEMPT', { taskId: taskId, reason: r.reason });
+  return {
+    ok: true, taskId: taskId, entryId: r.entryId, wasBroken: r.wasBroken,
+    prevLastExempt: r.prevLastExempt, prevPendingDebt: r.prevPendingDebt,
+    prevLastDebtDate: r.prevLastDebtDate,
+  };
+}
+
 const FLOW_ATOMS = {
   'currency.grant': {
-    id: 'currency.grant', params: ['account', 'amount', 'desc'], run: currencyGrant,
-    describe: p => '发放 ' + p.amount + ' 到 ' + p.account,
+    id: 'currency.grant', params: ['account', 'amount', 'desc', 'taskId', 'split'], run: currencyGrant,
+    describe: p => '发放 ' + p.amount + ' 到 ' + (p.split === 'allDomains' ? '全部领域均分' : p.account),
   },
   'currency.spend': {
     id: 'currency.spend', params: ['account', 'amount', 'desc'], run: currencySpend,
     describe: p => '从 ' + p.account + ' 扣除 ' + p.amount,
   },
   'asset.grant': {
-    id: 'asset.grant', params: ['assetId', 'amount', 'desc'], run: assetGrant,
-    describe: p => '发放资产 ' + p.assetId + ' ×' + p.amount,
+    id: 'asset.grant', params: ['assetId', 'amount', 'desc', 'cap'], run: assetGrant,
+    describe: p => '发放资产 ' + p.assetId + ' ×' + p.amount +
+      (p.cap !== undefined && p.cap !== null && p.cap !== '' ? '（上限 ' + p.cap + '）' : ''),
   },
   'asset.spend': {
     id: 'asset.spend', params: ['assetId', 'amount', 'desc'], run: assetSpend,
@@ -331,6 +389,10 @@ const FLOW_ATOMS = {
   'engine.recheckAchievements': {
     id: 'engine.recheckAchievements', params: [], run: recheckAchievements,
     describe: () => '复核成就解锁',
+  },
+  'task.exempt': {
+    id: 'task.exempt', params: ['taskId', 'desc'], run: taskExempt,
+    describe: p => '豁免任务 ' + (typeof p.taskId === 'string' ? p.taskId : '(运行时指定)'),
   },
 };
 const FLOW_ATOM_IDS = Object.keys(FLOW_ATOMS);

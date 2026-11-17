@@ -5,12 +5,19 @@ import { runCommand } from './command.js';
 import { parseCardGrantAmt } from './cond-ui.js';
 import { noteCheckinActivity } from './gate.js';
 import { Ledger, applyCheckinGain, setReverseHandler } from './ledger.js';
-import { processDailyTaskDebts, processLoansWithDecayReserve, skipNextLoanAutoPay } from './library.js';
+import { processDailyTaskDebts, processLoansWithDecayReserve, skipNextLoanAutoPay } from './debt.js';
 import { logAmt, clone, now } from './pure.js';
 import { state } from './state.js';
 import { toast } from './toast.js';
 // undo.js —— 撤销适配器与快照
 // 由 app.js 按功能拆分（第五轮可维护性重构），行为不变。
+function undoAbort(code,reason){
+  const e=new Error(reason);
+  e.__txn=true;
+  e.code=code;
+  e.info={reason:reason};
+  throw e;
+}
 
 // ===== Undo adapters =====
 // 撤销规则按 src 注册：新增一种可撤销流水 = 在 UNDO_ADAPTERS 里加一个 key。
@@ -75,6 +82,72 @@ const UNDO_ADAPTERS={
     toast('已撤销');
   }},
   purchase:{reverse:function(log){
+    // ===== 整单撤销：带 orderId 的购买（资产定价 / 附带赠送）=====
+    // 同一单的货币腿、资产腿、赠送腿必须一起退；任何一条赠送已被消耗都拒绝整单撤销。
+    if(log.orderId){
+      const orderLogs=state.logs.filter(function(l){return l.orderId===log.orderId;});
+      if(!orderLogs.length){toast('该笔购买已撤销','warn');return false;}
+      orderLogs.forEach(function(g){
+        if(g.src!=='purchase-grant')return;
+        const granted=Number(g.granted)||0;
+        if(granted<=0)return;
+        if(g.st==='card'){
+          if((state.cards[g.card]||0)<granted)undoAbort('UNDO_GRANT_SPENT','赠送的资产「'+(g.card||'')+'」已被使用，无法整单撤销');
+        }else if((Number(state.scores[g.st])||0)<granted){
+          undoAbort('UNDO_GRANT_SPENT','赠送的货币已被使用，无法整单撤销');
+        }
+      });
+      // 现实预算只联动货币腿；资产定价商品本就不会产生预算账目
+      orderLogs.filter(function(l){return l.src==='purchase'&&l.st!=='card';}).forEach(function(cl){
+        let budEntry=null;
+        if(state.ext&&state.ext.budgets&&Array.isArray(state.ext.budgets.ledger)){
+          budEntry=state.ext.budgets.ledger.find(function(e){
+            return e&&e.status!=='reversed'&&e.links&&e.links.purchaseLogId===cl.id;
+          })||null;
+        }
+        if(budEntry){
+          const cat=BudgetEngine.category(budEntry.categoryId);
+          const rp=cat?BudgetEngine.readPeriod(cat,now()):null;
+          const curKey=cat?BudgetEngine.bounds(cat.cycle,now()).key:'';
+          if(cat&&rp&&rp.period&&rp.period.end>now()&&budEntry.periodKey===curKey){
+            const rev=BudgetEngine.reverseEntry(budEntry.id);
+            if(!rev.ok)toast(rev.reason||'撤销失败','err');
+          }
+        }
+      });
+      // 货币腿：只退自付部分，贷款额不退回
+      orderLogs.filter(function(l){return l.src==='purchase'&&l.st!=='card';}).forEach(function(cl){
+        const paidPart=Math.abs(cl.amt)-(typeof cl.loanAmt==='number'?cl.loanAmt:0);
+        Ledger.post({op:'grant',account:cl.st,delta:paidPart,visible:false,reason:{src:'undo-purchase'}});
+        if(cl.loanId)state.loans=state.loans.filter(function(l){return l.id!==cl.loanId;});
+      });
+      // 资产腿：原额退回
+      orderLogs.filter(function(l){return l.src==='purchase'&&l.st==='card';}).forEach(function(l){
+        Ledger.post({op:'grant',account:'card:'+(l.card||''),delta:Math.abs(l.amt),visible:false,reason:{src:'undo-purchase'}});
+      });
+      // 赠送：原额收回（预检已确保余额足够，不会出现负数）
+      orderLogs.filter(function(l){return l.src==='purchase-grant';}).forEach(function(g){
+        const amt=Number(g.granted)||0;
+        if(amt<=0)return;
+        if(g.st==='card')Ledger.post({op:'grant',account:'card:'+(g.card||''),delta:-amt,visible:false,reason:{src:'undo-purchase-grant'}});
+        else Ledger.post({op:'grant',account:g.st,delta:-amt,visible:false,reason:{src:'undo-purchase-grant'}});
+      });
+      // 库存/销量只恢复一次
+      const forProd=orderLogs.find(function(l){return l.prodId;})||log;
+      if(forProd.prodId){
+        const p=state.products.find(function(x){return x.id===forProd.prodId;});
+        if(p){
+          if(p.stock>=0)p.stock++;
+          p.sold=Math.max(0,(p.sold||0)-1);
+        }
+      }
+      const ids={};
+      orderLogs.forEach(function(l){ids[l.id]=true;});
+      Ledger.removeLogs(function(l){return !ids[l.id];});
+      toast('已撤销购买（整单）');
+      return;
+    }
+    // ===== 旧路径：无 orderId 的普通货币购买，行为保持不变 =====
     // 先联动撤销该购买产生的现实预算账目（只走 BudgetEngine 已有入口）。
     // 跨期账目按预算既有口径不可撤销：此处只处理当期可撤销的账目，购买退款仍照常进行。
     let budEntry=null;

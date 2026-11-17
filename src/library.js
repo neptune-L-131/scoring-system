@@ -3,14 +3,16 @@ import { checkAchievements } from './business.js';
 import { runCommand } from './command.js';
 import { BACKUP_KEY, STAGE_PRESET_KEY } from './constants.js';
 import { defaults, newExtState, tierCurrency } from './defaults.js';
-import { setLastTickDay } from './entities.js';
+import { assetGrantCore, setLastTickDay } from './entities.js';
 import { noteCheckinActivity, validProductTier } from './gate.js';
 import { Ledger, applyCheckinGain } from './ledger.js';
 import { closeModal, openModal } from './modal-host.js';
-import { normalizeActivity, normalizeProductBudget, normalizeProductGate, setLoadIssue, setPersistBlocked } from './normalize.js';
+import { normalizeActivity, normalizeAssetPrice, normalizeProductBudget, normalizeProductGate, normalizeProductGrants, setLoadIssue, setPersistBlocked } from './normalize.js';
 import { commit, save } from './persist.js';
 import { dayKey, logAmt, round2, clone, daysSince, effectiveLastTs, fmt, getTaskDomainIds, now, splitCents, taskHasType, taskScoreTypes, uid } from './pure.js';
-import { closeChoreDoneZone, computeChoreDecay, processChoreDecay, resetWorkUiState } from './render-work.js';
+import { _loanAutoPaySkipOnce, loanInterestStart, processDailyTaskDebts, processLoans, processLoansWithDecayReserve, skipNextLoanAutoPay } from './debt.js';
+import { ensureMetabolismRule } from './metabolism.js';
+import { closeChoreDoneZone, resetWorkUiState } from './work-ui-state.js';
 import { fillDomainChecklist, fillSelect } from './shell.js';
 import { render } from './render.js';
 import { resetStagePresets, setState, state } from './state.js';
@@ -594,18 +596,22 @@ function saveProdData(data){
   const tier=validProductTier(data.tier);
   const ctx=productGateContext();
   const gate=normalizeProductGate(data.gate,ctx);
-  const budget=normalizeProductBudget(data.budget,ctx);
+  const assetPrice=normalizeAssetPrice(data.assetPrice);
+  const grants=normalizeProductGrants(data.grants);
+  // 有资产定价时，贷款与现实预算一律不生效（双保险：UI 已禁用，这里再清一次）
+  const budget=assetPrice?{categoryId:'',amount:0}:normalizeProductBudget(data.budget,ctx);
+  const debtRate=assetPrice?0:(data.debtRate||0);
   const currency=tierCurrency(tier);
   if(data.id){
     const p=state.products.find(x=>x.id===data.id);
     if(!p)return;
-    Object.assign(p,data,{tier:tier,gate:gate,budget:budget,currency:currency});
+    Object.assign(p,data,{tier:tier,gate:gate,budget:budget,currency:currency,assetPrice:assetPrice,grants:grants,debtRate:debtRate});
   }else{
     state.products.push({
       id:uid(),name:data.name,desc:data.desc,currency:currency,
       tier:tier,gate:gate,budget:budget,
       price:data.price,stock:data.stock,categoryId:data.categoryId||'sc_default',
-      debtRate:data.debtRate||0,
+      debtRate:debtRate,assetPrice:assetPrice,grants:grants,
       sold:0,createdAt:now()
     });
     Ledger.event('上架商品「'+data.name+'」','create');
@@ -621,13 +627,38 @@ function delProd(id){
   Ledger.event('删除商品「'+p.name+'」','delete-prod',{prodCopy:prodCopy,prodIndex:prodIndex});
   save();
 }
+function prodFail(code,reason,extra){
+  const e=new Error(reason);
+  e.__txn=true;
+  e.code=code;
+  e.info=Object.assign({reason:reason},extra||{});
+  throw e;
+}
 function buyProduct(id){
   const p=state.products.find(x=>x.id===id);
   if(!p)return;
   if(p.stock===0){return runCommand({reject:{reason:'sold-out',toast:{msg:'已售罄',type:'err'}}});}
+  // 运行时再归一一次，防止导入/旧存档里出现脏的资产定价与赠送
+  const assetPrice=normalizeAssetPrice(p.assetPrice);
+  const grants=normalizeProductGrants(p.grants);
+  const hasAssetPrice=!!assetPrice;
   const tier=validProductTier(p.tier);
   const cur=tierCurrency(tier);
   const cn=cur==='vitality'?'活力点':'成果点';
+  const price=Number(p.price)||0;
+  const hasCurrencyLeg=price>0;
+  // 旧商品（无资产定价/无赠送）保持完全旧路径；新路径才引入 orderId 与主腿标记
+  const orderId=(hasAssetPrice||grants.length)?uid():'';
+  const grantAssetDef=function(assetId){
+    return (state.assetDefs||[]).find(function(d){return d&&d.id===assetId;})||null;
+  };
+  let assetDef=null;
+  if(hasAssetPrice){
+    assetDef=grantAssetDef(assetPrice.assetId);
+    if(!assetDef||assetDef.enabled===false||assetDef.archived){
+      return runCommand({reject:{reason:'asset-price-invalid',toast:{msg:'商品绑定的资产不可用，请重新编辑商品',type:'err'}}});
+    }
+  }
   // 贷款决策必须等事务内的预算结算完成后再判断：reconcileDue 可能先发放结余奖励，
   // 让余额在购买前变得够用；按事务外的旧余额借贷会凭空多开一笔贷。
   let willLoan=false;
@@ -635,6 +666,8 @@ function buyProduct(id){
   const loanId=uid();
 
   let budgetMsg='';
+  let assetMsg='';
+  let grantMsg='';
   runCommand({
     label:'buyProduct',
     // 迁移前口径：有 reason 提示 reason；条件不满足提示固定文案；其余失败静默
@@ -647,9 +680,23 @@ function buyProduct(id){
     run:function(tx){
     // 唯一门槛判定点：策略拒绝抛事务错误，由 txn 统一回滚
     Ledger.checkPurchase(p);
-    // 商品绑定现实预算：预检 → 计划（余额不足直接抛错，整笔回滚）→ 虚拟扣款 → 同事务写现实账
+    if(!hasCurrencyLeg&&!hasAssetPrice)prodFail('INVALID_PRICE','价格需大于 0');
+    // 资产定价预检：必须在同事务内先确认余额，避免“先记流水后退款”
+    if(hasAssetPrice){
+      const bal=Number(state.cards[assetPrice.assetId])||0;
+      if(bal<assetPrice.amount){
+        prodFail('FLOW_INSUFFICIENT','资产不足：需要 '+assetPrice.amount+' 个「'+(assetDef.name||assetPrice.assetId)+'」');
+      }
+      // 防自循环：赠送同一资产且数量不少于消耗，等于免费刷资产
+      grants.forEach(function(g){
+        if(g.kind==='asset'&&g.assetId===assetPrice.assetId&&g.amount>=assetPrice.amount){
+          prodFail('INVALID_GRANTS','赠送资产不能覆盖资产定价本身（会形成自循环）');
+        }
+      });
+    }
+    // 商品绑定现实预算：资产定价商品一律不联动
     let budgetPlan=null;
-    if(p.budget&&p.budget.categoryId&&Number(p.budget.amount)>0){
+    if(!hasAssetPrice&&p.budget&&p.budget.categoryId&&Number(p.budget.amount)>0){
       BudgetEngine.reconcileDue(p.budget.categoryId,now());
       budgetPlan=BudgetEngine.prepareEntry(p.budget.categoryId,Number(p.budget.amount),{
         source:'product',productId:p.id,ts:now(),
@@ -657,13 +704,21 @@ function buyProduct(id){
       });
     }
     const balance=Number(state.scores[cur])||0;
-    willLoan=balance<p.price;
-    loanAmt=willLoan?round2(p.price-balance):0;
-    if(willLoan&&loanAmt>0)Ledger.post({op:'grant',account:cur,delta:loanAmt,visible:false,reason:{src:'loan-draw'}});
+    if(hasAssetPrice){
+      // 有资产定价：禁止贷款；货币部分必须足额
+      if(hasCurrencyLeg&&balance<price){
+        prodFail('PURCHASE_DENIED','资产定价商品不支持贷款，'+cn+'不足');
+      }
+    }else{
+      willLoan=balance<price;
+      loanAmt=willLoan?round2(price-balance):0;
+      if(willLoan&&loanAmt>0)Ledger.post({op:'grant',account:cur,delta:loanAmt,visible:false,reason:{src:'loan-draw'}});
+    }
     if(p.stock>0)p.stock--;
     p.sold=(p.sold||0)+1;
 
     let desc='购买「'+p.name+'」';
+    if(hasAssetPrice)desc+='（消耗 '+assetPrice.amount+' '+(assetDef.name||assetPrice.assetId)+'）';
     if(willLoan){
       desc+=' (贷款'+fmt(loanAmt)+' '+cn+')';
       Ledger.liability.open({
@@ -671,7 +726,51 @@ function buyProduct(id){
         productId:p.id,productName:p.name,reason:{src:'purchase'}
       });
     }
-    const spendRes=Ledger.spend(cur,p.price,{src:'purchase',desc:desc,prodId:p.id,loanId:willLoan?loanId:'',loanAmt:willLoan?loanAmt:0});
+    let spendRes=null;
+    if(hasCurrencyLeg){
+      const spendExtra={src:'purchase',desc:desc,prodId:p.id,loanId:willLoan?loanId:'',loanAmt:willLoan?loanAmt:0};
+      if(orderId){
+        spendExtra.orderId=orderId;
+        spendExtra.payLeg='currency';
+        spendExtra.primaryPurchase=true;
+      }
+      spendRes=Ledger.spend(cur,price,spendExtra);
+    }
+    if(hasAssetPrice){
+      // 资产消耗与购买在同一个事务里；可见流水，撤销时按 orderId 整单退
+      Ledger.post({
+        op:'spend',account:'card:'+assetPrice.assetId,delta:-assetPrice.amount,
+        entry:{st:'card',amt:-assetPrice.amount,desc:desc,src:'purchase',card:assetPrice.assetId,
+          prodId:p.id,orderId:orderId,payLeg:'asset',primaryPurchase:!hasCurrencyLeg},
+        reason:{src:'purchase'}
+      });
+      assetMsg=' · 消耗 '+assetPrice.amount+' '+(assetDef.name||assetPrice.assetId);
+    }
+    if(grants.length){
+      grants.forEach(function(g){
+        if(g.kind==='asset'){
+          const def=grantAssetDef(g.assetId);
+          if(!def||def.enabled===false||def.archived){
+            prodFail('INVALID_GRANTS','赠送资产「'+g.assetId+'」不可用');
+          }
+          const gr=assetGrantCore({
+            mode:'flow',assetId:g.assetId,amount:g.amount,maxBalance:def.maxBalance,
+            entry:function(granted){return {st:'card',amt:granted,desc:'购买「'+p.name+'」赠送「'+def.name+'」×'+granted,src:'purchase-grant',card:g.assetId,prodId:p.id,orderId:orderId,primaryPurchase:false,granted:granted};},
+            reason:{src:'purchase-grant'}
+          });
+          if(!gr.ok)prodFail('FLOW_ASSET_CAP','赠送「'+def.name+'」会超出余额上限');
+          grantMsg+=' · 赠 '+gr.granted+' '+(def.name||g.assetId);
+        }else{
+          const gcn=g.account==='vitality'?'活力点':'成果点';
+          Ledger.post({
+            op:'grant',account:g.account,delta:g.amount,
+            entry:{st:g.account,amt:g.amount,desc:'购买「'+p.name+'」赠送 '+fmt(g.amount)+' '+gcn,src:'purchase-grant',orderId:orderId,primaryPurchase:false,granted:g.amount},
+            reason:{src:'purchase-grant'}
+          });
+          grantMsg+=' · 赠 '+fmt(g.amount)+' '+gcn;
+        }
+      });
+    }
     if(budgetPlan){
       const br=BudgetEngine.commitEntry(tx,budgetPlan,{purchaseLogId:spendRes&&spendRes.entryId});
       budgetMsg=' · 记「'+budgetPlan.cat.name+'」'+fmt(budgetPlan.amount);
@@ -680,71 +779,28 @@ function buyProduct(id){
     }
     processDailyTaskDebts(true);
     processLoansWithDecayReserve();
-    return {toast:{msg:'已购买：'+p.name+' (-'+fmt(p.price)+' '+cn+')'+(willLoan?' · 贷款'+fmt(loanAmt):'')+budgetMsg}};
+    const paidTxt=hasCurrencyLeg?('-' + fmt(price) + ' ' + cn):'';
+    // 事件只在事务提交后由命令层派发；旧商品用主腿流水 id 作为事件来源，保证键唯一
+    const eventSourceId=orderId||((spendRes&&spendRes.entryId)||'')||uid();
+    return {
+      toast:{msg:'已购买：'+p.name+(paidTxt?' ('+paidTxt+')':'')+(willLoan?' · 贷款'+fmt(loanAmt):'')+assetMsg+grantMsg+budgetMsg},
+      events:[{
+        kind:'purchase',
+        sourceId:eventSourceId,
+        occurredAt:now(),
+        payload:{
+          productId:p.id,tier:tier,price:price,paid:hasCurrencyLeg?price:0,
+          assetPayments:hasAssetPrice?[{assetId:assetPrice.assetId,amount:assetPrice.amount}]:[],
+          stockAfter:p.stock,orderId:orderId
+        }
+      }]
+    };
     }
   });
 }
 
 // ===== Daily task debt processing =====
 // Accumulates pending debt on each task (does NOT deduct from total scores).
-// Debt is only applied at check-in time, reducing the earnable amount.
-// If net (gross - pendingDebt) goes negative, the excess is deducted from total scores.
-function processDailyTaskDebts(silent=false){
-  const todayTs=dayStart(now());
-
-  state.tasks.forEach(task=>{
-    if(task.archived)return; // 归档任务不参与打卡与债务累积
-    if(task.debtRate<=0)return;
-    if(!task.lastCheckIn)return;
-
-    const gapDays=dayDiff(todayTs,effectiveLastTs(task));
-
-    // Only accumulate debt if streak is broken (gap >= 2 days)
-    if(gapDays<2)return;
-
-    // Calculate how many debt days have already been accumulated
-    let lastDebtDay;
-    if(task.lastDebtDate){
-      lastDebtDay=dayStart(task.lastDebtDate);
-    }else{
-      // First time: debt starts from the day after lastCheckIn
-      lastDebtDay=addDays(dayStart(effectiveLastTs(task)),1);
-    }
-
-    const daysSince=dayDiff(todayTs,lastDebtDay);
-    if(daysSince<=0)return;
-
-    // Accumulate to pendingDebt (don't touch total scores)
-    // 与 calcCheckIn / calcSkip 同一精度口径：日债务与累计欠债都保留两位
-    const dailyDebt=round2(task.initialValue*(task.debtRate/100));
-    task.pendingDebt=round2((task.pendingDebt||0)+dailyDebt*daysSince);
-    task.lastDebtDate=todayTs;
-  });
-
-  if(!silent)save();
-}
-
-// ===== Metabolism（已迁移为周期活动）=====
-// 自动归档不再有硬编码逻辑：首次载入/升级时播种一条可编辑、可停用、可删除的周期活动。
-// 之后是否归档、归档阈值多少，全部由活动规则决定；本函数只负责播种。
-function ensureMetabolismRule(){
-  if(!state.ext||typeof state.ext!=='object')state.ext={};
-  if(state.ext.metabolismSeeded)return false;
-  state.ext.metabolismSeeded=true;
-  if(!Array.isArray(state.activities))state.activities=[];
-  if(state.activities.some(function(a){return a.id==='act_metabolism';}))return false;
-  state.activities.push(normalizeActivity({
-    id:'act_metabolism',
-    name:'任务自动归档',
-    enabled:true,
-    period:'day',
-    anchor:1,
-    condition:{mode:'all',items:[{range:'today',metric:'task_idle',op:'>=',value:14,targetType:'all',target:'',newFilter:'none',aggregate:'sum'}]},
-    result:{items:[{type:'archive',entity:'task',idleDays:14}]},
-    lastRun:null
-  }));
-  return true;
-}
 function unlockTask(taskId){
   const t=state.tasks.find(x=>x.id===taskId);
   if(!t||!t.archived)return;
@@ -762,61 +818,6 @@ function unlockTask(taskId){
   save();
   toast('已解锁「'+t.name+'」，可重新打卡');
   render();
-}
-
-// ===== Loan processing (daily interest) =====
-// silent：不单独写盘（由调用方统一 commit）
-// reserveVitality：还贷前先预留「当天已腐化但尚未入账」的活力点，避免用这笔钱还贷
-// 一次性跳过自动还款：撤销「贷款还款」时使用，只影响当前这次处理，不改变长期行为
-let _loanAutoPaySkipOnce=false;
-// 单笔贷款的计息起点：优先用贷款自带的 lastInterestAt；
-// 旧贷款没有该字段时回退到全局 lastDebtDate，再回退到贷款开立日。
-function loanInterestStart(loan){
-  if(loan&&typeof loan.lastInterestAt==='number'&&isFinite(loan.lastInterestAt)&&loan.lastInterestAt>0)return loan.lastInterestAt;
-  if(state.lastDebtDate)return state.lastDebtDate;
-  return Number(loan&&loan.date)||now();
-}
-function processLoans(silent=false,reserveVitality=0){
-  const skipAutoPay=_loanAutoPaySkipOnce;
-  _loanAutoPaySkipOnce=false;
-  Ledger.txn(function(){
-    if(!state.loans)state.loans=[];
-
-    // 逐笔按自己的计息起点算天数：新借的贷款不会被全局 lastDebtDate 追溯计息
-    if(state.loans.length>0){
-      const todayTs=dayStart(now());
-      state.loans.slice().forEach(function(loan){
-        const startDay=dayStart(loanInterestStart(loan));
-        const days=dayDiff(todayTs,startDay);
-        if(days>0&&loan.debtRate>0){
-          // 复利按天换算为一次幂运算，避免按天循环
-          Ledger.liability.mutate(loan.id,function(before){return before*Math.pow(1+loan.debtRate/100,days);},{src:'loan-interest'});
-        }
-        // 每笔贷款各自推进起点；日息为 0 的贷款也推进，避免恢复计息时补算历史天数
-        loan.lastInterestAt=todayTs;
-      });
-      state.lastDebtDate=todayTs;
-    }else{
-      state.lastDebtDate=now();
-    }
-
-    // Auto-pay loans when balance is sufficient (always check)
-    if(state.loans.length>0&&!skipAutoPay){
-      const reserve=(typeof reserveVitality==='number'&&isFinite(reserveVitality))?Math.max(0,reserveVitality):0;
-      state.loans.slice().forEach(function(loan){
-        const avail=(state.scores[loan.currency]||0)-(loan.currency==='vitality'?reserve:0);
-        if(avail>=loan.amount){
-          Ledger.spend(loan.currency,loan.amount,{src:'loan-repay',desc:'偿还贷款「'+loan.productName+'」',loanId:loan.id,loanCopy:clone(loan)});
-          Ledger.liability.close(loan.id,{src:'loan-repay'});
-        }
-      });
-    }
-  },{label:'loans',save:silent?'none':undefined,render:false});
-}
-// 还贷前统一按当天腐化总额预留（不改变 processLoans 与 processChoreDecay 的先后顺序）
-function processLoansWithDecayReserve(){
-  const decay=computeChoreDecay();
-  processLoans(true,decay.total||0);
 }
 
 // ===== 手动修正余额（用于修复历史版本重复扣减造成的余额偏差） =====
@@ -948,6 +949,4 @@ function clearEverything(){
   toast('已清除全部设置与数据');
 }
 
-export function skipNextLoanAutoPay(){_loanAutoPaySkipOnce=true;}
-
-export { addCollection, delCollection, renameCollection, addDomain, delDomain, renameDomain, pendingTaskSave, saveTaskData, resolveDomainChange, cancelDomainChange, finalizeTaskSave, recalcTaskHistory, delTask, saveAchData, delAch, openMetricModal, getCheckedMetricDomains, handleMetricSave, delMetric, addShopCategory, delShopCategory, renameShopCategory, fillShopCatSelect, productGateContext, saveProdData, delProd, buyProduct, processDailyTaskDebts, ensureMetabolismRule, unlockTask, _loanAutoPaySkipOnce, loanInterestStart, processLoans, processLoansWithDecayReserve, manualAdjustBalance, clearDataResults, clearEverything };
+export { addCollection, delCollection, renameCollection, addDomain, delDomain, renameDomain, pendingTaskSave, saveTaskData, resolveDomainChange, cancelDomainChange, finalizeTaskSave, recalcTaskHistory, delTask, saveAchData, delAch, openMetricModal, getCheckedMetricDomains, handleMetricSave, delMetric, addShopCategory, delShopCategory, renameShopCategory, fillShopCatSelect, productGateContext, saveProdData, delProd, buyProduct, processDailyTaskDebts, ensureMetabolismRule, unlockTask, _loanAutoPaySkipOnce, loanInterestStart, processLoans, processLoansWithDecayReserve, skipNextLoanAutoPay, manualAdjustBalance, clearDataResults, clearEverything };

@@ -31,6 +31,13 @@ function optionalInt(raw) {
   return { value: n };
 }
 
+// 使用配方：目前只有「任务豁免」一种；固定消耗 1 张本资产
+function useRecipeFromDraft(d) {
+  const type = String((d && d.useType) || 'none');
+  if (type !== 'task-exempt') return null;
+  return { v: 1, type: 'task-exempt', cost: 1 };
+}
+
 // 纯校验：不读写 DOM、不写 state。ctx = { defs, balance, periodIssued, builtin, originalId }
 function validateAssetDraft(draft, ctx) {
   const d = draft || {};
@@ -98,6 +105,7 @@ function validateAssetDraft(draft, ctx) {
       maxBalance: maxBalance,
       maxIssuedPerPeriod: maxIssuedPerPeriod,
       issuePeriod: { cycle: cycleRaw, anchor: anchorNum },
+      useRecipe: useRecipeFromDraft(d),
     },
   };
 }
@@ -152,6 +160,17 @@ function assetReferencesOf(assetId) {
       });
     });
   });
+  // 商品：资产定价消耗 / 购买赠送
+  (Array.isArray(state.products) ? state.products : []).forEach(function (p) {
+    if (!p) return;
+    if (p.assetPrice && p.assetPrice.assetId === assetId) {
+      refs.push({ kind: 'product', name: String(p.name || p.id || '未命名商品'), stepLabel: '资产定价', action: '消耗' });
+    }
+    (Array.isArray(p.grants) ? p.grants : []).forEach(function (g) {
+      if (!g || g.kind !== 'asset' || g.assetId !== assetId) return;
+      refs.push({ kind: 'product', name: String(p.name || p.id || '未命名商品'), stepLabel: '购买赠送', action: '赠送' });
+    });
+  });
   return refs;
 }
 
@@ -189,7 +208,10 @@ function assetRowHTML(def) {
 
   let ops = '';
   if (builtin) {
-    ops = '<div class="asset-locked">内置资产：名称、单位、上限与周期由系统固定，不可改名或删除</div>';
+    ops = '<div class="asset-ops">'
+      + '<button class="btn btn-sm" onclick="openAssetModal(\'' + attrId(id) + '\')">配置使用配方</button>'
+      + '</div>'
+      + '<div class="asset-locked">内置资产：名称、单位、上限与周期由系统固定，不可改名或删除</div>';
   } else {
     ops = '<div class="asset-ops">'
       + '<button class="btn btn-sm" onclick="openAssetModal(\'' + attrId(id) + '\')">编辑</button>';
@@ -219,7 +241,9 @@ function assetRowHTML(def) {
     + '<span class="asset-balance">余额 ' + fmt(balance) + ' ' + esc(unit) + '</span>'
     + '</div>'
     + '<div class="asset-meta">ID ' + esc(id) + ' · 余额上限 ' + maxBal + ' · 单期发放上限 ' + maxIssued
-    + ' · ' + cycleText + ' · 本期已发 ' + fmt(issued) + '</div>'
+    + ' · ' + cycleText + ' · 本期已发 ' + fmt(issued)
+    + ' · 使用配方 ' + (def.useRecipe && def.useRecipe.type === 'task-exempt' ? '任务豁免（消耗 ' + fmt(def.useRecipe.cost || 1) + '）' : '无')
+    + '</div>'
     + stateNote
     + refsHTML(id)
     + ops
@@ -270,6 +294,7 @@ function openAssetModal(assetId) {
   setFieldValue('assetMaxIssued', def && def.maxIssuedPerPeriod !== null && def.maxIssuedPerPeriod !== undefined ? def.maxIssuedPerPeriod : '');
   setFieldValue('assetCycle', def && def.issuePeriod && def.issuePeriod.cycle === 'month' ? 'month' : 'week');
   setFieldValue('assetAnchor', def && def.issuePeriod ? String(def.issuePeriod.anchor || 1) : '1');
+  setFieldValue('assetUse', def && def.useRecipe && def.useRecipe.type === 'task-exempt' ? 'task-exempt' : 'none');
   // 编辑时 ID 不可改；内置资产整组定义由系统固定
   setReadOnly('assetId', !!def);
   setReadOnly('assetName', builtin);
@@ -280,7 +305,7 @@ function openAssetModal(assetId) {
   if (cycleEl) cycleEl.disabled = builtin;
   const anchorEl = document.getElementById('assetAnchor');
   if (anchorEl) anchorEl.disabled = builtin;
-  setHint(builtin ? '内置资产由系统固定：名称、单位、上限与周期不可修改，也不能删除。' : '');
+  setHint(builtin ? '内置资产由系统固定：名称、单位、上限与周期不可修改。使用配方可自行开启或关闭。' : '');
   openModal('assetModal');
 }
 
@@ -288,6 +313,35 @@ function handleAssetSave() {
   const originalId = String(fieldValue('assetOriginalId') || '');
   const defs = Array.isArray(state.assetDefs) ? state.assetDefs : [];
   const existing = originalId ? assetDefOf(originalId) : null;
+  if (originalId && !existing) {
+    const lost = fail('ASSET_NOT_FOUND', '资产定义不存在或已被删除');
+    setHint(lost.message);
+    toast(lost.message, 'err');
+    return lost;
+  }
+  // 内置资产的语义字段锁定，但「使用配方」是用户配置项，允许单独修改
+  if (originalId === 'exemption') {
+    const lockedChanged = fieldValue('assetName').trim() !== existing.name
+      || fieldValue('assetUnit').trim() !== existing.unit
+      || Number(fieldValue('assetMaxBalance')) !== existing.maxBalance
+      || Number(fieldValue('assetMaxIssued')) !== existing.maxIssuedPerPeriod
+      || fieldValue('assetCycle') !== (existing.issuePeriod && existing.issuePeriod.cycle)
+      || Number(fieldValue('assetAnchor')) !== (existing.issuePeriod && existing.issuePeriod.anchor);
+    if (lockedChanged) {
+      const locked = fail('ASSET_BUILTIN_LOCKED', '内置资产的名称、单位、上限与周期不可修改；只能调整使用配方');
+      setHint(locked.message);
+      toast(locked.message, 'err');
+      return locked;
+    }
+    existing.useRecipe = useRecipeFromDraft({ useType: fieldValue('assetUse') });
+    existing.updatedAt = now();
+    save();
+    render();
+    closeModal('assetModal');
+    const message = existing.useRecipe ? '已开启内置资产的「任务豁免」使用配方' : '已关闭内置资产的使用配方';
+    toast(message);
+    return { ok: true, message: message };
+  }
   const balance = originalId ? balanceOf(originalId) : 0;
   const ctx = {
     defs: defs,
@@ -304,18 +358,13 @@ function handleAssetSave() {
     maxIssuedPerPeriod: fieldValue('assetMaxIssued'),
     cycle: fieldValue('assetCycle'),
     anchor: fieldValue('assetAnchor'),
+    useType: fieldValue('assetUse'),
   }, ctx);
 
   if (!res.ok) {
     setHint(res.message);
     toast(res.message, 'err');
     return res;
-  }
-  if (originalId && !existing) {
-    const lost = fail('ASSET_NOT_FOUND', '资产定义不存在或已被删除');
-    setHint(lost.message);
-    toast(lost.message, 'err');
-    return lost;
   }
 
   const v = res.value;
@@ -326,6 +375,7 @@ function handleAssetSave() {
     existing.maxBalance = v.maxBalance;
     existing.maxIssuedPerPeriod = v.maxIssuedPerPeriod;
     existing.issuePeriod = v.issuePeriod;
+    existing.useRecipe = v.useRecipe;
     existing.updatedAt = ts;
   } else {
     defs.push({
@@ -336,6 +386,7 @@ function handleAssetSave() {
       maxBalance: v.maxBalance,
       maxIssuedPerPeriod: v.maxIssuedPerPeriod,
       issuePeriod: v.issuePeriod,
+      useRecipe: v.useRecipe,
       enabled: true,
       archived: false,
       origin: 'user',

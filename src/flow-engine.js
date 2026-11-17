@@ -9,12 +9,14 @@ import {
   FLOW_ATOM_IDLE_DAYS_MAX, FLOW_ATOM_MAX_ASSET, FLOW_ATOM_MAX_CURRENCY,
   FLOW_ATOM_NOTE_MAX_LEN, FLOW_IDEM_KEEP, FLOW_MAX_DEPTH, FLOW_MAX_STEPS, FLOW_RUN_KEEP,
 } from './constants.js';
+import { registerFlowDueProcessor } from './flow-scheduler.js';
 import { FLOW_ATOMS, assetPeriodKeyOf, runFlowAtom } from './flow-atoms.js';
 import { BudgetEngine } from './budget.js';
 import { evalCondition } from './cond-eval.js';
+import { EVENT_KINDS } from './events.js';
 import { Ledger } from './ledger.js';
 import { save } from './persist.js';
-import { now, periodKey, uid } from './pure.js';
+import { isPointMetric, now, periodKey, uid } from './pure.js';
 import { getState, setState, state } from './state.js';
 
 const STEP_ID_RE = /^[a-z][a-z0-9_]{0,15}$/;
@@ -28,6 +30,7 @@ const ATOM_OUTPUT_FIELDS = {
   'entity.archiveIdle': ['count', 'archived'],
   'log.note': [],
   'engine.recheckAchievements': ['count'],
+  'task.exempt': [],
 };
 
 function fail(code, info) {
@@ -39,6 +42,24 @@ function fail(code, info) {
 }
 function cErr(code, stepId, detail) {
   return { code: code, stepId: stepId || '', detail: detail === undefined ? '' : String(detail) };
+}
+
+// 条件树叶子遍历：分组节点用 items 嵌套，叶子带 metric/range
+function walkCondLeaves(node, fn) {
+  if (!node || typeof node !== 'object') return;
+  if (Array.isArray(node.items)) node.items.forEach(function (n) { walkCondLeaves(n, fn); });
+  if (typeof node.metric === 'string' && node.metric) fn(node);
+}
+// 步骤树里的分支条件（when）同样属于“事件流条件”，必须一并做指标白名单校验
+function walkBranchWhens(list, fn) {
+  (Array.isArray(list) ? list : []).forEach(function (s) {
+    if (!s || typeof s !== 'object') return;
+    if (s.kind === 'branch') {
+      fn(s.when);
+      walkBranchWhens(s.then, fn);
+      walkBranchWhens(s.else, fn);
+    }
+  });
 }
 
 function findAssetDef(assetId) {
@@ -66,10 +87,13 @@ function compile(flow) {
   if (flow.v !== undefined && (typeof flow.v !== 'number' || flow.v < 1)) errors.push(cErr('FLOW_INVALID_DEF', '', 'v'));
   if (typeof flow.id !== 'string' || !flow.id) errors.push(cErr('FLOW_INVALID_DEF', '', 'id'));
   const trig = flow.trigger || {};
-  if (trig.type !== 'period' && trig.type !== 'manual') errors.push(cErr('FLOW_BAD_TRIGGER'));
+  if (trig.type !== 'period' && trig.type !== 'manual' && trig.type !== 'event') errors.push(cErr('FLOW_BAD_TRIGGER'));
   if (trig.type === 'period') {
     if (['day', 'week', 'month'].indexOf(trig.period) < 0) errors.push(cErr('FLOW_BAD_TRIGGER', '', 'period'));
     if (!Number.isInteger(trig.anchor) || trig.anchor < 1 || trig.anchor > 7) errors.push(cErr('FLOW_BAD_TRIGGER', '', 'anchor'));
+  }
+  if (trig.type === 'event' && (!trig.event || EVENT_KINDS.indexOf(trig.event.kind) < 0)) {
+    errors.push(cErr('FLOW_BAD_TRIGGER', '', 'event'));
   }
   const limits = (flow.limits && typeof flow.limits === 'object') ? flow.limits : {};
   const maxSteps = Math.min(FLOW_MAX_STEPS, Math.max(1, Math.round(Number(limits.maxSteps) || FLOW_MAX_STEPS)));
@@ -79,6 +103,8 @@ function compile(flow) {
     seen: {}, registry: {}, total: 0,
     recheckId: '', recheckCount: 0, recheckNested: false,
     lastTopId: '', overSteps: false,
+    // 运行输入：只在运行时由调用方注入（资产使用配方传 taskId），静态参数可声明引用
+    inputs: new Set((Array.isArray(flow.inputs) ? flow.inputs : []).map(function (x) { return x && x.name; }).filter(Boolean)),
   };
   if (Array.isArray(flow.steps)) {
     validateStepList(flow.steps, 0, false, st, maxSteps, errors, true);
@@ -89,6 +115,18 @@ function compile(flow) {
     if (st.recheckNested) errors.push(cErr('FLOW_REACHECK_ORDER', st.recheckId, 'nested'));
     else if (st.lastTopId && st.recheckId !== st.lastTopId) errors.push(cErr('FLOW_REACHECK_ORDER', st.recheckId, 'not-last'));
   }
+  // 事件触发只承诺“事件发生那一刻”：点态指标与 range:'period' 在事件时刻没有稳定窗口，
+  // 保存/编译直接拒绝，而不是等到运行期才给出不可复现的结果。
+  if (trig.type === 'event') {
+    const checkEventCond = function (when) {
+      walkCondLeaves(when, function (it) {
+        if (isPointMetric(it.metric)) errors.push(cErr('FLOW_EVENT_POINT_METRIC', it.metric, 'metric'));
+        if (it.range === 'period') errors.push(cErr('FLOW_EVENT_PERIOD_RANGE', it.metric, 'range'));
+      });
+    };
+    checkEventCond(flow.condition);
+    walkBranchWhens(flow.steps, checkEventCond);
+  }
   if (errors.length) return { ok: false, errors: errors, plan: null };
   return {
     ok: true,
@@ -97,6 +135,7 @@ function compile(flow) {
       flowId: flow.id, trigger: trig,
       condition: flow.condition || { mode: 'all', items: [] },
       limits: limits, steps: flow.steps, totalSteps: st.total,
+      inputs: Array.isArray(flow.inputs) ? flow.inputs : [],
     },
   };
 }
@@ -184,20 +223,40 @@ function checkStaticParams(step, params, insideBranch, st, errors) {
       else validateRef(step.id, v, insideBranch, st, errors);
       return;
     }
+    const isInput = v && typeof v === 'object' && !Array.isArray(v) && v.input !== undefined;
+    if (isInput) {
+      // 运行输入只允许 taskId，且必须在 flow.inputs 里声明
+      if (k !== 'taskId' || typeof v.input !== 'string' || !st.inputs.has(v.input)) {
+        errors.push(cErr('FLOW_BAD_REF', step.id, 'input:' + k));
+      }
+      return;
+    }
     if (k === 'amount' && (typeof v !== 'number' || !isFinite(v) || v <= 0)) errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'amount'));
     if (k === 'account' && typeof v !== 'string') errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'account'));
     if (k === 'assetId' && typeof v !== 'string') errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'assetId'));
     if (k === 'idleDays' && (!Number.isInteger(v) || v < 1 || v > FLOW_ATOM_IDLE_DAYS_MAX)) errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'idleDays'));
     if (k === 'kind' && ['task', 'affair', 'chore'].indexOf(v) < 0) errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'kind'));
     if (k === 'desc' && (typeof v !== 'string' || !v.trim())) errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'desc'));
+    if (k === 'split' && v !== 'allDomains') errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'split'));
+    if (k === 'taskId' && typeof v !== 'string') errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'taskId'));
+    if (k === 'cap' && (!Number.isInteger(v) || v < 1)) errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'cap'));
     if (k === 'amount' && typeof v === 'number' && atomId.indexOf('currency.') === 0 && v > FLOW_ATOM_MAX_CURRENCY) {
       errors.push(cErr('FLOW_AMOUNT_LIMIT', step.id, v));
     }
   });
 
   if (atomId === 'currency.grant' || atomId === 'currency.spend') {
+    const splitAll = atomId === 'currency.grant' && params.split === 'allDomains';
     if (params.account === undefined) errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'account'));
-    else if (typeof params.account === 'string' && !isKnownAccount(params.account)) errors.push(cErr('FLOW_INVALID_ACCOUNT', step.id, params.account));
+    else if (splitAll) {
+      if (params.account !== 'progress') errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'split'));
+      else if (!(state.domains || []).some(d => d && d.id)) errors.push(cErr('FLOW_INVALID_ACCOUNT', step.id, 'progress'));
+    } else if (params.account === 'progress') {
+      errors.push(cErr('FLOW_INVALID_ACCOUNT', step.id, 'progress'));
+    } else if (typeof params.account === 'string' && !isKnownAccount(params.account)) {
+      errors.push(cErr('FLOW_INVALID_ACCOUNT', step.id, params.account));
+    }
+    if (params.taskId !== undefined && params.account !== 'vitality') errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'taskId'));
     if (params.amount === undefined) errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'amount'));
   }
   if (atomId === 'asset.grant' || atomId === 'asset.spend') {
@@ -213,7 +272,8 @@ function checkStaticParams(step, params, insideBranch, st, errors) {
       if (!Number.isInteger(params.amount)) errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'amount'));
       const defMax = def && def.maxIssuedPerPeriod !== null && def.maxIssuedPerPeriod !== undefined
         ? Number(def.maxIssuedPerPeriod) : FLOW_ATOM_MAX_ASSET;
-      const stepMax = Math.min(FLOW_ATOM_MAX_ASSET, defMax);
+      // 带 cap 的发放复刻活动语义，不受资产周期上限压缩
+      const stepMax = params.cap !== undefined ? FLOW_ATOM_MAX_ASSET : Math.min(FLOW_ATOM_MAX_ASSET, defMax);
       if (params.amount > stepMax) errors.push(cErr('FLOW_AMOUNT_LIMIT', step.id, params.amount));
     }
   }
@@ -225,6 +285,12 @@ function checkStaticParams(step, params, insideBranch, st, errors) {
     if (params.desc === undefined) errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'desc'));
     if (typeof params.desc === 'string' && params.desc.length > FLOW_ATOM_NOTE_MAX_LEN) {
       errors.push(cErr('FLOW_NOTE_TOO_LONG', step.id, params.desc.length));
+    }
+  }
+  if (atomId === 'task.exempt') {
+    if (params.taskId === undefined) errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'taskId'));
+    else if (typeof params.taskId === 'string' && !params.taskId.trim()) {
+      errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'taskId'));
     }
   }
 }
@@ -258,6 +324,13 @@ function resolveParams(ctx, params) {
   const out = {};
   Object.keys(params).forEach(function (k) {
     const v = params[k];
+    if (v && typeof v === 'object' && !Array.isArray(v) && v.input !== undefined) {
+      const name = String(v.input);
+      const val = ctx.inputs ? ctx.inputs[name] : undefined;
+      if (val !== undefined && val !== null) out[k] = val;
+      else fail('FLOW_INPUT_MISSING', { input: name });
+      return;
+    }
     if (v && typeof v === 'object' && !Array.isArray(v) && v.ref !== undefined) {
       const raw = String(v.ref);
       const dot = raw.indexOf('.');
@@ -311,10 +384,14 @@ function executeStep(ctx, step) {
   logIds.forEach(function (id) { ctx.stepLogIds.push(id); });
   if (step.atom === 'asset.grant' || step.atom === 'asset.spend') {
     const aid = params.assetId;
-    const op = ctx.assetOps[aid] || { issued: 0, spent: 0 };
-    if (step.atom === 'asset.grant') op.issued += result.granted || 0;
-    else op.spent += result.spent || 0;
-    ctx.assetOps[aid] = op;
+    const delta = step.atom === 'asset.grant' ? (result.granted || 0) : (result.spent || 0);
+    // cap 裁剪到 0 时不产生任何计量（避免 runs/issued 被空发放污染）
+    if (delta > 0) {
+      const op = ctx.assetOps[aid] || { issued: 0, spent: 0 };
+      if (step.atom === 'asset.grant') op.issued += delta;
+      else op.spent += delta;
+      ctx.assetOps[aid] = op;
+    }
   }
 }
 
@@ -330,7 +407,17 @@ function deltasOf(ctx) {
     if (!set.has(l.id)) return;
     if (l.st === 'vitality') out.vitality += l.amt;
     else if (l.st === 'achievement') out.achievement += l.amt;
-    else if (l.st === 'progress') out.progress[l.dom] = (out.progress[l.dom] || 0) + l.amt;
+    else if (l.st === 'progress') {
+      // 全领域均分的流水带 splits，按领域展开，避免全部记到默认领域
+      if (Array.isArray(l.splits) && l.splits.length) {
+        l.splits.forEach(function (x) {
+          const dom = (x && x.dom) || 'd_default';
+          out.progress[dom] = (out.progress[dom] || 0) + (Number(x.amt) || 0);
+        });
+      } else {
+        out.progress[l.dom] = (out.progress[l.dom] || 0) + l.amt;
+      }
+    }
     else if (l.st === 'card') out.cards[l.card] = (out.cards[l.card] || 0) + l.amt;
   });
   return out;
@@ -441,6 +528,7 @@ function execute(flow, plan, meta) {
     flow: flow, flowName: flow.name, limits: plan.limits,
     runId: runId, runKey: meta.runKey, trigger: meta.trigger, periodKey: meta.period,
     ts: meta.ts, actLike: meta.actLike, startedAt: now(), silent: true, dryRun: false,
+    inputs: (meta && meta.inputs && typeof meta.inputs === 'object') ? meta.inputs : {},
     outputs: {}, stepOutputs: {}, stepLogIds: [], assetOps: {}, journalSteps: [],
     totals: { granted: 0, spent: 0, assetGranted: 0, assetSpent: 0, steps: 0, notes: 0, recheck: 0 },
   };
@@ -462,6 +550,11 @@ function execute(flow, plan, meta) {
       flow.lastRun = meta.runKey;
       state.ext.assetMeters.idem[meta.runKey] = { flowId: flow.id, runId: runId, at: now() };
       pruneIdem();
+    } else if (meta.trigger === 'event') {
+      // 事件触发的幂等靠事件键：lastEventKey + 持久幂等表，跨刷新不重放
+      flow.lastEventKey = meta.eventKey || '';
+      state.ext.assetMeters.idem[meta.runKey] = { flowId: flow.id, runId: runId, at: now() };
+      pruneIdem();
     }
   }, { label: 'flow:' + flow.id, save: 'none', render: false });
   if (!txr.ok) return { ok: false, error: txr.error };
@@ -481,15 +574,26 @@ function runFlow(flowId, opts) {
   if (_active.has(flow.id)) return { ok: false, error: { code: 'FLOW_REENTRANT' } };
   const compiled = compile(flow);
   if (!compiled.ok) return { ok: false, error: { code: 'FLOW_COMPILE_FAILED', errors: compiled.errors } };
+  // 声明了运行输入（目前仅资产使用配方的 taskId）就必须由调用方注入
+  const inputs = (opts.inputs && typeof opts.inputs === 'object') ? opts.inputs : {};
+  const declared = compiled.plan.inputs || [];
+  for (let i = 0; i < declared.length; i += 1) {
+    const name = declared[i] && declared[i].name;
+    if (name && (inputs[name] === undefined || inputs[name] === null || inputs[name] === '')) {
+      return { ok: false, error: { code: 'FLOW_INPUT_MISSING', input: name } };
+    }
+  }
   ensureRuntimeStructures();
 
   const ts = Number.isFinite(Number(opts.ts)) ? Number(opts.ts) : now();
-  const trigger = opts.trigger === 'manual' ? 'manual' : 'period';
+  const trigger = opts.trigger === 'manual' ? 'manual' : (opts.trigger === 'event' ? 'event' : 'period');
   let runKey = '';
   let period = '';
+  let base = '';
+  let eventKey = '';
   if (trigger === 'period') {
     period = periodKey(flow.trigger, ts);
-    const base = flow.id + '@' + period;
+    base = flow.id + '@' + period;
     // lastRun 是“该周期已发生”的快速闸门；idem 负责多跑额度与持久去重
     if (flow.limits.maxRunsPerPeriod <= 1 && flow.lastRun === base) {
       return { ok: true, skipped: 'already-run', runKey: base };
@@ -497,6 +601,14 @@ function runFlow(flowId, opts) {
     const used = countIdem(state.ext.assetMeters.idem, base);
     if (used >= flow.limits.maxRunsPerPeriod) return { ok: true, skipped: 'already-run', runKey: base };
     runKey = used === 0 ? base : base + '#' + used;
+  } else if (trigger === 'event') {
+    eventKey = (opts.event && typeof opts.event.key === 'string') ? opts.event.key : '';
+    if (!eventKey) return { ok: false, error: { code: 'FLOW_BAD_EVENT' } };
+    // 同一事件的同一条流只执行一次：lastEventKey 快速闸门 + 持久幂等表跨刷新去重
+    runKey = flow.id + '@event:' + eventKey;
+    if (flow.lastEventKey === eventKey || state.ext.assetMeters.idem[runKey]) {
+      return { ok: true, skipped: 'already-run', runKey: runKey };
+    }
   } else {
     runKey = flow.id + '@manual@' + ts;
   }
@@ -511,17 +623,110 @@ function runFlow(flowId, opts) {
   } catch (e) {
     return { ok: false, error: { code: 'FLOW_CONDITION_ERROR', message: e && e.message } };
   }
-  // 条件不成立 = 本次未发生：不写 lastRun、不写幂等键、不落任何流水
-  if (!condOk) return { ok: true, skipped: 'condition-false', runKey: runKey };
+  // 条件不成立 = 本次未发生：默认不写 lastRun、不写幂等键、不落任何流水。
+  // 迁移流可开启 settleWhenConditionFalse：本周期就此结束（复刻活动“每周期只求值一次”）。
+  if (!condOk) {
+    if (trigger === 'event') {
+      // 事件流条件不成立 = 本次未发生：不发放，但落“已求值”幂等记录，避免同一事件重复求值
+      flow.lastEventKey = eventKey;
+      state.ext.assetMeters.idem[runKey] = { flowId: flow.id, runId: '', at: now(), skipped: true };
+      pruneIdem();
+      return { ok: true, skipped: 'condition-false', settled: false, runKey: runKey };
+    }
+    const settled = trigger === 'period' && flow.settleWhenConditionFalse === true;
+    if (settled) flow.lastRun = base;
+    return { ok: true, skipped: 'condition-false', settled: settled, runKey: runKey };
+  }
 
   _active.add(flow.id);
   try {
     return execute(flow, compiled.plan, {
-      trigger: trigger, ts: ts, runKey: runKey, period: period, actLike: actLike,
+      trigger: trigger, ts: ts, runKey: runKey, period: period, actLike: actLike, inputs: inputs,
+      eventKey: eventKey,
     });
   } finally {
     _active.delete(flow.id);
   }
+}
+
+// ===== 资产使用配方（task.exempt 闭环）=====
+// 配方不是一条落盘的流：运行时按资产定义生成一条虚拟手动流，复用同一编译器/执行器/撤销。
+// 语义：先扣本资产（可见流水），再登记任务豁免；任一步失败整单回滚。
+function buildAssetUseFlow(def) {
+  const recipe = def && def.useRecipe;
+  if (!recipe || recipe.type !== 'task-exempt') return null;
+  const cost = Math.max(1, Math.min(10, Math.round(Number(recipe.cost) || 1)));
+  return {
+    v: 1,
+    id: 'use:' + def.id,
+    name: '使用「' + (def.name || def.id) + '」豁免',
+    enabled: true,
+    trigger: { type: 'manual' },
+    condition: { mode: 'all', items: [] },
+    limits: {
+      maxSteps: 4, maxGrantPerRun: 0, maxSpendPerRun: 0,
+      maxAssetGrantPerRun: 0, maxAssetSpendPerRun: Math.max(3, cost), maxRunsPerPeriod: 1,
+    },
+    inputs: [{ name: 'taskId', type: 'task' }],
+    steps: [
+      { id: 'spend', atom: 'asset.spend', params: { assetId: def.id, amount: cost, desc: '使用「' + (def.name || def.id) + '」' } },
+      { id: 'exempt', atom: 'task.exempt', params: { taskId: { input: 'taskId' }, desc: '「' + (def.name || def.id) + '」豁免任务' } },
+    ],
+  };
+}
+
+function assetUseDef(assetId) {
+  const def = findAssetDef(assetId);
+  if (!def) return { error: { code: 'FLOW_ASSET_UNKNOWN' } };
+  if (def.enabled === false) return { error: { code: 'FLOW_ASSET_DISABLED' } };
+  if (def.archived) return { error: { code: 'FLOW_ASSET_ARCHIVED' } };
+  if (!def.useRecipe || def.useRecipe.type !== 'task-exempt') return { error: { code: 'FLOW_NO_USE_RECIPE' } };
+  return { def: def };
+}
+
+// 使用资产执行一次手动运行（trigger='asset'，不占周期额度）
+function runAssetUse(assetId, opts) {
+  opts = opts || {};
+  if (Ledger.inTxn()) return { ok: false, error: { code: 'FLOW_BUSY', message: '资产使用不能嵌套在事务内' } };
+  const found = assetUseDef(assetId);
+  if (found.error) return { ok: false, error: found.error };
+  const taskId = opts.taskId;
+  if (typeof taskId !== 'string' || !taskId) return { ok: false, error: { code: 'FLOW_INPUT_MISSING', input: 'taskId' } };
+  const flow = buildAssetUseFlow(found.def);
+  const compiled = compile(flow);
+  if (!compiled.ok) return { ok: false, error: { code: 'FLOW_COMPILE_FAILED', errors: compiled.errors } };
+  ensureRuntimeStructures();
+  const ts = Number.isFinite(Number(opts.ts)) ? Number(opts.ts) : now();
+  const actLike = { period: 'week', anchor: 1, budgetCtx: BudgetEngine.activityContext(ts) };
+  return execute(flow, compiled.plan, {
+    trigger: 'asset', ts: ts, runKey: 'use:' + assetId + '@' + ts, period: '',
+    actLike: actLike, inputs: { taskId: taskId },
+  });
+}
+
+// 资产使用干跑：与流干跑同一条路径（克隆 state → 真执行 → 还原）
+function dryRunAssetUse(assetId, opts) {
+  opts = opts || {};
+  if (Ledger.inTxn()) {
+    return { ok: false, dryRun: true, error: { code: 'FLOW_DRY_RUN_IN_TXN', message: '干跑不能在事务内调用' } };
+  }
+  const original = getState();
+  const ts = Number.isFinite(Number(opts.ts)) ? Number(opts.ts) : now();
+  const found = assetUseDef(assetId);
+  const flowName = found.def ? ('使用「' + (found.def.name || found.def.id) + '」豁免') : '';
+  const clone = cloneStateDeep(original);
+  const snap = captureStateSnapshot(clone, ts);
+  setState(clone);
+  let report;
+  try {
+    const result = runAssetUse(assetId, { taskId: opts.taskId, ts: ts });
+    report = buildDryRunReport(original, snap, getState(), result, {
+      flowId: 'use:' + assetId, flowName: flowName, trigger: 'asset', ts: ts, periodKey: '',
+    });
+  } finally {
+    setState(original);
+  }
+  return report;
 }
 
 // 周期调度：只求值 trigger.type === 'period' 的启用流
@@ -533,7 +738,7 @@ function processDue(ts, silent) {
     if (!flow || flow.enabled === false || flow.invalid) return;
     if (!flow.trigger || flow.trigger.type !== 'period') return;
     const r = runFlow(flow.id, { trigger: 'period', ts: at });
-    if (r && r.ok && !r.skipped) changed = true;
+    if (r && r.ok && (!r.skipped || r.settled)) changed = true;
     results.push(r);
   });
   if (changed && !silent) save();
@@ -673,7 +878,7 @@ function buildDryRunReport(original, snap, after, result, meta) {
   const report = {
     ok: true, dryRun: true,
     flowId: meta.flowId,
-    flowName: (flow && flow.name) || '',
+    flowName: (flow && flow.name) || meta.flowName || '',
     trigger: meta.trigger,
     periodKey: meta.periodKey || '',
     runKey: '',
@@ -780,6 +985,8 @@ function undoFail(code, info) {
 
 function accountKeyOfLog(log) {
   if (!log || !log.st) return '';
+  // 拆分流水没有单一账户键，由 reverseOneLog 逐领域退回
+  if (log.st === 'progress' && Array.isArray(log.splits) && log.splits.length) return '';
   if (log.st === 'progress') return 'progress:' + (log.dom || 'd_default');
   if (log.st === 'card') return 'card:' + (log.card || '');
   if (log.st === 'vitality' || log.st === 'achievement') return log.st;
@@ -800,7 +1007,13 @@ function reverseOneLog(logId, ctx) {
   if (log.achId) reLockAchievement(log.achId);
   const key = accountKeyOfLog(log);
   const amt = Number(log.amt) || 0;
-  if (key && amt !== 0) {
+  if (!key && log.st === 'progress' && Array.isArray(log.splits) && log.splits.length) {
+    log.splits.forEach(function (x) {
+      const v = Number(x && x.amt) || 0;
+      if (!v) return;
+      Ledger.post({ op: 'grant', account: 'progress:' + ((x && x.dom) || 'd_default'), delta: -v, visible: false, reason: { src: 'undo-flow' } });
+    });
+  } else if (key && amt !== 0) {
     Ledger.post({ op: 'grant', account: key, delta: -amt, visible: false, reason: { src: 'undo-flow' } });
   }
   Ledger.removeLogs(function (l) { return l.id !== logId; });
@@ -827,7 +1040,22 @@ function restoreArchivedEntities(step, ctx) {
   });
 }
 
-// 7 个原子各一个反转器（独立注册表）：能复用通用语义的就只声明差异
+// task.exempt 反转：恢复任务字段（日志由通用反转删除；扣卡步骤有自己的 reverser）
+function restoreTaskExempt(step, ctx) {
+  reverseGenericStep(step, ctx);
+  const taskId = step && step.input && step.input.taskId;
+  const t = (state.tasks || []).find(function (x) { return x && x.id === taskId; });
+  if (!t) undoFail('FLOW_UNDO_ENTITY_MISSING', { kind: 'task', id: taskId });
+  const o = (step && step.output) || {};
+  if (o.prevLastExempt !== undefined && o.prevLastExempt !== null) t.lastExempt = o.prevLastExempt;
+  else delete t.lastExempt;
+  t.pendingDebt = Number(o.prevPendingDebt) || 0;
+  if (o.prevLastDebtDate !== undefined && o.prevLastDebtDate !== null) t.lastDebtDate = o.prevLastDebtDate;
+  else delete t.lastDebtDate;
+  ctx.restoredEntities += 1;
+}
+
+// 各原子一个反转器（独立注册表）：能复用通用语义的就只声明差异
 const FLOW_REVERSERS = {
   'currency.grant': reverseGenericStep,
   'currency.spend': reverseGenericStep,
@@ -839,6 +1067,7 @@ const FLOW_REVERSERS = {
     restoreArchivedEntities(step, ctx);
   },
   'engine.recheckAchievements': reverseGenericStep,
+  'task.exempt': restoreTaskExempt,
 };
 
 function restoreAssetMeters(journal, ctx) {
@@ -985,6 +1214,13 @@ function undoFlowRun(runId, opts) {
 
 const FlowEngine = {
   compile: compile, runFlow: runFlow, processDue: processDue, dryRun: dryRun, undoFlowRun: undoFlowRun,
+  runAssetUse: runAssetUse, dryRunAssetUse: dryRunAssetUse,
 };
 
-export { compile, runFlow, processDue, dryRun, undoFlowRun, FLOW_REVERSERS, FlowEngine };
+registerFlowDueProcessor(processDue);
+
+export {
+  compile, runFlow, processDue, dryRun, undoFlowRun,
+  runAssetUse, dryRunAssetUse, buildAssetUseFlow,
+  FLOW_REVERSERS, FlowEngine,
+};

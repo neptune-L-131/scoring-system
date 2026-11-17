@@ -83,7 +83,7 @@ function renderShop(){
   sl.innerHTML=html;
 
   const pl=document.getElementById('purchaseList');
-  const purchases=state.logs.filter(l=>l.src==='purchase');
+  const purchases=state.logs.filter(l=>l.src==='purchase'&&l.primaryPurchase!==false);
   if(!purchases.length){
     pl.innerHTML='<div class="empty" style="padding:24px"><p style="margin:0">暂无购买记录</p></div>';
   }else{
@@ -102,12 +102,24 @@ function shopCardHTML(p,catId,prevCatId){
   const isV=cur==='vitality';
   const cn=isV?'活力点':'成果点';
   const balance=state.scores[cur];
-  const willLoan=balance<p.price;
+  const assetPrice=(p.assetPrice&&p.assetPrice.assetId)?p.assetPrice:null;
+  const assetDef=assetPrice?(state.assetDefs||[]).find(function(d){return d&&d.id===assetPrice.assetId;})||null:null;
+  const assetBal=assetPrice?((state.cards&&state.cards[assetPrice.assetId])||0):0;
+  const assetLack=!!assetPrice&&assetBal<assetPrice.amount;
+  const assetTxt=assetPrice?' · 另需'+assetPrice.amount+' '+(assetDef?assetDef.name:assetPrice.assetId):'';
+  const grantTxt=(p.grants||[]).map(function(g){
+    if(g.kind==='asset'){
+      const d=(state.assetDefs||[]).find(function(x){return x&&x.id===g.assetId;});
+      return '赠'+(d?d.name:g.assetId)+'×'+g.amount;
+    }
+    return '赠'+(g.account==='vitality'?'活力点':'成果点')+' '+fmt(g.amount);
+  }).join('、');
+  const willLoan=!assetPrice&&balance<p.price;
   const isSoldout=p.stock===0;
   const gate=evaluateProductGate(p);
   const locked=gate.deny&&!isSoldout;
   const stockTxt=p.stock===-1?'':p.stock===0?' · 售罄':' · 库存'+p.stock;
-  const debtTxt=(p.debtRate||0)>0?' · 债率'+fmt(p.debtRate)+'%/天':'';
+  const debtTxt=(!assetPrice&&(p.debtRate||0)>0)?' · 债率'+fmt(p.debtRate)+'%/天':'';
   const loanWarn=willLoan&&!isSoldout&&!gate.deny?' · 贷款'+fmt(p.price-balance):'';
   const soldoutCls=isSoldout?' soldout':'';
   const lockedCls=locked?' locked':'';
@@ -118,14 +130,17 @@ function shopCardHTML(p,catId,prevCatId){
     ?'<div class="sh-buy" style="text-align:center;font-size:12px;color:var(--text-3);padding:8px">售罄</div>'
     :gate.deny
       ?'<button class="btn btn-sm sh-buy" disabled>门槛未达标</button>'
-      :'<button class="btn btn-sm sh-buy" onclick="buyProduct(\''+p.id+'\')">'+(willLoan?'贷款购买':'购买')+'</button>';
+      :assetLack
+        ?'<button class="btn btn-sm sh-buy" disabled>资产不足</button>'
+        :'<button class="btn btn-sm sh-buy" onclick="buyProduct(\''+p.id+'\')">'+(willLoan?'贷款购买':'购买')+'</button>';
   return '<div class="shop-card'+soldoutCls+lockedCls+'" data-prod-id="'+p.id+'" data-cat-id="'+catId+'"'+dataPrevCat+'>'
     +'<div class="card-top" style="margin-bottom:0"><div class="sh-name">'+esc(p.name)+'</div>'
     +actionsRowHTML('card-actions',dragHandleHTML('拖拽排序或跨分类移动')+'<button onclick="openProdModal(\''+p.id+'\')">编辑</button><button class="del" onclick="confirmDelProd(\''+p.id+'\')">删除</button>')+'</div>'
     +(p.desc?'<div class="sh-desc">'+esc(p.desc)+'</div>':'')
     +((p.budget&&p.budget.categoryId&&Number(p.budget.amount)>0)
       ?'<div class="sh-budget">预算·'+esc((BudgetEngine.category(p.budget.categoryId)||{name:'已删除分类'}).name)+' '+fmt(p.budget.amount)+'</div>':'')
-    +'<div class="sh-cost '+(isV?'v':'a')+'">'+fmt(p.price)+'<span class="unit">'+cn+tierTxt+stockTxt+debtTxt+loanWarn+'</span></div>'
+    +(grantTxt?'<div class="sh-budget">'+esc(grantTxt)+'</div>':'')
+    +'<div class="sh-cost '+(isV?'v':'a')+'">'+fmt(p.price)+'<span class="unit">'+cn+tierTxt+stockTxt+debtTxt+loanWarn+assetTxt+'</span></div>'
     +gateHTML
     +buyHTML
     +'</div>';

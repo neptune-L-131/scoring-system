@@ -10,15 +10,17 @@ import {
   FLOW_ATOM_NOTE_MAX_LEN, FLOW_MAX_DEPTH, FLOW_MAX_STEPS, FLOW_RUN_KEEP,
   FLOW_VERSION, LOG_MAX,
 } from './constants.js';
+import { deleteMigratedFlow } from './activity-migrate.js';
 import { FLOW_ATOMS, FLOW_ATOM_IDS, assetPeriodKeyOf, describeFlowAtom } from './flow-atoms.js';
 import { FlowEngine, FLOW_REVERSERS } from './flow-engine.js';
 import { normalizeCondition } from './cond-model.js';
-import { condNodeLabel } from './cycle.js';
-import { renderCondTree, resetCondDraftUI, setCondDraftContext } from './cond-ui.js';
+import { condNodeLabel, metricLabel } from './cycle.js';
+import { isCondEventMode, refreshCondPanel, renderCondTree, resetCondDraftUI, setCondDraftContext, setCondEventMode } from './cond-ui.js';
+import { EVENT_KINDS } from './events.js';
 import { closeModal, openModal } from './modal-host.js';
 import { normalizeFlow } from './normalize.js';
 import { save } from './persist.js';
-import { cardName, esc, escAttr, fmt, now, uid } from './pure.js';
+import { cardName, esc, escAttr, fmt, isPointMetric, now, uid } from './pure.js';
 import { registerRenderer, render } from './render.js';
 import { state } from './state.js';
 import { accountLabel } from './stats.js';
@@ -124,6 +126,7 @@ function periodText(period, anchor) {
 }
 function flowTriggerText(flow) {
   const t = flow.trigger || {};
+  if (t.type === 'event') return t.event && t.event.kind === 'purchase' ? '购买时触发' : '打卡时触发';
   return t.type === 'manual' ? '手动触发' : periodText(t.period, t.anchor);
 }
 function fmtRunTime(ts) {
@@ -168,7 +171,8 @@ function defaultStep(atom) {
   return { id: nextStepId(), atom: atom, params: defaultParams(atom) };
 }
 function defaultBranchLeaf() {
-  return { range: 'period', days: 7, metric: 'checkins', op: '>=', value: 1, targetType: 'all', newFilter: 'none' };
+  // 事件触发模式下分支条件默认「今天」，否则默认「本周期」
+  return { range: isCondEventMode() ? 'today' : 'period', days: 7, metric: 'checkins', op: '>=', value: 1, targetType: 'all', newFilter: 'none' };
 }
 function defaultBranch() {
   const step = { id: nextStepId(), kind: 'branch', when: { mode: 'all', items: [defaultBranchLeaf()] }, then: [], else: [] };
@@ -241,7 +245,18 @@ function validateStepParams(atom, params, id) {
   const p = params || {};
   if (atom === 'currency.grant' || atom === 'currency.spend') {
     if (!p.account) return fail('FLOW_BAD_PARAMS', '步骤「' + id + '」请选择账户');
-    if (!knownAccount(p.account)) return fail('FLOW_INVALID_ACCOUNT', '步骤「' + id + '」的账户「' + p.account + '」不存在');
+    const splitAll = atom === 'currency.grant' && p.split === 'allDomains';
+    if (splitAll) {
+      if (p.account !== 'progress') return fail('FLOW_BAD_PARAMS', '步骤「' + id + '」只有进度账户支持全部领域均分');
+      if (!(state.domains || []).some(d => d && d.id)) return fail('FLOW_INVALID_ACCOUNT', '步骤「' + id + '」当前没有可分摊的领域');
+    } else if (p.account === 'progress') {
+      return fail('FLOW_INVALID_ACCOUNT', '步骤「' + id + '」进度账户需要选择具体领域');
+    } else if (!knownAccount(p.account)) {
+      return fail('FLOW_INVALID_ACCOUNT', '步骤「' + id + '」的账户「' + p.account + '」不存在');
+    }
+    if (p.taskId !== undefined && p.account !== 'vitality') {
+      return fail('FLOW_BAD_PARAMS', '步骤「' + id + '」只有活力账户支持指定任务');
+    }
     const amt = Number(p.amount);
     if (!isFinite(amt) || amt <= 0) return fail('FLOW_INVALID_AMOUNT', '步骤「' + id + '」的金额必须大于 0');
     if (Math.abs(amt * 100 - Math.round(amt * 100)) > 1e-6) return fail('FLOW_INVALID_AMOUNT', '步骤「' + id + '」的金额最多两位小数');
@@ -256,8 +271,13 @@ function validateStepParams(atom, params, id) {
     if (def.archived) return fail('FLOW_ASSET_ARCHIVED', '步骤「' + id + '」引用的资产「' + (def.name || def.id) + '」已归档');
     const amt = Number(p.amount);
     if (!Number.isInteger(amt) || amt < 1) return fail('FLOW_INVALID_AMOUNT', '步骤「' + id + '」的资产数量必须是正整数');
+    if (p.cap !== undefined) {
+      const cap = Number(p.cap);
+      if (!Number.isInteger(cap) || cap < 1) return fail('FLOW_BAD_PARAMS', '步骤「' + id + '」的上限必须是正整数');
+    }
     let max = FLOW_ATOM_MAX_ASSET;
-    if (atom === 'asset.grant' && def.maxIssuedPerPeriod !== null && def.maxIssuedPerPeriod !== undefined) {
+    // 带 cap 的发放复刻活动语义，不受资产周期上限压缩
+    if (atom === 'asset.grant' && p.cap === undefined && def.maxIssuedPerPeriod !== null && def.maxIssuedPerPeriod !== undefined) {
       max = Math.min(max, Number(def.maxIssuedPerPeriod));
     }
     if (amt > max) return fail('FLOW_AMOUNT_LIMIT', '步骤「' + id + '」的资产数量不能超过 ' + max);
@@ -304,17 +324,55 @@ function validateStepList(list, depth, seen) {
   }
   return null;
 }
+// 事件触发只承诺“事件发生那一刻”，点态指标与「本周期」范围在此时没有稳定窗口
+function walkCondLeavesUI(node, fn) {
+  if (!node || typeof node !== 'object') return;
+  if (Array.isArray(node.items)) node.items.forEach(function (n) { walkCondLeavesUI(n, fn); });
+  if (typeof node.metric === 'string' && node.metric) fn(node);
+}
+function eventCondBlockText(when) {
+  let msg = '';
+  walkCondLeavesUI(when, function (it) {
+    if (msg) return;
+    if (isPointMetric(it.metric)) {
+      msg = '事件触发不能使用点态指标「' + metricLabel(it.metric) + '」：事件时刻没有稳定取值，请改用周期触发';
+    } else if (it.range === 'period') {
+      msg = '事件触发不能用「本周期」范围：事件落在周期中途时无法确定窗口，请改用周期触发';
+    }
+  });
+  return msg;
+}
 export function validateFlowDraft(draft) {
   if (!draft) return fail('FLOW_INVALID_DEF', '动作流草稿不存在');
   const name = String(draft.name || '').trim();
   if (!name) return fail('FLOW_NAME_REQUIRED', '请填写动作流名称');
   if (name.length > 40) return fail('FLOW_NAME_TOO_LONG', '动作流名称最多 40 个字符');
   const trig = draft.trigger || {};
-  if (trig.type !== 'manual' && trig.type !== 'period') return fail('FLOW_BAD_TRIGGER', '触发方式只能是手动或周期');
+  if (trig.type !== 'manual' && trig.type !== 'period' && trig.type !== 'event') {
+    return fail('FLOW_BAD_TRIGGER', '触发方式只能是手动、周期或事件');
+  }
   if (trig.type === 'period') {
     if (['day', 'week', 'month'].indexOf(trig.period) < 0) return fail('FLOW_BAD_TRIGGER', '周期只能是每天/每周/每月');
     const anchor = Number(trig.anchor);
     if (!Number.isInteger(anchor) || anchor < 1 || anchor > 7) return fail('FLOW_BAD_TRIGGER', '周期锚点必须是 1–7 的整数');
+  }
+  if (trig.type === 'event') {
+    const kind = trig.event && trig.event.kind;
+    if (EVENT_KINDS.indexOf(kind) < 0) return fail('FLOW_BAD_TRIGGER', '事件触发只能选择打卡或购买');
+    const blocked = eventCondBlockText(draft.condition);
+    if (blocked) return fail('FLOW_EVENT_BAD_CONDITION', blocked);
+    let branchMsg = '';
+    (function walk(list) {
+      (Array.isArray(list) ? list : []).forEach(function (s) {
+        if (branchMsg || !s || typeof s !== 'object') return;
+        if (s.kind === 'branch') {
+          branchMsg = eventCondBlockText(s.when);
+          walk(s.then);
+          walk(s.else);
+        }
+      });
+    })(draft.steps);
+    if (branchMsg) return fail('FLOW_EVENT_BAD_CONDITION', branchMsg);
   }
   const steps = Array.isArray(draft.steps) ? draft.steps : [];
   if (!steps.length) return fail('FLOW_NO_STEPS', '请至少添加一个步骤');
@@ -325,11 +383,13 @@ export function validateFlowDraft(draft) {
   return {
     ok: true,
     name: name,
-    trigger: {
-      type: trig.type,
-      period: trig.type === 'period' ? trig.period : 'week',
-      anchor: trig.type === 'period' ? Number(trig.anchor) : 1,
-    },
+    trigger: trig.type === 'event'
+      ? { type: 'event', event: { kind: trig.event.kind }, period: 'week', anchor: 1 }
+      : {
+        type: trig.type,
+        period: trig.type === 'period' ? trig.period : 'week',
+        anchor: trig.type === 'period' ? Number(trig.anchor) : 1,
+      },
   };
 }
 
@@ -366,8 +426,11 @@ export function sanitizeFlowSteps(list) {
     const src = (s && s.params) || {};
     const params = {};
     allowed.forEach(function (k) {
-      if (k === 'amount' || k === 'idleDays') {
-        const n = Number(String(src[k] === undefined ? '' : src[k]).trim());
+      if (k === 'amount' || k === 'idleDays' || k === 'cap') {
+        // 未填写的数值型参数直接省略：Number('') === 0 会把可选参数写成 0
+        const raw = src[k];
+        if (raw === undefined || raw === null || String(raw).trim() === '') return;
+        const n = Number(String(raw).trim());
         if (isFinite(n)) params[k] = n;
       } else if (src[k] !== undefined && String(src[k]).trim() !== '') {
         params[k] = String(src[k]).trim();
@@ -399,6 +462,8 @@ const COMPILE_ERR_TEXT = {
   FLOW_REACHECK_ORDER: '「复核成就」必须作为最后一个顶层步骤且只能出现一次',
   FLOW_BAD_REF: '金额引用配置不合法',
   FLOW_REF_DEFAULT_REQUIRED: '分支内输出被引用时必须提供默认值',
+  FLOW_EVENT_POINT_METRIC: '事件触发不能使用点态指标（事件时刻没有稳定取值）',
+  FLOW_EVENT_PERIOD_RANGE: '事件触发不能使用「本周期」范围条件（事件时刻等不到正确窗口）',
 };
 function compileErrorText(errors) {
   const e = (errors && errors[0]) || {};
@@ -420,9 +485,13 @@ function buildCandidate() {
     invalid: false,
     trigger: v.trigger,
     condition: normalizeCondition(flowDraft.condition),
+    settleWhenConditionFalse: flowDraft.settleWhenConditionFalse === true,
+    editorMode: (existing ? existing.editorMode : flowDraft.editorMode) === 'simple' ? 'simple' : 'advanced',
+    migratedFromActivity: existing ? existing.migratedFromActivity : (flowDraft.migratedFromActivity || ''),
     limits: existing ? existing.limits : {},
     steps: sanitizeFlowSteps(flowDraft.steps),
     lastRun: existing ? existing.lastRun : null,
+    lastEventKey: existing ? existing.lastEventKey : '',
     createdAt: existing && existing.createdAt ? existing.createdAt : ts,
     updatedAt: ts,
   });
@@ -484,15 +553,24 @@ function assetOptions() {
 function paramsHTML(atom, params, path) {
   const p = params || {};
   if (atom === 'currency.grant' || atom === 'currency.spend') {
+    const accts = accountOptions();
+    if (atom === 'currency.grant' && p.split === 'allDomains') accts.unshift({ id: 'progress', name: '进度·全部领域均分' });
     return '<label>账户<select onchange="flowStepParamChanged(\'' + path + '\',\'account\',this.value)">' +
-      optionsHTML(accountOptions(), p.account || 'vitality', true) + '</select></label>' +
+      optionsHTML(accts, p.account || 'vitality', true) + '</select></label>' +
       '<label>金额<input type="number" min="0.01" max="' + FLOW_ATOM_MAX_CURRENCY + '" step="0.01" value="' + escAttr(p.amount === undefined ? '1' : p.amount) + '" onchange="flowStepParamChanged(\'' + path + '\',\'amount\',this.value)"></label>' +
+      (atom === 'currency.grant'
+        ? '<label>领域<select onchange="flowStepSplitChanged(\'' + path + '\',this.value)"><option value=""' + (p.split === 'allDomains' ? '' : ' selected') + '>跟随账户</option><option value="allDomains"' + (p.split === 'allDomains' ? ' selected' : '') + '>全部领域均分</option></select></label>' +
+          '<label>任务 ID（可选）<input type="text" maxlength="64" value="' + escAttr(p.taskId || '') + '" onchange="flowStepParamChanged(\'' + path + '\',\'taskId\',this.value)"></label>'
+        : '') +
       '<label>备注<input type="text" maxlength="120" value="' + escAttr(p.desc || '') + '" onchange="flowStepParamChanged(\'' + path + '\',\'desc\',this.value)"></label>';
   }
   if (atom === 'asset.grant' || atom === 'asset.spend') {
     return '<label>资产<select onchange="flowStepParamChanged(\'' + path + '\',\'assetId\',this.value)">' +
       optionsHTML(assetOptions(), p.assetId || '', true) + '</select></label>' +
       '<label>数量<input type="number" min="1" max="' + FLOW_ATOM_MAX_ASSET + '" step="1" value="' + escAttr(p.amount === undefined ? '1' : p.amount) + '" onchange="flowStepParamChanged(\'' + path + '\',\'amount\',this.value)"></label>' +
+      (atom === 'asset.grant'
+        ? '<label>上限（可选）<input type="number" min="1" max="999" step="1" value="' + escAttr(p.cap === undefined ? '' : p.cap) + '" onchange="flowStepParamChanged(\'' + path + '\',\'cap\',this.value)"></label>'
+        : '') +
       '<label>备注<input type="text" maxlength="120" value="' + escAttr(p.desc || '') + '" onchange="flowStepParamChanged(\'' + path + '\',\'desc\',this.value)"></label>';
   }
   if (atom === 'entity.archiveIdle') {
@@ -587,20 +665,28 @@ function flowCardHTML(flow) {
   const tag = flow.invalid
     ? '<span class="flow-tag off">定义异常</span>'
     : (enabled ? '<span class="flow-tag on">运行中</span>' : '<span class="flow-tag off">已停用</span>');
+  const modeTag = flow.editorMode === 'simple' ? '<span class="flow-tag">简易</span>' : '';
+  const eventFlow = !!(flow.trigger && flow.trigger.type === 'event');
+  const onNote = eventFlow ? '打卡/购买成功提交后自动执行一次；每次运行都可在下方整单撤销。' : '到点会自动执行；每次运行都可在下方整单撤销。';
+  const offNote = eventFlow ? '已停用：打卡/购买后不会执行；开启后才生效。' : '已停用：不会自动执行；新建的流默认停用，启用后才按周期运行。';
+  const deleteBtn = flow.migratedFromActivity
+    ? '<button class="btn btn-sm btn-danger" onclick="deleteMigratedFlowConfig(\'' + attrId(flow.id) + '\')">删除</button>'
+    : '';
   const steps = (flow.steps || []).map(function (s, i) {
     return '<div class="flow-step-line"><span class="flow-step-idx">' + (i + 1) + '</span>' + esc(stepSummary(s)) + '</div>';
   }).join('') || '<div class="flow-step-none">还没有步骤</div>';
   return '<div class="flow-item">' +
-    '<div class="flow-head"><div class="flow-title">' + esc(flow.name || '未命名动作流') + tag + '</div>' +
+    '<div class="flow-head"><div class="flow-title">' + esc(flow.name || '未命名动作流') + tag + modeTag + '</div>' +
     '<div class="flow-ops">' +
     '<button class="btn btn-sm" onclick="openFlowModal(\'' + attrId(flow.id) + '\')">编辑</button>' +
     '<button class="btn btn-sm" onclick="dryRunFlow(\'' + attrId(flow.id) + '\')">试跑</button>' +
-    '<button class="btn btn-sm btn-primary" onclick="executeFlow(\'' + attrId(flow.id) + '\')"' + (enabled ? '' : ' disabled') + '>立即执行</button>' +
-    '<label class="flow-switch" title="启用后才会按周期自动执行"><input type="checkbox"' + (enabled ? ' checked' : '') + ' onchange="toggleFlowEnabled(\'' + attrId(flow.id) + '\')"><span></span></label>' +
+    '<button class="btn btn-sm btn-primary" onclick="executeFlow(\'' + attrId(flow.id) + '\')"' + (enabled && !eventFlow ? '' : ' disabled') + (eventFlow ? ' title="事件触发流不能手动执行"' : '') + '>立即执行</button>' +
+    deleteBtn +
+    '<label class="flow-switch" title="' + (eventFlow ? '启用后打卡/购买提交时会自动执行' : '启用后才会按周期自动执行') + '"><input type="checkbox"' + (enabled ? ' checked' : '') + ' onchange="toggleFlowEnabled(\'' + attrId(flow.id) + '\')"><span></span></label>' +
     '</div></div>' +
     '<div class="flow-meta">' + esc(flowTriggerText(flow)) + ' · 条件：' + esc(flowCondSummary(flow)) + ' · ' + countSteps(flow.steps) + ' 个步骤</div>' +
     '<div class="flow-steps">' + steps + '</div>' +
-    '<div class="flow-note">' + (enabled ? '到点会自动执行；每次运行都可在下方整单撤销。' : '已停用：不会自动执行；新建的流默认停用，启用后才按周期运行。') + '</div>' +
+    '<div class="flow-note">' + (enabled ? onNote : offNote) + '</div>' +
     '</div>';
 }
 function warningText(w) {
@@ -719,7 +805,7 @@ function runCardHTML(rec) {
   if (!rec) return '';
   const reversed = rec.status === 'reversed';
   const tag = reversed ? '<span class="flow-tag off">已撤销</span>' : '<span class="flow-tag on">可撤销</span>';
-  const trig = rec.trigger === 'manual' ? '手动' : '周期';
+  const trig = rec.trigger === 'manual' ? '手动' : (rec.trigger === 'event' ? '事件' : '周期');
   const journal = rec.journal;
   const steps = journal && Array.isArray(journal.steps) ? journal.steps.map(runStepLine).join('') : '<div class="flow-step-none">没有可展示的步骤明细</div>';
   const accounts = journal && Array.isArray(journal.accounts) ? journal.accounts : [];
@@ -828,6 +914,23 @@ export function flowUndoErrorText(error) {
 }
 
 // ===== 处理器 =====
+function triggerSelectValue(t) {
+  if (t && t.type === 'event' && t.event && EVENT_KINDS.indexOf(t.event.kind) >= 0) return 'event-' + t.event.kind;
+  return (t && t.type === 'manual') ? 'manual' : 'period';
+}
+function isEventTriggerSelect(v) {
+  return v === 'event-checkin' || v === 'event-purchase';
+}
+function triggerFromSelect(v) {
+  if (isEventTriggerSelect(v)) {
+    return { type: 'event', event: { kind: v.slice(6) }, period: 'week', anchor: 1 };
+  }
+  return {
+    type: v === 'manual' ? 'manual' : 'period',
+    period: fieldValue('flowPeriod') || 'week',
+    anchor: Number(fieldValue('flowAnchor')) || 1,
+  };
+}
 export function openFlowModal(flowId) {
   const flow = flowId ? findFlow(flowId) : null;
   if (flowId && !flow) {
@@ -847,6 +950,9 @@ export function openFlowModal(flowId) {
       enabled: false,
       trigger: { type: 'period', period: 'week', anchor: 1 },
       condition: { mode: 'all', items: [] },
+      settleWhenConditionFalse: false,
+      editorMode: 'advanced',
+      migratedFromActivity: '',
       limits: {},
       steps: [],
     };
@@ -856,14 +962,16 @@ export function openFlowModal(flowId) {
   flowModalOpen = true;
   setField('flowName', flowDraft.name || '');
   setChecked('flowEnabled', flowDraft.enabled !== false);
-  setField('flowTriggerType', flowDraft.trigger.type === 'manual' ? 'manual' : 'period');
+  setField('flowTriggerType', triggerSelectValue(flowDraft.trigger));
   setField('flowPeriod', flowDraft.trigger.period || 'week');
   setField('flowAnchor', String(flowDraft.trigger.anchor || 1));
   setField('flowCondMode', flowDraft.condition.mode === 'any' ? 'any' : 'all');
+  setChecked('flowSettleWhenFalse', flowDraft.settleWhenConditionFalse === true);
   setFlowHint('');
   bindFlowCond();
   renderCondTree();
   renderFlowSteps();
+  renderFlowEditorMode();
   flowTriggerChanged();
   openModal('flowModal');
   return flowDraft;
@@ -872,19 +980,57 @@ export function closeFlowModal() {
   flowModalOpen = false;
   flowDraft = null;
   flowEditingId = '';
+  setCondEventMode(false);
   resetCondDraftUI();
   closeModal('flowModal');
+}
+function renderFlowEditorMode() {
+  if (!flowDraft) return;
+  const simple = flowDraft.editorMode === 'simple';
+  showEl('flowStepsWrap', !simple);
+  const box = document.getElementById('flowSimpleSummary');
+  if (!box) return;
+  if (!simple) {
+    box.style.display = 'none';
+    box.innerHTML = '';
+    return;
+  }
+  const steps = Array.isArray(flowDraft.steps) ? flowDraft.steps : [];
+  box.style.display = '';
+  box.innerHTML = '<div class="sec-note">简易模式：迁移生成的步骤只读预览；需要调整细节请转为高级编辑。</div>'
+    + steps.map(function (s, i) {
+      return '<div class="act-meta">' + (i + 1) + '. ' + esc(stepSummary(s)) + '</div>';
+    }).join('')
+    + '<button class="btn btn-sm" onclick="flowSwitchToAdvanced()">转为高级编辑</button>';
+}
+export function flowSwitchToAdvanced() {
+  if (!flowDraft) return;
+  flowDraft.editorMode = 'advanced';
+  renderFlowEditorMode();
+  toast('已切换到高级编辑；保存后生效');
+}
+export function deleteMigratedFlowConfig(flowId) {
+  const flow = findFlow(flowId);
+  if (!flow) { toast('动作流不存在或已被删除', 'err'); return; }
+  if (typeof confirm === 'function' && !confirm('删除动作流「' + (flow.name || flow.id) + '」？\n旧周期活动会保持停用，可重新迁移。')) return;
+  const r = deleteMigratedFlow(flowId);
+  if (!r.ok) {
+    if (r.code === 'FLOW_HAS_RUNS') toast('该动作流已有运行记录，无法删除', 'err');
+    else if (r.code === 'FLOW_NOT_MIGRATED') toast('只能删除由周期活动迁移生成的流', 'err');
+    else toast('删除失败：' + (r.code || '未知原因'), 'err');
+    return;
+  }
+  save();
+  renderAfterChange();
+  toast('已删除迁移动作流；旧活动保持停用，可重新迁移');
 }
 export function handleFlowSave() {
   if (!flowDraft) return fail('FLOW_NO_DRAFT', '请先打开动作流编辑器');
   flowDraft.name = fieldValue('flowName');
   flowDraft.enabled = getChecked('flowEnabled');
-  flowDraft.trigger = {
-    type: fieldValue('flowTriggerType') === 'manual' ? 'manual' : 'period',
-    period: fieldValue('flowPeriod') || 'week',
-    anchor: Number(fieldValue('flowAnchor')) || 1,
-  };
+  flowDraft.trigger = triggerFromSelect(fieldValue('flowTriggerType'));
   flowDraft.condition.mode = fieldValue('flowCondMode') === 'any' ? 'any' : 'all';
+  flowDraft.settleWhenConditionFalse = getChecked('flowSettleWhenFalse');
   const built = buildCandidate();
   if (!built.ok) {
     setFlowHint(built.message, false);
@@ -913,10 +1059,16 @@ function renderAfterChange() {
   render();
 }
 export function flowTriggerChanged() {
-  const type = fieldValue('flowTriggerType') === 'manual' ? 'manual' : 'period';
+  const v = fieldValue('flowTriggerType');
+  const event = isEventTriggerSelect(v);
+  const type = event ? 'event' : (v === 'manual' ? 'manual' : 'period');
   showEl('flowPeriodWrap', type === 'period');
   showEl('flowAnchorWrap', type === 'period');
-  if (flowDraft) flowDraft.trigger.type = type;
+  showEl('flowEventHint', event);
+  // 事件触发模式下条件编辑器要提前说明哪些指标/范围不可用，避免配完才发现被拒
+  setCondEventMode(event);
+  refreshCondPanel();
+  if (flowDraft) flowDraft.trigger = triggerFromSelect(v);
 }
 export function flowCondModeChange() {
   if (!flowDraft) return;
@@ -930,6 +1082,19 @@ export function flowStepAtomChanged(path, atom) {
   if (!step || !FLOW_ATOMS[atom]) return;
   step.atom = atom;
   step.params = defaultParams(atom);
+  renderFlowSteps();
+}
+export function flowStepSplitChanged(path, value) {
+  const step = stepAt(path);
+  if (!step) return;
+  if (!step.params || typeof step.params !== 'object') step.params = {};
+  if (value === 'allDomains') {
+    step.params.split = 'allDomains';
+    step.params.account = 'progress';
+  } else {
+    delete step.params.split;
+    if (step.params.account === 'progress') step.params.account = 'vitality';
+  }
   renderFlowSteps();
 }
 export function flowStepParamChanged(path, key, value) {
@@ -947,6 +1112,11 @@ export function flowStepParamChanged(path, key, value) {
     return;
   }
   if (!step.params || typeof step.params !== 'object') step.params = {};
+  // 可选参数清空即移除，避免空字符串被当成 0 / 非法值
+  if ((key === 'cap' || key === 'taskId') && String(value).trim() === '') {
+    delete step.params[key];
+    return;
+  }
   step.params[key] = value;
 }
 export function flowStepMove(path, dir) {
@@ -1012,7 +1182,10 @@ export function toggleFlowEnabled(flowId) {
   flow.updatedAt = now();
   save();
   renderAfterChange();
-  toast(next ? ('已启用「' + flow.name + '」：将按周期自动执行') : ('已停用「' + flow.name + '」：不会再自动执行'));
+  const isEvent = !!(flow.trigger && flow.trigger.type === 'event');
+  toast(next
+    ? ('已启用「' + flow.name + '」：' + (isEvent ? '打卡/购买提交后自动执行' : '将按周期自动执行'))
+    : ('已停用「' + flow.name + '」：不会再自动执行'));
   return { ok: true, enabled: next };
 }
 export function dryRunFlow(flowId) {
@@ -1044,6 +1217,10 @@ export function executeFlow(flowId) {
   if (flow.enabled === false || flow.invalid) {
     toast('「' + flow.name + '」已停用，请先启用再执行', 'err');
     return { ok: false, code: 'FLOW_DISABLED' };
+  }
+  if (flow.trigger && flow.trigger.type === 'event') {
+    toast('事件触发流只能在打卡/购买提交后自动执行，不能手动运行', 'warn');
+    return { ok: false, code: 'FLOW_EVENT_TRIGGERED' };
   }
   if (typeof confirm === 'function' && !confirm('立即执行动作流「' + flow.name + '」？会立即写入流水。')) {
     return { ok: false, cancelled: true };

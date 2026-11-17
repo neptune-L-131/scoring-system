@@ -2,7 +2,8 @@ import { BudgetEngine } from './budget.js';
 import { checkAchievements } from './business.js';
 import { processActivities, setLastTickDay } from './entities.js';
 import { FlowEngine } from './flow-engine.js';
-import { ensureMetabolismRule, processDailyTaskDebts, processLoansWithDecayReserve } from './library.js';
+import { processDailyTaskDebts, processLoansWithDecayReserve } from './debt.js';
+import { ensureMetabolismRule } from './metabolism.js';
 import { dayKey } from './pure.js';
 import { processChoreDecay } from './render-work.js';
 // startup.js —— 启动时的一次性处理器（活动/债务/贷款/预算结算/跨天基准）

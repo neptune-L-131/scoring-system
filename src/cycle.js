@@ -1,11 +1,7 @@
 import { registerRenderer } from './render.js';
 import { BudgetEngine } from './budget.js';
-import { normalizeCondition } from './cond-model.js';
-import { condDraft, condDraftUI, countCondLeaves, renderActivityResultDetails, renderCondTree, resetCondDraftUI, setCondDraft } from './cond-ui.js';
 import { COND_RANGES } from './constants.js';
-import { archiveIdleEntities } from './entities.js';
-import { openModal } from './modal-host.js';
-import { cardName, isAffairMetric, isChoreMetric, isPointMetric, esc, fmt } from './pure.js';
+import { cardName, isPointMetric, fmt } from './pure.js';
 import { state } from './state.js';
 import { addDays, dayStart, now, rangeOf, relativeDay, weekStart } from './time.js';
 import { domainName, taskNameLabel } from './utils.js';
@@ -199,122 +195,12 @@ function actMetaLabel(a){
   const resTxt=resItems.length?resItems.map(rewardItemLabel).join('、'):'无';
   return '前提：'+condTxt+'　结果：'+resTxt;
 }
-function readRewardItems(){
-  const rewardItems=[];
-  document.querySelectorAll('#activityResultDetails .reward-row').forEach(row=>{
-    const type=row.querySelector('.rr-type').value;
-    if(type==='archive'){
-      const entSel=row.querySelector('.rr-entity');
-      const idleInp=row.querySelector('.rr-idle');
-      rewardItems.push({
-        type:'archive',
-        entity:entSel?entSel.value:'task',
-        idleDays:Math.max(1,Math.round(Number(idleInp&&idleInp.value)||14))
-      });
-      return;
-    }
-    const amount=Math.max(0,Number(row.querySelector('.rr-amount').value)||0);
-    if(amount<=0&&type!=='card')return;
-    if(type==='card'){
-      rewardItems.push({type:'card',card:'exemption',amount:Math.round(amount),cap:Math.max(1,Math.round(Number(row.querySelector('.rr-cap').value)||3))});
-    }else if(type==='progress'){
-      const did=row.querySelector('.rr-domain').value;
-      const r={type:'progress',amount:amount};
-      if(did)r.domainId=did;
-      rewardItems.push(r);
-    }else if(type==='vitality'){
-      const tid=row.querySelector('.rr-task').value;
-      const r={type:'vitality',amount:amount};
-      if(tid)r.taskId=tid;
-      rewardItems.push(r);
-    }else if(type==='achievement'){
-      rewardItems.push({type:'achievement',amount:amount});
-    }
-  });
-  return rewardItems;
-}
-function updateCondPreview(){
-  const el=document.getElementById(condDraftUI.previewId||'condPreview');
-  if(!el)return;
-  // 预算规则条件：交给预算侧的自定义预览，不读取周期活动字段
-  if(condDraftUI.previewFn){condDraftUI.previewFn(el,condDraft);return;}
-  const periodSel=document.getElementById('activityPeriod');
-  if(!periodSel)return;
-  const items=condDraft.items||[];
-  const mode=condDraft.mode==='any'?'any':'all';
-  const period=periodSel.value;
-  const anchor=parseInt(document.getElementById('activityAnchor').value,10)||1;
-  const anchorNames=['','周一','周二','周三','周四','周五','周六','周日'];
-  const when=period==='day'?'每天结算时':period==='month'?'每月结算时':('每'+anchorNames[anchor]+'结算时');
-  const actLike={period:period};
-  let condTxt;
-  if(!items.length)condTxt='无条件触发';
-  else condTxt=items.map(n=>condNLNode(n,actLike)).join(mode==='any'?' 或 ':' 且 ');
-  const rewards=readRewardItems();
-  let resTxt=rewards.length?rewards.map(rewardItemLabel).join('、'):'（未设置动作）';
-  // 结构操作在配置时就给出当前命中数量：让用户确认“触发会发生什么”
-  const arch=rewards.filter(r=>r.type==='archive');
-  if(arch.length){
-    let hit=0;
-    arch.forEach(r=>{hit+=archiveIdleEntities(r.entity,r.idleDays,Date.now(),'',true);});
-    resTxt+='（按当前状态将归档 '+hit+' 个）';
-  }
-  el.innerHTML='<span class="cp-badge">预览</span>'+esc(when)+'，若 '+esc(condTxt)+'，则 '+esc(resTxt)+'。';
-}
-function openActivityModal(id){
-  const a=id?state.activities.find(x=>x.id===id):null;
-  document.getElementById('activityId').value=id||'';
-  document.getElementById('activityModalTitle').textContent=id?'编辑周期活动':'新建周期活动';
-  document.getElementById('activityName').value=a?a.name:'';
-  document.getElementById('activityPeriod').value=a?a.period:'week';
-  document.getElementById('activityAnchor').value=a?(a.anchor||1):1;
-  resetCondDraftUI();
-  setCondDraft(normalizeCondition((a&&a.condition)||{mode:'all',items:[]}));
-  document.getElementById('activityCondMode').value=(condDraft.mode==='any')?'any':'all';
-  document.getElementById('activityDeleteBtn').style.display=id?'':'none';
-  renderActivityResultDetails(a?a.result:null);
-  renderCondTree();
-  activityPeriodChanged();
-  // 折叠分区：基本信息展开，前提与奖励默认收起以保持简洁（标题栏显示摘要）
-  setAcc('accBasic',true);
-  setAcc('accCond',false);
-  setAcc('accResult',false);
-  updateActivitySummary();
-  openModal('activityModal');
-  setTimeout(()=>document.getElementById('activityName').focus(),50);
-}
-function activityPeriodChanged(){
-  const p=document.getElementById('activityPeriod').value;
-  document.getElementById('activityAnchorFg').style.display=(p==='week')?'':'none';
-  updateCondPreview();
-  updateActivitySummary();
-}
-function toggleAcc(id){const el=document.getElementById(id);if(el)el.classList.toggle('open');}
-function setAcc(id,open){const el=document.getElementById(id);if(el)el.classList.toggle('open',open);}
-function updateActivitySummary(){
-  const periodSel=document.getElementById('activityPeriod');
-  if(periodSel){
-    const p=periodSel.value;
-    const anchorNames=['','周一','周二','周三','周四','周五','周六','周日'];
-    const a=parseInt(document.getElementById('activityAnchor').value,10)||1;
-    const basicSum=document.getElementById('accBasicSum');
-    if(basicSum)basicSum.textContent=p==='week'?('每周 · '+anchorNames[a]):periodLabel(p);
-  }
-  const condMode=document.getElementById('activityCondMode');
-  const condSum=document.getElementById('accCondSum');
-  if(condSum){
-    const n=countCondLeaves(condDraft.items||[]);
-    const m=(condMode&&condMode.value==='any')?'任一':'全部';
-    condSum.textContent=n?((m==='任一'?'任一满足':'全部满足')+' · '+n+' 项'):'无条件';
-  }
-  const resBox=document.getElementById('activityResultDetails');
-  const resSum=document.getElementById('accResultSum');
-  if(resSum&&resBox){
-    const n=resBox.querySelectorAll('.reward-row').length;
-    resSum.textContent=n?(n+' 项动作'):'未设置';
-  }
-}
 
-export { fmtDate, cycleNextGrant, updateExemptChip, periodLabel, COND_METRICS, COND_TARGET_TYPES, COND_NEW_FILTERS, COND_AGGREGATES, condTargetTypesFor, condNewFilterOptions, rangeLabel, metricNameLabel, condEntityWord, condIsMulti, condScopePhrase, metricLabel, opLabel, rangeTimeWord, condItemLabel, condNodeLabel, condNLLeaf, condNLNode, rewardItemLabel, actMetaLabel, readRewardItems, updateCondPreview, openActivityModal, activityPeriodChanged, toggleAcc, setAcc, updateActivitySummary };
+
+
+
+
+
+export { fmtDate, cycleNextGrant, updateExemptChip, periodLabel, COND_METRICS, COND_TARGET_TYPES, COND_NEW_FILTERS, COND_AGGREGATES, condTargetTypesFor, condNewFilterOptions, rangeLabel, metricNameLabel, condEntityWord, condIsMulti, condScopePhrase, metricLabel, opLabel, rangeTimeWord, condItemLabel, condNodeLabel, condNLLeaf, condNLNode, rewardItemLabel, actMetaLabel };
 
 registerRenderer('exempt', updateExemptChip);

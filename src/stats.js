@@ -126,7 +126,7 @@ function computeEntryAgg(entry){
   const a=(st==='achievement')?(Number(entry.amt)||0):0;
   agg.v=v;agg.p=p;agg.a=a;
   if(entry.src==='checkin')agg.ck=1;
-  if(entry.src==='purchase')agg.buy=1;
+  if(entry.src==='purchase'&&entry.primaryPurchase!==false)agg.buy=1;
   if(entry.src==='cost'&&Number(entry.amt)<0)agg.inv=-Number(entry.amt)||0;
   if(entry.src==='purchase'&&st==='vitality'&&Number(entry.amt)<0)agg.cons=-Number(entry.amt)||0;
   if(entry.src==='checkin'&&v>0)agg.prod=v;

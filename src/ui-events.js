@@ -1,7 +1,5 @@
 import { Persist, save } from './persist.js';
-import { renderBank } from './render-bank.js';
-import { renderWork } from './render-work.js';
-import { render } from './render.js';
+import { getRenderer, render } from './render.js';
 import { state } from './state.js';
 import { toast } from './toast.js';
 // ui-events.js —— 内联开关、折叠、拖拽排序
@@ -16,8 +14,10 @@ function filterByDomain(domId){
     state.filterDomain=domId;
   }
   save();
-  renderWork();
-  renderBank();
+  const renderWork = getRenderer('work');
+  const renderBank = getRenderer('bank');
+  if (renderWork) renderWork();
+  if (renderBank) renderBank();
 }
 
 function toggleInline(id){

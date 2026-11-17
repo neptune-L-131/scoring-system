@@ -272,6 +272,12 @@
   </div>
   <div id="cycleActivities"></div>
 
+  <div class="sec-head mt-lg">
+    <div class="sec-title">从周期活动迁移</div>
+    <div class="sec-meta">旧活动停用保留；迁移出的流默认停用、简易模式</div>
+  </div>
+  <div id="activityMigrationPanel"></div>
+
   <div class="sec-head sec-head-major mt-lg">
     <div class="sec-title">动作流</div>
     <div style="display:flex;gap:6px">
@@ -800,6 +806,13 @@
         <option value="4">周四</option><option value="5">周五</option><option value="6">周六</option><option value="7">周日</option>
       </select>
     </div>
+    <div class="fg">
+      <label>使用配方 <span class="h">允许在任务卡上消耗本资产执行「豁免」；不配置则该资产只能发/扣</span></label>
+      <select id="assetUse">
+        <option value="none">无</option>
+        <option value="task-exempt">任务豁免（消耗 1 张）</option>
+      </select>
+    </div>
     <div class="asset-form-hint" id="assetFormHint"></div>
     <div class="modal-foot">
       <button class="btn" onclick="closeModal('assetModal')">取消</button>
@@ -821,6 +834,8 @@
         <select id="flowTriggerType" onchange="flowTriggerChanged()">
           <option value="period">按周期自动</option>
           <option value="manual">仅手动</option>
+          <option value="event-checkin">打卡时触发</option>
+          <option value="event-purchase">购买时触发</option>
         </select>
       </div>
       <div class="fg" id="flowPeriodWrap"><label>周期</label>
@@ -841,9 +856,11 @@
           <option value="7">周日 / 7 号</option>
         </select>
       </div>
+      <div class="sub" id="flowEventHint" style="display:none">事件触发会在打卡/购买成功提交后执行一次，条件按事件发生时刻求值；点态指标与「本周期」范围不可用。事件流不会触发其它事件流。</div>
     </div>
     <div class="fg">
       <label class="flow-check"><input type="checkbox" id="flowEnabled"> 启用（启用后才会按周期自动执行；新建默认停用）</label>
+      <label class="flow-check"><input type="checkbox" id="flowSettleWhenFalse"> 条件不成立时也结束本周期（每周期只求值一次）</label>
     </div>
 
     <div class="sec-head">
@@ -860,11 +877,14 @@
     <div id="flowCondItems" class="cond-tree"></div>
     <div id="flowCondPreview" class="sec-note"></div>
 
-    <div class="sec-head">
-      <div class="sec-title">有序步骤</div>
-      <div class="sec-meta">只能选择已开放的 7 个原子；金额与数量在保存时校验</div>
+    <div id="flowStepsWrap">
+      <div class="sec-head">
+        <div class="sec-title">有序步骤</div>
+        <div class="sec-meta">只能选择已开放的 8 个原子；金额与数量在保存时校验</div>
+      </div>
+      <div id="flowStepList"></div>
     </div>
-    <div id="flowStepList"></div>
+    <div id="flowSimpleSummary" style="display:none"></div>
 
     <div class="asset-form-hint" id="flowFormHint"></div>
     <div class="modal-foot">
@@ -928,7 +948,32 @@
         <div id="prodGatePreview" class="cond-preview"></div>
       </div>
     </div>
-    <div class="fg"><label>价格 <span class="h">支持小数</span></label><input type="number" id="prodPrice" value="10" min="0.1" step="0.1"></div>
+    <div class="fg"><label>价格 <span class="h">支持小数；有资产定价时可填 0</span></label><input type="number" id="prodPrice" value="10" min="0" step="0.1"></div>
+    <div class="fg">
+      <label>资产定价 <span class="h">选填：额外消耗自定义资产；有资产定价时禁用贷款与现实预算</span></label>
+      <div style="display:flex;gap:6px">
+        <select id="prodAssetPriceId" style="flex:1" onchange="onProdAssetPriceChange()"></select>
+        <input type="number" id="prodAssetPriceAmt" value="1" min="1" step="1" style="width:88px">
+      </div>
+    </div>
+    <div class="fg">
+      <label>购买赠送资产 <span class="h">选填：购买成功后赠送</span></label>
+      <div style="display:flex;gap:6px">
+        <select id="prodGrantAssetId" style="flex:1"></select>
+        <input type="number" id="prodGrantAssetAmt" value="0" min="0" step="1" style="width:88px">
+      </div>
+    </div>
+    <div class="fg">
+      <label>购买赠送货币 <span class="h">选填：活力点 / 成果点</span></label>
+      <div style="display:flex;gap:6px">
+        <select id="prodGrantCurrency" style="flex:1">
+          <option value="">不赠送</option>
+          <option value="vitality">活力点</option>
+          <option value="achievement">成果点</option>
+        </select>
+        <input type="number" id="prodGrantCurrencyAmt" value="0" min="0" step="0.1" style="width:88px">
+      </div>
+    </div>
     <div class="fg"><label>库存 <span class="h">-1 = 无限</span></label><input type="number" id="prodStock" value="-1" min="-1" step="1"></div>
     <div class="fg">
       <label>债率 <span class="h">贷款购买时，每日额外利息%</span></label>

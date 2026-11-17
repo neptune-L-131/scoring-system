@@ -26,6 +26,13 @@ function taskCardView(t) {
   const cards = (state.cards && state.cards.exemption) || 0;
   const exAct = exemptionActivity();
   const ruleEnabled = !!(exAct && exAct.enabled);
+  // 资产使用配方优先：任何配置了「任务豁免」且余额足够的资产都能承担豁免
+  const recipeAssets = (state.assetDefs || []).filter(function (d) {
+    return d && d.enabled !== false && !d.archived
+      && d.useRecipe && d.useRecipe.type === 'task-exempt'
+      && ((state.cards && state.cards[d.id]) || 0) > 0;
+  });
+  const canAsset = recipeAssets.length > 0;
 
   const typeTags = hasV && hasP
     ? [{ kind: 'v', text: '活力点' }, { kind: 'p', text: '进度值' }]
@@ -46,7 +53,8 @@ function taskCardView(t) {
     domainNames: hasP ? getTaskDomainIds(t).map(function (id) { return domainName(id); }) : [],
     exemption: {
       cards: cards,
-      canExempt: ruleEnabled && cards > 0 && !checkedToday && !exemptToday,
+      canExempt: (canAsset || (ruleEnabled && cards > 0)) && !checkedToday && !exemptToday,
+      assetDriven: canAsset,
       label: checkIn.gapDays >= 2 ? '补救' : '请假',
     },
   };

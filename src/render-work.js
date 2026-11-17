@@ -3,6 +3,7 @@ import { choreCfg, choreFreshDays, choreBaseTs, choreOverdueDays, choreTierRate,
 import { checkAchievements, checkIn, useExemption } from './business.js';
 import { BudgetEngine } from './budget.js';
 import { budgetBadgeHTML, budgetBindingHTML, budgetOf, budgetRefOf, openBudgetAmountDialog, readBudgetBinding, rememberBudgetDraft, resolveActionBudget, reverseBoundBudget } from './budget-binding.js';
+import { computeChoreDecay, processChoreDecay } from './chore-core.js';
 import { STAGE_NAMES, AFFAIR_CURVES } from './constants.js';
 import { defaultChoreConfig, normalizeChoreConfig } from './defaults.js';
 import { todayAgenda } from './entity-kit.js';
@@ -24,6 +25,7 @@ import { domainName, domainProgress, totalProgress } from './utils.js';
 import { affairCardView, choreCardView, taskCardView } from './view-models.js';
 import { ZONE_END, actionsRowHTML, collBodyHTML, collGroupHTML, collHeaderHTML, dragHandleHTML, emptyHTML, tagHTML, zoneHTML, zoneStartHTML } from './view-primitives.js';
 import { registerPanelTarget, renderPanel } from './render-targets.js';
+import { registerWorkUiState } from './work-ui-state.js';
 // render-work.js —— 渲染：打工页（任务/项目/杂事/阶段奖励）
 // 由 app.js 按功能拆分（第五轮可维护性重构），行为不变。
 
@@ -1102,46 +1104,6 @@ function settleChoreBatches(silent=false){
   });
   return r.ok?gain:0;
 }
-// 腐化债静默结算：超期杂事按档位系数逐日累积，直接从活力点扣除，不弹提示
-// 纯计算：只统计当天应扣总额与件数/天数，不修改 state、不写日志
-function computeChoreDecay(){
-  const chores=state.chores||[];
-  if(!chores.length)return {total:0,charged:0,dueDays:0,overdue:[],today:dayStartTs(now())};
-  const cfg=choreCfg();
-  const today=dayStartTs(now());
-  const overdue=chores.filter(function(c){return !c.done&&!c.archived&&choreOverdueDays(c)>0;});
-  if(!overdue.length)return {total:0,charged:0,dueDays:0,overdue:[],today:today};
-  const rate=choreTierRate(overdue.length,cfg);
-  let total=0,dueDays=0,charged=0;
-  overdue.forEach(function(c){
-    const deadline=addDays(choreBaseTs(c),Math.round(choreFreshDays(c)));
-    let start=addDays(deadline,1);
-    if(c.decayKey){
-      const p=String(c.decayKey).split('-');
-      const last=new Date(Number(p[0]),Number(p[1])-1,Number(p[2])).getTime();
-      if(isFinite(last))start=Math.max(start,addDays(last,1));
-    }
-    const days=dayDiff(today,start)+1;
-    if(days<=0)return;
-    charged++;
-    dueDays+=days;
-    total+=rate*days;
-  });
-  return {total:round2(total),charged:charged,dueDays:dueDays,overdue:overdue,today:today};
-}
-function processChoreDecay(silent=false){
-  const r=computeChoreDecay();
-  if(r.total<=0||r.charged<=0)return 0;
-  const res=runCommand({
-    label:'chore-decay',save:!silent,render:false,silentFail:true,
-    run:function(){
-      const target=round2((state.scores.vitality||0)-r.total);
-      Ledger.post({op:'adjust',account:'vitality',target:target,entry:{st:'vitality',amt:-r.total,desc:'杂事腐化债：'+r.charged+' 件超期，累计 '+r.dueDays+' 天',src:'chore-decay',dom:''},reason:{src:'chore-decay'}});
-      r.overdue.forEach(function(c){c.decayKey=dayKey(r.today);});
-    }
-  });
-  return res.ok?r.total:0;
-}
 function addChoreFromInput(){
   const inp=document.getElementById('choreInput');
   if(!inp)return;
@@ -1519,7 +1481,7 @@ function taskCardHTML(t,collId){
   const canExempt=v.exemption.canExempt;
   const exemptLabel=v.exemption.label;
   const exemptBtn=canExempt
-    ?'<button class="btn btn-sm btn-exempt" title="剩余豁免卡 '+cards+' 张" onclick="useExemption(\''+t.id+'\')">豁免·'+exemptLabel+'</button>'
+    ?'<button class="btn btn-sm btn-exempt" title="'+(v.exemption.assetDriven?'消耗 1 个配置了「任务豁免」的资产':'剩余豁免卡 '+cards+' 张')+'" onclick="useTaskExemption(\''+t.id+'\')">豁免·'+exemptLabel+'</button>'
     :'';
 
   const checkinBtn=v.checkedToday
@@ -1678,8 +1640,10 @@ function achCardHTML(a,domId){
     +'</div>';
 }
 
-export function resetWorkUiState(){affairView='list';affairCalCursor=null;affairCalSelected=null;affairDoneOpen=false;choreDoneOpen=false;choreArchivedOpen=false;}
-export function closeChoreDoneZone(){choreDoneOpen=false;}
+registerWorkUiState({
+  reset:function(){affairView='list';affairCalCursor=null;affairCalSelected=null;affairDoneOpen=false;choreDoneOpen=false;choreArchivedOpen=false;},
+  closeChoreDoneZone:function(){choreDoneOpen=false;}
+});
 
 export { affairView, affairCalCursor, affairCalSelected, affairDoneOpen, choreDoneOpen, choreArchivedOpen, editAffairSteps, setScoreCell, renderWork, frSameDay, fmtClock, fmtPlan, fmtDateCal, toLocalInput, fromLocalInput, editAffairCurve, affairTags, editPresetCurve, renderAffairPresetsHTML, applyAffairPreset, openPresetModal, presetCurvePreview, presetCurveRefresh, setPresetCurve, renderPresetCurveCustom, presetCurveInput, getPresetCurve, togglePresetAch, savePreset, delPreset, renderAffairs, affairStatusLine, affairAxisHTML, affairZoneStart, AFFAIR_ZONE_END, doneZoneHTML, toggleAffairZone, affairMoreBtn, affairMenuTarget, toggleAffairMenu, closeAffairMenu, affairInProgressCardHTML, affairScheduleCardHTML, affairDraftCardHTML, affairDoneCardHTML, affairUnits, affairStepUnitCardHTML, todayAgendaHTML, renderAffairSchedule, renderAffairCalendar, addAffairFromInput, applyAffairValue, reverseAffairValue, affairApplyProgress, AFFAIR_UNDO_LIMIT, affairCanUndo, affairPushUndo, affairUndoAction, _completeAffairStep, advanceAffairStep, completeAffair, completeAffairStep, initAffairAxes, openAffairPlanModal, saveAffairPlan, openAffairModal, handleAffairSave, delAffair, restoreAffair, renderAffairSteps, affairStepInput, affairStepTime, affairAddStep, affairRemoveStep, readAffairSteps, affairCurvePreview, affairCurveRefresh, setAffairCurve, renderAffairCurveCustom, affairCurveInput, getAffairCurve, toggleAffairAch, toggleAffairView, toggleAffairDone, affairSelectDay, affairCalShift, settleChoreBatches, computeChoreDecay, processChoreDecay, addChoreFromInput, toggleChoreDone, toggleChoreDoneZone, fmtChoreDate, choreCardHTML, renderChores, toggleChoreArchivedZone, restoreChore, toDateInputValue, openChoreModal, saveChore, affairConvertToChore, choreConvertFromModal, delChore, CHORE_CFG_FIELDS, readChoreCfgForm, writeChoreCfgForm, choreCfgInputPreview, openChoreConfigModal, resetChoreConfig, saveChoreConfig, stageBarHTML, taskCardHTML, applyStageBar, updateStageBar, setStageFromX, initStageBars, initTaskReveal, achCardHTML };
 

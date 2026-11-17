@@ -458,6 +458,39 @@ function onProdTierChange(){
   if(tier!=='daily')prodGatePreviewFn(document.getElementById('prodGatePreview')||{innerHTML:''});
 }
 
+// 商品「资产定价 / 购买赠送」：老商品默认为空，渲染与行为不变
+function fillProdAssetSelects(selectedPriceId, selectedGrantId){
+  const defs=(state.assetDefs||[]).filter(function(d){return d&&d.enabled!==false&&!d.archived;});
+  const priceSel=document.getElementById('prodAssetPriceId');
+  const grantSel=document.getElementById('prodGrantAssetId');
+  if(priceSel){
+    priceSel.innerHTML='<option value="">不消耗资产</option>'+defs.map(function(d){
+      return '<option value="'+escAttr(d.id)+'"'+(d.id===selectedPriceId?' selected':'')+'>'+esc(d.name)+'</option>';
+    }).join('');
+    priceSel.value=defs.some(function(d){return d.id===selectedPriceId;})?selectedPriceId:'';
+  }
+  if(grantSel){
+    grantSel.innerHTML='<option value="">不赠送资产</option>'+defs.map(function(d){
+      return '<option value="'+escAttr(d.id)+'"'+(d.id===selectedGrantId?' selected':'')+'>'+esc(d.name)+'</option>';
+    }).join('');
+    grantSel.value=defs.some(function(d){return d.id===selectedGrantId;})?selectedGrantId:'';
+  }
+}
+function onProdAssetPriceChange(){
+  const sel=document.getElementById('prodAssetPriceId');
+  const has=!!(sel&&sel.value);
+  const amt=document.getElementById('prodAssetPriceAmt');
+  if(amt){amt.disabled=!has; if(!has)amt.value=1;}
+  // 资产定价商品：禁止贷款与现实预算联动（双保险：saveProdData/buyProduct 也会拦）
+  const bud=document.getElementById('prodBudgetCategory');
+  if(bud){bud.disabled=has; if(has)bud.value='';}
+  const budAmt=document.getElementById('prodBudgetAmount');
+  if(budAmt){budAmt.disabled=has; if(has)budAmt.value=0;}
+  const debt=document.getElementById('prodDebtRate');
+  if(debt){debt.disabled=has; if(has)debt.value=0;}
+  onProdBudgetChange();
+}
+
 function openProdModal(id,presetCatId){
   const title=document.getElementById('prodModalTitle');
   document.getElementById('prodId').value='';
@@ -480,6 +513,14 @@ function openProdModal(id,presetCatId){
     const bp=(p.budget&&p.budget.categoryId)?p.budget:{categoryId:'',amount:0};
     fillProdBudgetSelect(bp.categoryId);
     document.getElementById('prodBudgetAmount').value=bp.amount||0;
+    const ap=p.assetPrice||null;
+    const ga=(p.grants||[]).find(function(g){return g.kind==='asset';})||null;
+    const gc=(p.grants||[]).find(function(g){return g.kind==='currency';})||null;
+    document.getElementById('prodAssetPriceAmt').value=ap?ap.amount:1;
+    document.getElementById('prodGrantAssetAmt').value=ga?ga.amount:0;
+    document.getElementById('prodGrantCurrency').value=gc?gc.account:'';
+    document.getElementById('prodGrantCurrencyAmt').value=gc?gc.amount:0;
+    fillProdAssetSelects(ap?ap.assetId:'',ga?ga.assetId:'');
   }else{
     title.textContent='上架商品';
     document.getElementById('prodName').value='';
@@ -489,9 +530,15 @@ function openProdModal(id,presetCatId){
     document.getElementById('prodDebtRate').value=0;
     fillProdBudgetSelect('');
     document.getElementById('prodBudgetAmount').value=0;
+    document.getElementById('prodAssetPriceAmt').value=1;
+    document.getElementById('prodGrantAssetAmt').value=0;
+    document.getElementById('prodGrantCurrency').value='';
+    document.getElementById('prodGrantCurrencyAmt').value=0;
+    fillProdAssetSelects('','');
   }
   renderProdGateEditor(gate,validProductTier(document.getElementById('prodTier').value));
   onProdBudgetChange();
+  onProdAssetPriceChange();
   onProdTierChange();
   openModal('prodModal');
   setTimeout(()=>document.getElementById('prodName').focus(),50);
@@ -521,15 +568,26 @@ function handleProdSave(){
   const id=document.getElementById('prodId').value;
   const name=document.getElementById('prodName').value.trim();
   const desc=document.getElementById('prodDesc').value.trim();
-  const price=parseFloat(document.getElementById('prodPrice').value);
+  const priceRaw=parseFloat(document.getElementById('prodPrice').value);
   const stock=parseInt(document.getElementById('prodStock').value,10);
-  const debtRate=parseFloat(document.getElementById('prodDebtRate').value);
+  let debtRate=parseFloat(document.getElementById('prodDebtRate').value);
   const categoryId=document.getElementById('prodCategory').value;
   const tier=validProductTier(document.getElementById('prodTier').value);
+  const assetPriceId=document.getElementById('prodAssetPriceId').value;
+  const assetPriceAmt=parseInt(document.getElementById('prodAssetPriceAmt').value,10);
+  const grantAssetId=document.getElementById('prodGrantAssetId').value;
+  const grantAssetAmt=parseInt(document.getElementById('prodGrantAssetAmt').value,10);
+  const grantCurrency=document.getElementById('prodGrantCurrency').value;
+  const grantCurrencyAmt=parseFloat(document.getElementById('prodGrantCurrencyAmt').value);
+  const hasAssetPrice=!!assetPriceId;
 
   if(!name){toast('请输入商品名称','err');return}
-  if(isNaN(price)||price<0.1){toast('价格需 ≥ 0.1','err');return}
+  if(hasAssetPrice){
+    if(isNaN(priceRaw)||priceRaw<0){toast('价格需 ≥ 0（有资产定价时可填 0）','err');return}
+  }else if(isNaN(priceRaw)||priceRaw<0.1){toast('价格需 ≥ 0.1','err');return}
+  if(hasAssetPrice&&(isNaN(assetPriceAmt)||assetPriceAmt<1)){toast('资产定价数量需 ≥ 1','err');return}
   if(isNaN(stock)||stock<-1){toast('库存需 ≥ -1','err');return}
+  if(hasAssetPrice){debtRate=0;}
   if(isNaN(debtRate)||debtRate<0){toast('债率需 ≥ 0','err');return}
 
   let gate=defaultProductGate();
@@ -541,10 +599,10 @@ function handleProdSave(){
     syncLegacyGateFields(gate,cond);
   }
 
-  // 现实预算联动：绑定分类时金额必须 > 0，且分类需存在/启用/未归档
+  // 现实预算联动：资产定价商品一律不联动
   let budget={categoryId:'',amount:0};
   const budSel=document.getElementById('prodBudgetCategory');
-  const budCatId=budSel?budSel.value:'';
+  const budCatId=hasAssetPrice?'':(budSel?budSel.value:'');
   if(budCatId){
     const budCat=BudgetEngine.category(budCatId);
     if(!budCat||!budCat.enabled||budCat.archived){toast('绑定的预算分类不可用，请重新选择','err');return}
@@ -553,7 +611,30 @@ function handleProdSave(){
     budget={categoryId:budCatId,amount:round4(budAmt)};
   }
 
-  saveProdData({id:id||null,name:name,desc:desc,price:price,stock:stock,debtRate:debtRate,categoryId:categoryId,tier:tier,gate:gate,budget:budget});
+  // 资产定价 / 赠送
+  let assetPrice=null;
+  if(hasAssetPrice){
+    const def=(state.assetDefs||[]).find(function(d){return d&&d.id===assetPriceId;});
+    if(!def||def.enabled===false||def.archived){toast('资产定价绑定的资产不可用，请重新选择','err');return}
+    assetPrice={assetId:assetPriceId,amount:assetPriceAmt};
+  }
+  const grants=[];
+  if(grantAssetId){
+    if(isNaN(grantAssetAmt)||grantAssetAmt<1){toast('赠送资产数量需 ≥ 1','err');return}
+    const def=(state.assetDefs||[]).find(function(d){return d&&d.id===grantAssetId;});
+    if(!def||def.enabled===false||def.archived){toast('赠送资产不可用，请重新选择','err');return}
+    grants.push({kind:'asset',assetId:grantAssetId,amount:grantAssetAmt});
+  }
+  if(grantCurrency){
+    if(isNaN(grantCurrencyAmt)||grantCurrencyAmt<=0){toast('赠送货币数量需大于 0','err');return}
+    grants.push({kind:'currency',account:grantCurrency,amount:round4(grantCurrencyAmt)});
+  }
+  // 自循环防护：赠送同一资产且不少于消耗 = 免费刷资产
+  if(assetPrice&&grants.some(function(g){return g.kind==='asset'&&g.assetId===assetPrice.assetId&&g.amount>=assetPrice.amount;})){
+    toast('赠送资产不能覆盖资产定价本身（会形成自循环）','err');return;
+  }
+
+  saveProdData({id:id||null,name:name,desc:desc,price:priceRaw,stock:stock,debtRate:debtRate,categoryId:categoryId,tier:tier,gate:gate,budget:budget,assetPrice:assetPrice,grants:grants});
   closeModal('prodModal');
   toast(id?'商品已更新':'商品已上架');
   render();
@@ -572,4 +653,4 @@ function confirmDelProd(id){
   if(p&&confirm('删除商品「'+p.name+'」？\n（可在银行流水撤销此操作）')){delProd(id);toast('商品已删除');render()}
 }
 
-export { editTypes, editStage, openTaskModal, TASK_SLIDERS, refreshTaskSliders, bindTaskSliders, updateTaskAccSummaries, setTaskAccordion, applyScoreTypePicks, toggleScoreType, onStageEnabled, onStageInput, stageRowHTML, renderStageRows, toggleStageParam, applyStagePreset, runStagePreset, generateStage, genArith, genDecr, handleTaskSave, openAchModal, handleAchSave, onProdGateModeChange, updateProdTierHint, prodGatePreviewFn, validateGateCondition, syncLegacyGateFields, renderProdGateEditor, onProdTierChange, openProdModal, fillProdBudgetSelect, onProdBudgetChange, handleProdSave, confirmDelTask, confirmDelAch, confirmDelProd };
+export { editTypes, editStage, openTaskModal, TASK_SLIDERS, refreshTaskSliders, bindTaskSliders, updateTaskAccSummaries, setTaskAccordion, applyScoreTypePicks, toggleScoreType, onStageEnabled, onStageInput, stageRowHTML, renderStageRows, toggleStageParam, applyStagePreset, runStagePreset, generateStage, genArith, genDecr, handleTaskSave, openAchModal, handleAchSave, onProdGateModeChange, updateProdTierHint, prodGatePreviewFn, validateGateCondition, syncLegacyGateFields, renderProdGateEditor, onProdTierChange, openProdModal, fillProdBudgetSelect, onProdBudgetChange, fillProdAssetSelects, onProdAssetPriceChange, handleProdSave, confirmDelTask, confirmDelAch, confirmDelProd };

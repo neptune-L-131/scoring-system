@@ -1,5 +1,5 @@
 import { KEY } from './constants.js';
-import { _persistBlocked } from './normalize.js';
+import { _persistBlocked } from './persist-state.js';
 import { render } from './render.js';
 import { state } from './state.js';
 import { toast } from './toast.js';
