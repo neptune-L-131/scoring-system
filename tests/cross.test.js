@@ -192,39 +192,6 @@ describe('archiveIdleEntities：dry-run 与真实归档', () => {
   });
 });
 
-describe('processActivities：结构动作与奖励共用事务', () => {
-  it('“任务不活跃 14 天 → 归档”可由一条规则表达', () => {
-    api.resetState({
-      tasks: [{ id: 't1', name: '闲置任务', lastCheckIn: Date.now() - 30 * DAY, archived: false }],
-      activities: [{
-        id: 'act_archive', name: '自动归档', enabled: true, period: 'week', anchor: 1,
-        condition: { mode: 'all', items: [] },
-        result: { items: [{ type: 'archive', entity: 'task', idleDays: 14 }] },
-        lastRun: null,
-      }],
-    });
-    api.processActivities(true);
-    const s = api.getState();
-    expect(s.tasks[0].archived).toBe(true);
-    expect(s.activities[0].lastRun).toBe(api.periodKey({ period: 'week', anchor: 1 }, Date.now()));
-  });
-
-  it('条件不满足时不归档，也不推进 lastRun 以外的东西', () => {
-    api.resetState({
-      tasks: [{ id: 't1', name: '活跃任务', lastCheckIn: Date.now() - DAY, archived: false }],
-      activities: [{
-        id: 'act_archive', name: '自动归档', enabled: true, period: 'week', anchor: 1,
-        condition: { mode: 'all', items: [{ range: 'recent', days: 7, metric: 'checkins', op: '>=', value: 99 }] },
-        result: { items: [{ type: 'archive', entity: 'task', idleDays: 14 }] },
-        lastRun: null,
-      }],
-    });
-    api.processActivities(true);
-    const s = api.getState();
-    expect(s.tasks[0].archived).toBe(false);
-  });
-});
-
 describe('#debug 自检：不可见操作后仍全部通过', () => {
   it('贷款式隐形入账 + 撤销 + 截断后 checks 全绿', () => {
     api.resetState();

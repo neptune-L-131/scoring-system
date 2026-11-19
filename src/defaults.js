@@ -1,4 +1,5 @@
 import { ASSET_VERSION, BUDGET_LEDGER_MAX, BUDGET_PERIOD_KEEP, BUDGET_VERSION, FLOW_VERSION, SCHEMA_VERSION, STATS_VERSION } from './constants.js';
+import { defaultExecBuys } from './exec-quota.js';
 import { defaultWatermark, now, uid } from './pure.js';
 // defaults.js —— 默认状态与默认配置工厂
 // 由 state/normalize 抽离（第六轮循环依赖治理），返回值逐字未改。
@@ -73,18 +74,14 @@ function defaultAssetDef(id,name,extra){
     enabled:true,archived:false,origin:'builtin',createdAt:0,updatedAt:0
   },extra||{});
 }
+// 新存档唯一的资产示例：出厂即带「任务豁免」使用配方，之后与普通资产完全同权
 function defaultAssetDefs(){
-  return[defaultAssetDef('exemption','断更豁免卡')];
+  return[defaultAssetDef('exemption','断更豁免卡',{useRecipe:{v:1,type:'task-exempt',cost:1}})];
 }
-function defaultActivities(){
-  return[
-    {id:'act_exemption',name:'断更豁免卡',enabled:true,period:'week',anchor:1,
-     condition:{mode:'all',items:[]},
-     result:{items:[{type:'card',card:'exemption',amount:1,cap:3}]},lastRun:null},
-    {id:'act_score_up',name:'进步奖励',enabled:false,period:'week',anchor:1,
-     condition:{mode:'all',items:[{range:'period',metric:'checkins',op:'>=',value:3}]},
-     result:{items:[{type:'vitality',amount:10}]},lastRun:null}
-  ];
+function defaultAssetCards(){
+  const cards={};
+  defaultAssetDefs().forEach(function(d){cards[d.id]=0;});
+  return cards;
 }
 function newExtState(){
   return{
@@ -97,12 +94,12 @@ function newExtState(){
     activity:{},
     achievementCounted:{},
     shadow:[],
-    // 代谢规则是否已播种：一旦为 true，用户删除默认规则后不再自动补回
-    metabolismSeeded:false,
     features:{audit:true},
     // 阶段 4 运行层：资产周期计量与动作流运行记录（缺省空结构，懒安全）
     assetMeters:{v:ASSET_VERSION,byAsset:{},idem:{}},
     flowRuns:{v:FLOW_VERSION,seq:0,byId:{},recent:[]},
+    // 执行权商品的本周期购买次数：不随购买流水裁剪而丢失
+    execBuys:defaultExecBuys(),
     // 阶段 5 事件触发：只做事件记录的数据结构，不参与任何执行
     events:{v:1,recent:[]}
   };
@@ -128,11 +125,10 @@ function defaults(){
     // 事项转换记录（P3）：只保留最近若干条，最后一条可撤销
     conversions:[],
     loans:[],
-    cards:{exemption:0},
-    // 阶段 4 配置层：资产定义（内置豁免卡恒定存在）与动作流（默认空）
+    cards:defaultAssetCards(),
+    // 阶段 4 配置层：资产定义（仅新存档播种示例）与动作流（默认空）
     assetDefs:defaultAssetDefs(),
     flows:[],
-    activities:defaultActivities(),
     lastDebtDate:null,
     filterDomain:null,
     metrics:[],
@@ -140,4 +136,4 @@ function defaults(){
   };
 }
 
-export { defaultBudgetSettings, defaultBudgetsState, defaultProductGate, tierCurrency, defaultChoreConfig, normalizeChoreConfig, migrateChore, defaultAssetDef, defaultAssetDefs, defaultActivities, newExtState, defaults };
+export { defaultBudgetSettings, defaultBudgetsState, defaultProductGate, tierCurrency, defaultChoreConfig, normalizeChoreConfig, migrateChore, defaultAssetDef, defaultAssetDefs, defaultAssetCards, newExtState, defaults };

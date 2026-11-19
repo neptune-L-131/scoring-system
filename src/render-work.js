@@ -1,6 +1,6 @@
 import { registerRenderer } from './render.js';
-import { choreCfg, choreFreshDays, choreBaseTs, choreOverdueDays, choreTierRate, choreDailyDecay, choreUnsettled, choreProgressOf, choreProgressParts } from './utils.js';
-import { checkAchievements, checkIn, useExemption } from './business.js';
+import { choreCfg, choreFreshDays, choreDailyDecay, choreUnsettled, choreProgressParts } from './utils.js';
+import { checkAchievements, checkIn } from './business.js';
 import { BudgetEngine } from './budget.js';
 import { budgetBadgeHTML, budgetBindingHTML, budgetOf, budgetRefOf, openBudgetAmountDialog, readBudgetBinding, rememberBudgetDraft, resolveActionBudget, reverseBoundBudget } from './budget-binding.js';
 import { computeChoreDecay, processChoreDecay } from './chore-core.js';
@@ -14,7 +14,7 @@ import { confirmDelAch, confirmDelTask, openAchModal, openTaskModal } from './mo
 import { closeModal, openModal } from './modal-host.js';
 import { commit, save } from './persist.js';
 import { runCommand } from './command.js';
-import { calcCheckIn, dayKey, dayStartTs, weekStartTs, toNum, round2, stageCellLabel, stageNetAt, stageSel, taskIsStaged, clone, daysSince, esc, escAttr, fmt, fmtTime, getTaskDomainIds, now, taskHasType, uid, affairSteps, affairTotalSteps, affairDoneSteps, affairLastAdvance, affairCurve, affairCurveType, affairTargetAt, affairIsDone } from './pure.js';
+import { calcCheckIn, dayKey, round2, stageCellLabel, stageNetAt, stageSel, taskIsStaged, clone, daysSince, esc, escAttr, fmt, fmtTime, getTaskDomainIds, now, taskHasType, uid, affairSteps, affairTotalSteps, affairDoneSteps, affairLastAdvance, affairCurve, affairCurveType, affairTargetAt, affairIsDone } from './pure.js';
 import { render } from './render.js';
 import { fillDomainChecklist } from './shell.js';
 import { state } from './state.js';
@@ -48,6 +48,9 @@ function renderWork(){
   setScoreCell('wVitality',state.scores.vitality);
   setScoreCell('wProgress',totalProgress());
   setScoreCell('wAchievement',state.scores.achievement);
+
+  // 主入口：今天该做什么（只读聚合，点击仅定位高亮）
+  renderTodayAgenda();
 
   const domCount=state.domains.length;
   document.getElementById('wProgressSub').textContent=domCount>1?domCount+'个领域':'';
@@ -304,8 +307,6 @@ function renderAffairs(){
   // 2. 日程区（列表/日历视图切换只影响本区呈现）
   const schedCount=affairUnits().length;
   html+=affairZoneStart('schedule','日程',schedCount,'<button class="affair-view-toggle" onclick="event.stopPropagation();toggleAffairView()">'+(affairView==='cal'?'列表':'日历')+'</button>');
-  // 只读聚合：任务打卡 / 项目日程 / 到期杂事合成“今天该做什么”（不写 state、不改变下方分区）
-  html+=todayAgendaHTML();
   html+=(affairView==='cal')?renderAffairCalendar():renderAffairSchedule();
   html+=AFFAIR_ZONE_END;
   // 3. 草稿区（无步骤、未安排、尚未推进）
@@ -486,23 +487,110 @@ function affairStepUnitCardHTML(u,opts){
     +'</div>';
 }
 
-// “今天该做什么”：只读聚合清单，插在日程区顶部；不提供任何写入动作（点击无副作用）
-function todayAgendaHTML(){
-  const items=todayAgenda();
-  if(!items.length)return '';
-  const doneN=items.filter(function(x){return x.status==='done';}).length;
-  const chips=items.map(function(it){
-    const kindCls=it.kind==='affair'?' affair':(it.kind==='chore'?' chore':'');
-    const cls='agenda-chip'+kindCls+(it.status==='done'?' done':'')+(it.overdue?' overdue':'');
-    const label=(it.status==='done'?'✓ ':'')+esc(it.title);
-    const sub=it.subtitle?'<i>'+esc(it.subtitle)+'</i>':'';
-    const flag=it.overdue?'<b>逾期</b>':'';
-    return '<span class="'+cls+'" title="'+(it.kind==='task'?'任务':it.kind==='affair'?'项目':'杂事')+'">'+label+sub+flag+'</span>';
-  }).join('');
-  return '<div class="agenda-box">'
-    +'<div class="agenda-head">今天该做什么 <span class="agenda-count">'+(items.length-doneN)+' 待办 · '+doneN+' 已完成</span></div>'
-    +'<div class="agenda-list">'+chips+'</div>'
+// ===== 打工页主入口：今天该做什么 =====
+// 只读聚合视图：分组口径全部来自 todayAgenda() 的 bucket 字段（overdue / today / active），
+// 渲染层只负责分组与文字；点击某条仅“定位到对应卡片 + 短暂高亮”，不写任何状态。
+const AGENDA_GROUPS=[
+  {key:'overdue',title:'已逾期',cls:'is-overdue'},
+  {key:'today',title:'今天到期',cls:'is-today'},
+  {key:'active',title:'进行中',cls:'is-active'}
+];
+const AGENDA_KIND_LABEL={task:'任务',affair:'项目',chore:'杂事'};
+
+function agendaWhenText(it){
+  if(it.overdue&&it.dueAt){
+    const n=-dayDiff(it.dueAt,now());
+    return n>1?'逾期 '+n+' 天':'逾期';
+  }
+  if(it.dueAt)return fmtClock(it.dueAt);
+  return it.kind==='task'?'待打卡':'';
+}
+
+function agendaRowHTML(it){
+  const args="'"+it.kind+"','"+String(it.id).replace(/['\\]/g,'')+"'";
+  const sub=it.subtitle?'<span class="agenda-row-sub">'+esc(it.subtitle)+'</span>':'';
+  const when=agendaWhenText(it);
+  return '<div class="agenda-row" onclick="jumpToAgendaItem('+args+')" title="定位到这张卡片">'
+    +'<span class="agenda-row-tag">'+AGENDA_KIND_LABEL[it.kind]+'</span>'
+    +'<span class="agenda-row-name">'+esc(it.title)+'</span>'
+    +sub
+    +(when?'<span class="agenda-row-when">'+when+'</span>':'')
     +'</div>';
+}
+
+function agendaBlockHTML(){
+  const items=todayAgenda();
+  const doneN=items.filter(function(x){return x.status==='done';}).length;
+  const todo=items.filter(function(x){return x.status!=='done';});
+  let groups='';
+  AGENDA_GROUPS.forEach(function(g){
+    const list=todo.filter(function(it){return it.bucket===g.key;});
+    if(!list.length)return; // 空分组直接省略，不留空白区块
+    groups+='<div class="agenda-group '+g.cls+'">'
+      +'<div class="agenda-group-head"><span class="agenda-group-name">'+g.title+'</span><span class="agenda-group-count">'+list.length+'</span></div>'
+      +list.map(agendaRowHTML).join('')
+      +'</div>';
+  });
+  let body;
+  if(groups){
+    body='<div class="agenda-scroll">'+groups+'</div>';
+  }else{
+    body='<div class="agenda-empty">'+(doneN?'今天的待办都已完成':'今天没有到期或待推进的事项')+'</div>';
+  }
+  return '<div class="agenda-panel">'
+    +'<div class="agenda-panel-head"><span class="agenda-title">今天该做什么</span>'
+    +'<span class="agenda-summary">'+todo.length+' 项待办'+(doneN?' · 已完成 '+doneN:'')+'</span></div>'
+    +body
+    +'</div>';
+}
+
+function renderTodayAgenda(){
+  const box=document.getElementById('todayAgenda');
+  if(!box)return;
+  box.innerHTML=agendaBlockHTML();
+}
+
+function agendaSelector(kind,id){
+  const safe=String(id).replace(/["\\]/g,'');
+  if(kind==='task')return '.task-card[data-task-id="'+safe+'"]';
+  if(kind==='chore')return '.chore-card[data-chore-id="'+safe+'"]';
+  return '.affair-card[data-affair-id="'+safe+'"]';
+}
+
+// 目标可能被折叠容器（大区 / 集合 / 项目分区）隐藏：逐层展开。
+// 只改本次 DOM 视图，不写入 state，下一次正常渲染会回到用户原来的折叠状态。
+function revealAgendaTarget(kind,id){
+  const find=function(){
+    if(kind==='affair'){
+      const sched=document.querySelector('#affair-zone-schedule '+agendaSelector(kind,id));
+      if(sched)return sched;
+    }
+    return document.querySelector(agendaSelector(kind,id));
+  };
+  let el=find();
+  if(el)return el;
+  const majorId=kind==='task'?'major_task':(kind==='chore'?'major_chore':'major_affair');
+  const major=document.getElementById(majorId);
+  if(major&&major.classList.contains('collapsed'))major.classList.remove('collapsed');
+  el=find();
+  if(el)return el;
+  const scopeId=kind==='task'?'taskGroups':(kind==='chore'?'chorePanel':'affairPanel');
+  const scope=document.getElementById(scopeId);
+  if(scope&&scope.querySelectorAll){
+    scope.querySelectorAll('.collapsed').forEach(function(n){n.classList.remove('collapsed');});
+  }
+  return find();
+}
+
+let agendaHitTimer=null;
+function jumpToAgendaItem(kind,id){
+  if(!id)return;
+  const el=revealAgendaTarget(kind,id);
+  if(!el){toast('这条事项的卡片当前没有显示（可能被折叠或在日历视图）','err');return;}
+  if(typeof el.scrollIntoView==='function')el.scrollIntoView({behavior:'smooth',block:'center'});
+  el.classList.add('agenda-hit');
+  if(agendaHitTimer)clearTimeout(agendaHitTimer);
+  agendaHitTimer=setTimeout(function(){el.classList.remove('agenda-hit');agendaHitTimer=null;},1800);
 }
 
 function renderAffairSchedule(){
@@ -1476,12 +1564,11 @@ function taskCardHTML(t,collId){
   const domTags=!v.isV?v.domainNames.map(function(n){return tagHTML('d',esc(n));}).join(''):'';
   const streakTag=curStreak>0?tagHTML('d','连胜'+curStreak+'天'):'';
 
-  // Exemption card eligibility
-  const cards=v.exemption.cards;
+  // Exemption asset eligibility
   const canExempt=v.exemption.canExempt;
   const exemptLabel=v.exemption.label;
   const exemptBtn=canExempt
-    ?'<button class="btn btn-sm btn-exempt" title="'+(v.exemption.assetDriven?'消耗 1 个配置了「任务豁免」的资产':'剩余豁免卡 '+cards+' 张')+'" onclick="useTaskExemption(\''+t.id+'\')">豁免·'+exemptLabel+'</button>'
+    ?'<button class="btn btn-sm btn-exempt" title="消耗 1 个配置了「任务豁免」的资产" onclick="useTaskExemption(\''+t.id+'\')">豁免·'+exemptLabel+'</button>'
     :'';
 
   const checkinBtn=v.checkedToday
@@ -1512,6 +1599,7 @@ function taskCardHTML(t,collId){
     +'<div class="card-bottom">'
     +(staged?stageBarHTML(t):'<div class="preview">'+prev+'</div>')
     +checkinBtn
+    +exemptBtn
     +'</div>'
     +'</div>'
     +'</div>';
@@ -1645,7 +1733,7 @@ registerWorkUiState({
   closeChoreDoneZone:function(){choreDoneOpen=false;}
 });
 
-export { affairView, affairCalCursor, affairCalSelected, affairDoneOpen, choreDoneOpen, choreArchivedOpen, editAffairSteps, setScoreCell, renderWork, frSameDay, fmtClock, fmtPlan, fmtDateCal, toLocalInput, fromLocalInput, editAffairCurve, affairTags, editPresetCurve, renderAffairPresetsHTML, applyAffairPreset, openPresetModal, presetCurvePreview, presetCurveRefresh, setPresetCurve, renderPresetCurveCustom, presetCurveInput, getPresetCurve, togglePresetAch, savePreset, delPreset, renderAffairs, affairStatusLine, affairAxisHTML, affairZoneStart, AFFAIR_ZONE_END, doneZoneHTML, toggleAffairZone, affairMoreBtn, affairMenuTarget, toggleAffairMenu, closeAffairMenu, affairInProgressCardHTML, affairScheduleCardHTML, affairDraftCardHTML, affairDoneCardHTML, affairUnits, affairStepUnitCardHTML, todayAgendaHTML, renderAffairSchedule, renderAffairCalendar, addAffairFromInput, applyAffairValue, reverseAffairValue, affairApplyProgress, AFFAIR_UNDO_LIMIT, affairCanUndo, affairPushUndo, affairUndoAction, _completeAffairStep, advanceAffairStep, completeAffair, completeAffairStep, initAffairAxes, openAffairPlanModal, saveAffairPlan, openAffairModal, handleAffairSave, delAffair, restoreAffair, renderAffairSteps, affairStepInput, affairStepTime, affairAddStep, affairRemoveStep, readAffairSteps, affairCurvePreview, affairCurveRefresh, setAffairCurve, renderAffairCurveCustom, affairCurveInput, getAffairCurve, toggleAffairAch, toggleAffairView, toggleAffairDone, affairSelectDay, affairCalShift, settleChoreBatches, computeChoreDecay, processChoreDecay, addChoreFromInput, toggleChoreDone, toggleChoreDoneZone, fmtChoreDate, choreCardHTML, renderChores, toggleChoreArchivedZone, restoreChore, toDateInputValue, openChoreModal, saveChore, affairConvertToChore, choreConvertFromModal, delChore, CHORE_CFG_FIELDS, readChoreCfgForm, writeChoreCfgForm, choreCfgInputPreview, openChoreConfigModal, resetChoreConfig, saveChoreConfig, stageBarHTML, taskCardHTML, applyStageBar, updateStageBar, setStageFromX, initStageBars, initTaskReveal, achCardHTML };
+export { affairView, affairCalCursor, affairCalSelected, affairDoneOpen, choreDoneOpen, choreArchivedOpen, editAffairSteps, setScoreCell, renderWork, frSameDay, fmtClock, fmtPlan, fmtDateCal, toLocalInput, fromLocalInput, editAffairCurve, affairTags, editPresetCurve, renderAffairPresetsHTML, applyAffairPreset, openPresetModal, presetCurvePreview, presetCurveRefresh, setPresetCurve, renderPresetCurveCustom, presetCurveInput, getPresetCurve, togglePresetAch, savePreset, delPreset, renderAffairs, affairStatusLine, affairAxisHTML, affairZoneStart, AFFAIR_ZONE_END, doneZoneHTML, toggleAffairZone, affairMoreBtn, affairMenuTarget, toggleAffairMenu, closeAffairMenu, affairInProgressCardHTML, affairScheduleCardHTML, affairDraftCardHTML, affairDoneCardHTML, affairUnits, affairStepUnitCardHTML, renderTodayAgenda, jumpToAgendaItem, renderAffairSchedule, renderAffairCalendar, addAffairFromInput, applyAffairValue, reverseAffairValue, affairApplyProgress, AFFAIR_UNDO_LIMIT, affairCanUndo, affairPushUndo, affairUndoAction, _completeAffairStep, advanceAffairStep, completeAffair, completeAffairStep, initAffairAxes, openAffairPlanModal, saveAffairPlan, openAffairModal, handleAffairSave, delAffair, restoreAffair, renderAffairSteps, affairStepInput, affairStepTime, affairAddStep, affairRemoveStep, readAffairSteps, affairCurvePreview, affairCurveRefresh, setAffairCurve, renderAffairCurveCustom, affairCurveInput, getAffairCurve, toggleAffairAch, toggleAffairView, toggleAffairDone, affairSelectDay, affairCalShift, settleChoreBatches, computeChoreDecay, processChoreDecay, addChoreFromInput, toggleChoreDone, toggleChoreDoneZone, fmtChoreDate, choreCardHTML, renderChores, toggleChoreArchivedZone, restoreChore, toDateInputValue, openChoreModal, saveChore, affairConvertToChore, choreConvertFromModal, delChore, CHORE_CFG_FIELDS, readChoreCfgForm, writeChoreCfgForm, choreCfgInputPreview, openChoreConfigModal, resetChoreConfig, saveChoreConfig, stageBarHTML, taskCardHTML, applyStageBar, updateStageBar, setStageFromX, initStageBars, initTaskReveal, achCardHTML };
 
 registerRenderer('work', renderWork);
 registerRenderer('stageBars', initStageBars);

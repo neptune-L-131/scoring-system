@@ -20,7 +20,13 @@ const EXPORT_NAMES = [
   'uid', 'fmt', 'now', 'daysSince', 'effectiveLastTs', 'taskCheckedToday', 'fmtTime',
   'totalProgress', 'domainName', 'taskNameLabel', 'collectionName', 'domainProgress', 'metricValue',
   'getTaskDomainIds', 'taskScoreTypes', 'taskHasType', 'logHasType', 'clone', 'splitCents',
-  'round2', 'round4', 'logAmt', 'cardName', 'stageRewards', 'taskIsStaged', 'stageValues',
+  'round2', 'round4', 'logAmt', 'stageRewards', 'taskIsStaged', 'stageValues',
+  // 事件触发预留（阶段 5 S4，仅数据结构与派发位）
+  'EVENT_KINDS', 'EVENT_KEEP', 'EVENT_MAX_FLOWS_PER_EVENT', 'EVENT_DEPTH_MAX',
+  'eventKeyOf', 'makeEvent', 'normalizeEvent', 'normalizeEventStore', 'rememberEvent',
+  'eventTriggersOf', 'planEventDispatch',
+  // 事件触发接通（阶段 5 第二步）
+  'setPostCommitHandler', 'emitPostCommit', 'handlePostCommitEvents', 'isPostCommitDispatching',
   'stageSel', 'stageValueAt', 'stageCellLabel', 'stageNetAt',
   'dayKey', 'weekStartKey', 'weekStartTs', 'periodKey', 'budgetBounds', 'dayStartTs',
   'prevPeriodRange', 'condWindowByRange', 'idleDaysSince', 'weekAnchorName',
@@ -49,16 +55,16 @@ const EXPORT_NAMES = [
   'normalizeProductGate', 'normalizeProduct', 'dateKeyOffset', 'normalizeActivityIndex',
   'normalizeStatsDaily', 'normalizeAccountSums', 'normalizeAchievementCounted',
   'normalizePresetNums', 'normalizeLoanNums', 'normalizeLogNums', 'normalizeCards',
-  'isValidAssetId', 'normalizeAssetDef', 'normalizeAssetDefs', 'normalizeFlow',
+  'isValidAssetId', 'normalizeAssetDef', 'normalizeAssetDefs', 'normalizeFlow', 'normalizeUseRecipe',
+  'normalizeAssetPrice', 'normalizeProductGrants', 'normalizeProductExec',
   'normalizeFlows', 'normalizeAssetMeters', 'normalizeFlowRunRecord', 'normalizeFlowRuns',
   'defaultAssetDef', 'defaultAssetDefs',
   'normalizeWatermark', 'normalizeBudgetSettings', 'normalizeBudgetRule',
   'normalizeBudgetCategory', 'normalizeBudgetPeriod', 'normalizeBudgetLedgerEntry',
   'normalizeBudgets', 'normalizeProductBudget', 'normalizeExt', 'applyMigrations', 'parseState',
   'defaultBudgetSettings', 'defaultBudgetsState', 'defaultProductGate', 'tierCurrency',
-  'validProductTier', 'isArchivedEntity', 'defaultActivities', 'normalizeCondItem',
-  'normalizeCondNode', 'normalizeCondition', 'normalizeRewardItem', 'normalizeResult',
-  'normalizeActivity', 'migrateActivities', 'defaultChoreConfig', 'normalizeChoreConfig',
+  'validProductTier', 'isArchivedEntity', 'normalizeCondItem',
+  'normalizeCondNode', 'normalizeCondition', 'defaultChoreConfig', 'normalizeChoreConfig',
   'migrateChore',
   // 条件求值
   'evalCondition', 'evalNode', 'evalCondItem', 'logDomainsOf', 'logMatchesTarget',
@@ -66,28 +72,33 @@ const EXPORT_NAMES = [
   'taskMetricValue', 'domainMetricValue', 'condLeafEntities', 'entityMetricValue',
   'affairActive', 'pointMetricValue', 'sumLogsInWindow', 'countLogsInWindow',
   'logAffairDomain', 'affairWindowValue', 'choreWindowValue', 'evalCountMetric',
-  'isPointMetric', 'isAffairMetric', 'isChoreMetric', 'isStage1Metric', 'isGateMetric',
+  'assetMetricValue', 'assetMovementInWindow',
+  'isPointMetric', 'isAssetMetric', 'isAssetHoldMetric', 'assetCatName', 'assetLogMeta',
+  'isAffairMetric', 'isChoreMetric', 'isStage1Metric', 'isGateMetric',
   'legacyGateCondition', 'gateConditionOf', 'gateFailReasons', 'evaluateProductGate',
   // 业务纯函数
-  'checkIn', 'useExemption', 'buyProduct',
+  'checkIn', 'exemptTaskCore', 'buyProduct', 'saveProdData',
   'calcCheckIn', 'calcSkip', 'choreCfg', 'choreFreshDays', 'choreBaseTs', 'choreOverdueDays',
   'choreTierRate', 'choreDailyDecay', 'choreUnsettled', 'computeChoreDecay',
   'affairSteps', 'affairTotalSteps', 'affairDoneSteps', 'affairLastAdvance', 'affairCurve',
   'affairCurveType', 'affairTargetAt', 'affairIsDone', 'migrateAffair',
   // 跨域 / 结构操作
-  'archiveIdleEntities', 'assetGrantPlan', 'assetGrantCore', 'applyResult', 'previewActivities', 'previewResultItems', 'processActivities', 'schedulerTick',
-  'ensureMetabolismRule', 'processLoans', 'processChoreDecay', 'processDailyTaskDebts',
+  'archiveIdleEntities', 'assetGrantPlan', 'assetGrantCore', 'createEntitiesFromTemplate', 'schedulerTick',
+  'processLoans', 'processChoreDecay', 'processDailyTaskDebts',
   'settleChoreBatches', 'checkAchievements', 'runConsistencyChecks',
   // 动作原子（阶段 4 S3）
   'FLOW_ATOMS', 'FLOW_ATOM_IDS', 'runFlowAtom', 'describeFlowAtom',
   'FLOW_ATOM_MAX_CURRENCY', 'FLOW_ATOM_MAX_ASSET', 'FLOW_ATOM_MAX_ARCHIVE',
   'FLOW_ATOM_MAX_NOTES', 'FLOW_ATOM_NOTE_MAX_LEN', 'FLOW_ATOM_IDLE_DAYS_MAX',
+  'FLOW_ATOM_MAX_CREATE', 'FLOW_ATOM_CREATE_NAME_MAX', 'PRODUCT_EXEC_MAX_PER_PERIOD',
   // 动作流引擎（阶段 4 S4）
-  'FlowEngine', 'FLOW_IDEM_KEEP',
+  'FlowEngine', 'FLOW_IDEM_KEEP', 'runFlowInTxn', 'undoFlowRunInTxn',
   // 动作流干跑（阶段 4 S5）
   'dryRun',
   // 动作流整单撤销（阶段 4 S6）
   'undoFlowRun', 'FLOW_REVERSERS',
+  // 资产使用配方（阶段 5 S1）
+  'runAssetUse', 'dryRunAssetUse', 'buildAssetUseFlow', 'usableExemptAssets',
   // 资产定义管理 UI（阶段 4 S8）
   'validateAssetDraft', 'assetReferencesOf', 'renderAssetDefs',
   'openAssetModal', 'handleAssetSave', 'toggleAssetEnabled',
@@ -106,7 +117,7 @@ const EXPORT_NAMES = [
   'PROD_TIERS', 'PROD_TIER_NAMES', 'SHADOW_SRC_NAMES', 'WEEK_ANCHOR_NAMES',
   'AFFAIR_CURVES', 'COND_METRIC_KEYS', 'COND_POINT_METRICS', 'COND_GATE_METRICS',
   // 引擎对象
-  'Ledger', 'BudgetEngine', 'UNDO_ADAPTERS', 'RESULT_ACTION_HANDLERS',
+  'Ledger', 'BudgetEngine', 'UNDO_ADAPTERS',
 ];
 
 // 最小 DOM 桩：只保证“加载与纯逻辑调用不抛异常”，不模拟真实渲染。
@@ -236,13 +247,16 @@ function installBrowserGlobals() {
 async function loadFromModules() {
   // 纯逻辑模块（不含 main.js：入口会跑初始化、碰 DOM）。
   const MODULES = [
-    'constants.js', 'time.js', 'pure.js', 'entity-kit.js', 'defaults.js', 'toast.js', 'cond-model.js', 'modal-host.js',
-    'state.js', 'theme.js', 'normalize.js', 'persist.js', 'utils.js', 'stats.js',
-    'ledger.js', 'gate.js', 'budget.js', 'budget-binding.js', 'command.js', 'conditions.js', 'entities.js', 'business.js',
+    'constants.js', 'time.js', 'pure.js', 'exec-quota.js', 'entity-kit.js', 'defaults.js', 'toast.js', 'cond-model.js', 'modal-host.js',
+    'state.js', 'theme.js', 'normalize.js', 'persist-state.js', 'persist.js', 'utils.js', 'stats.js',
+    'ledger.js', 'chore-core.js', 'debt.js', 'gate.js', 'budget.js', 'budget-binding.js', 'command.js', 'post-commit.js', 'conditions.js', 'entities.js', 'business.js',
+    'flow-scheduler.js',
     'flow-atoms.js',
     'flow-engine.js',
-    'library.js', 'shell.js', 'render-work.js', 'entity-convert.js', 'render-bank.js', 'asset-ui.js', 'render-shop.js',
-    'render-budget.js', 'cycle.js', 'cond-ui.js', 'flow-ui.js', 'ui-events.js', 'undo.js',
+    'events.js',
+    'event-bus.js',
+    'library.js', 'work-ui-state.js', 'shell.js', 'render-work.js', 'entity-convert.js', 'render-bank.js', 'asset-ui.js', 'render-shop.js',
+    'render-budget.js', 'cycle.js', 'cond-ui.js', 'flow-ui.js', 'asset-use.js', 'ui-events.js', 'undo.js',
     'modals.js', 'data.js', 'pwa.js', 'debug.js', 'startup.js',
   ];
   const api = {};

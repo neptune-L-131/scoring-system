@@ -4,7 +4,6 @@
 // 不拼接 HTML（HTML 由 render-* + view-primitives 负责），不写 state、不触发渲染。
 // 经济模型保持原样：这里只做展示口径的派生，不改变任何数值与交互。
 
-import { exemptionActivity } from './conditions.js';
 import { calcCheckIn, calcSkip, dayStart, fmt, getTaskDomainIds, logAmt, now, taskCheckedToday, taskIsStaged, taskScoreTypes } from './pure.js';
 import { state } from './state.js';
 import { choreOverdueDays, choreProgressOf, domainName } from './utils.js';
@@ -23,10 +22,7 @@ function taskCardView(t) {
   const checkedToday = taskCheckedToday(t);
   const todayStart = dayStart(now());
   const exemptToday = !!(t.lastExempt && t.lastExempt >= todayStart);
-  const cards = (state.cards && state.cards.exemption) || 0;
-  const exAct = exemptionActivity();
-  const ruleEnabled = !!(exAct && exAct.enabled);
-  // 资产使用配方优先：任何配置了「任务豁免」且余额足够的资产都能承担豁免
+  // 任何配置了「任务豁免」且余额足够的资产都能承担豁免
   const recipeAssets = (state.assetDefs || []).filter(function (d) {
     return d && d.enabled !== false && !d.archived
       && d.useRecipe && d.useRecipe.type === 'task-exempt'
@@ -52,9 +48,7 @@ function taskCardView(t) {
     typeTags: typeTags,
     domainNames: hasP ? getTaskDomainIds(t).map(function (id) { return domainName(id); }) : [],
     exemption: {
-      cards: cards,
-      canExempt: (canAsset || (ruleEnabled && cards > 0)) && !checkedToday && !exemptToday,
-      assetDriven: canAsset,
+      canExempt: canAsset && !checkedToday && !exemptToday,
       label: checkIn.gapDays >= 2 ? '补救' : '请假',
     },
   };

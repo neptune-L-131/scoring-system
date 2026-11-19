@@ -204,7 +204,6 @@ export function planEventDispatch(ev, opts) {
   };
 }
 
-// 派发计划入口：只产出计划，不做执行（执行由 event-bus.js 在事务提交后完成）。
-export function dispatchEvent(ev, opts) {
-  return planEventDispatch(ev, opts);
-}
+// 派发计划入口 planEventDispatch：只产出计划，不做执行（真实派发在 event-bus.js，
+// 由 post-commit 的 emitPostCommit 在事务提交后触发）。
+// 本模块不再导出 dispatchEvent 这类“看似执行、实则只算计划”的别名，消除语义歧义。

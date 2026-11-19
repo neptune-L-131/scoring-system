@@ -105,6 +105,30 @@ const Ledger=(function(){
     });
     return o;
   }
+  // 资产身份：从账户键 card:<id> 解析资产 id；非资产账户返回空串
+  function cardIdOf(account){
+    const s=String(account||'');
+    return s.indexOf('card:')===0?s.slice(5):'';
+  }
+  // 资产流水三要素（可选）：类别缺省按记账动作推断；来源/去向由调用方传入。
+  // 只补字段，不参与金额、余额与撤销口径。
+  function cardMetaOf(acct,op,reason){
+    const o={};
+    const card=(acct&&acct.st==='card');
+    if(!card)return o;
+    const cat=(reason&&reason.assetCat)||(op.op==='grant'?'issue':op.op==='spend'?'spend':op.op==='adjust'?'adjust':'');
+    if(cat)o.assetCat=cat;
+    if(reason&&reason.assetFrom)o.assetFrom=reason.assetFrom;
+    if(reason&&reason.assetTo)o.assetTo=reason.assetTo;
+    return o;
+  }
+  // 隐形调整记录：撤销补账归“手动调整”，避免被资产指标当成发放/消耗重复计量
+  function shadowCardMetaOf(account,op,reason){
+    if(String(account||'').indexOf('card:')!==0)return {};
+    const src=String((reason&&reason.src)||'');
+    const cat=(reason&&reason.assetCat)||(src.indexOf('undo-')===0?'adjust':op.op==='adjust'?'adjust':op.op==='spend'?'spend':'');
+    return cat?{assetCat:cat}:{};
+  }
   function writeEntry(op,acct,delta,reason){
     if(op.visible===false)return null;
     let entry;
@@ -114,6 +138,12 @@ const Ledger=(function(){
       entry={id:uid(),time:now(),st:op.st||acct.st,amt:delta,desc:(reason&&reason.desc)||'',src:(reason&&reason.src)||'',dom:(reason&&reason.dom!==undefined)?reason.dom:(acct.dom||'')};
       Object.assign(entry,pickExtra(reason));
     }
+    const meta=cardMetaOf(acct,op,reason);
+    Object.keys(meta).forEach(function(k){if(entry[k]===undefined)entry[k]=meta[k];});
+    // 身份兜底：调用方只传账户字符串时，从 card:<id> 补出资产键（既有可选字段），
+    // 让所有经过账本写入的资产流水都能按资产归类，不必逐个调用方传 card。
+    const cardId=cardIdOf(op.op==='transfer'?op.to:op.account);
+    if(cardId&&!entry.card)entry.card=cardId;
     return pushLog(entry);
   }
   function post(op){
@@ -134,8 +164,8 @@ const Ledger=(function(){
         noteInvisible(op.from,-amt);
         noteInvisible(op.to,amt);
         const lb=shadowLabel(reason.src,reason.desc);
-        shadowPush({id:uid(),ts:now(),acct:op.from,delta:-amt,before:beforeA,after:beforeA-amt,src:reason.src||'',label:lb});
-        shadowPush({id:uid(),ts:now(),acct:op.to,delta:amt,before:beforeB,after:beforeB+amt,src:reason.src||'',label:lb});
+        shadowPush(Object.assign({id:uid(),ts:now(),acct:op.from,delta:-amt,before:beforeA,after:beforeA-amt,src:reason.src||'',label:lb},shadowCardMetaOf(op.from,op,reason)));
+        shadowPush(Object.assign({id:uid(),ts:now(),acct:op.to,delta:amt,before:beforeB,after:beforeB+amt,src:reason.src||'',label:lb},shadowCardMetaOf(op.to,op,reason)));
       }
       audit({id:entry?entry.id:uid(),ts:now(),txn:tx.label,op:'transfer',from:op.from,to:op.to,delta:amt,src:reason.src||''});
       noteWatermark(op.to,beforeB+amt);
@@ -158,7 +188,7 @@ const Ledger=(function(){
     if(op.visible===false){
       // 隐形增减：计入差额累计，并写一条余额调整记录（银行页可见）
       noteInvisible(op.account,delta);
-      shadowPush({id:uid(),ts:now(),acct:op.account,delta:delta,before:before,after:after,src:reason.src||'',label:shadowLabel(reason.src,reason.desc)});
+      shadowPush(Object.assign({id:uid(),ts:now(),acct:op.account,delta:delta,before:before,after:after,src:reason.src||'',label:shadowLabel(reason.src,reason.desc)},shadowCardMetaOf(op.account,op,reason)));
     }
     const entry=writeEntry(op,acct,delta,reason);
     attachAgg(entry);
@@ -214,7 +244,7 @@ const Ledger=(function(){
       const lb=shadowLabel(reason.src,reason.desc);
       shadowRecs.forEach(function(r){
         noteInvisible(r.acct,r.delta);
-        shadowPush({id:uid(),ts:now(),acct:r.acct,delta:r.delta,before:r.before,after:r.after,src:reason.src||'',label:lb});
+        shadowPush(Object.assign({id:uid(),ts:now(),acct:r.acct,delta:r.delta,before:r.before,after:r.after,src:reason.src||'',label:lb},shadowCardMetaOf(r.acct,op,reason)));
       });
     }
     const entry=writeEntry(op,{st:op.st||'vitality',dom:''},total,reason);

@@ -1,6 +1,6 @@
 import { logDomainsOf } from './conditions.js';
 import { SHADOW_MAX, STATS_ENTITY_MAPS, STATS_KEEP_DAYS, STATS_SCALARS, STATS_VERSION, LOG_MAX } from './constants.js';
-import { dayKey, cardName, logAmt, round2, getTaskDomainIds, logHasType, now, uid } from './pure.js';
+import { dayKey, logAmt, round2, getTaskDomainIds, logHasType, now, uid } from './pure.js';
 import { state } from './state.js';
 import { keyOffset } from './time.js';
 import { domainName } from './utils.js';
@@ -93,7 +93,11 @@ function accountLabel(acct){
   if(acct==='vitality')return '活力点';
   if(acct==='achievement')return '成果点';
   if(acct.indexOf('progress:')===0)return '进度·'+domainName(acct.slice(9));
-  if(acct.indexOf('card:')===0)return cardName(acct.slice(5));
+  if(acct.indexOf('card:')===0){
+    const id=acct.slice(5);
+    const d=(state.assetDefs||[]).find(function(x){return x&&x.id===id;});
+    return d&&d.name?d.name:(id||'卡');
+  }
   return acct;
 }
 

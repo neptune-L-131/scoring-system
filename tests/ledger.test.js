@@ -222,6 +222,129 @@ describe('撤销适配器（Ledger.reverse）', () => {
   });
 });
 
+describe('资产身份兜底：单一写入口从 card:<id> 补 card 字段', () => {
+  const NOW = new Date(2026, 4, 10, 12, 0, 0, 0).getTime();
+  function setFixture() {
+    api.resetState({
+      scores: { vitality: 0, progress: {}, achievement: 0 },
+      domains: [{ id: 'd_default', name: '默认' }],
+      cards: { exemption: 0, star: 0, token: 5 },
+      tasks: [checkinTask({ lastCheckIn: null })],
+    });
+    api.patchState(s => {
+      s.assetDefs.push(api.normalizeAssetDef({
+        id: 'star', name: '星星', unit: '颗', maxBalance: 10, origin: 'user',
+      }));
+      s.assetDefs.push(api.normalizeAssetDef({
+        id: 'token', name: '令牌', unit: '枚', maxBalance: 99, origin: 'user',
+      }));
+    });
+  }
+  const cardLogs = () => api.getState().logs.filter(l => l.st === 'card');
+
+  it('活动发卡：调用方只传账户字符串，账本补齐 card', () => {
+    setFixture();
+    run(() => {
+      api.assetGrantCore({
+        mode: 'activity', assetId: 'star', amount: 1, cap: 3,
+        entry: g => ({ st: 'card', amt: g, desc: '活动发卡', src: 'card-grant', granted: g }),
+        reason: { src: 'card-grant' },
+      });
+    });
+    const logs = cardLogs();
+    expect(logs).toHaveLength(1);
+    expect(logs[0].card).toBe('star');
+    expect(api.getState().cards.star).toBe(1);
+  });
+
+  it('动作流发放与消耗：流水都带 card', () => {
+    setFixture();
+    run(() => {
+      api.runFlowAtom('asset.grant', { assetId: 'star', amount: 2 }, { ts: NOW });
+      api.runFlowAtom('asset.spend', { assetId: 'star', amount: 1 }, { ts: NOW });
+    });
+    const logs = cardLogs();
+    expect(logs.map(l => l.card)).toEqual(['star', 'star']);
+    expect(logs.map(l => l.src)).toEqual(['flow-asset-spend', 'flow-asset-grant']);
+  });
+
+  it('购买：消耗腿与赠送腿都带 card', () => {
+    setFixture();
+    api.patchState(s => {
+      s.products.push(api.normalizeProduct({
+        id: 'p1', name: '资产商品', desc: '', price: 0, stock: 2,
+        categoryId: 'sc_default', tier: 'daily',
+        assetPrice: { assetId: 'token', amount: 2 },
+        grants: [{ kind: 'asset', assetId: 'star', amount: 1 }],
+        sold: 0,
+      }));
+    });
+    api.buyProduct('p1');
+    const logs = cardLogs();
+    expect(logs).toHaveLength(2);
+    logs.forEach(l => {
+      expect(l.card).toBe(l.src === 'purchase' ? 'token' : 'star');
+    });
+  });
+
+  it('隐形消耗：visible:false 不写可见流水，余额痕迹仍指向具体资产', () => {
+    setFixture();
+    api.patchState(s => { s.cards.exemption = 1; });
+    // 旧「直接用卡」业务入口已移除；这里直接走账务单一写入口，继续校验 card 字段兜底
+    const r = api.Ledger.post({
+      op: 'spend', account: 'card:exemption', delta: -1, visible: false,
+      reason: { src: 'exempt-use', assetCat: 'spend', assetFrom: '手动操作', assetTo: '豁免任务「旧任务」' },
+    });
+    expect(r.ok).toBe(true);
+    const s = api.getState();
+    expect(s.cards.exemption).toBe(0);
+    expect(cardLogs()).toHaveLength(0);
+    const shadow = s.ext.shadow.find(x => x.acct === 'card:exemption');
+    expect(shadow).toMatchObject({ acct: 'card:exemption', delta: -1, src: 'exempt-use' });
+  });
+
+  it('撤销补账：反向补账落在具体资产账户上', () => {
+    setFixture();
+    api.patchState(s => {
+      s.products.push(api.normalizeProduct({
+        id: 'p1', name: '资产商品', desc: '', price: 0, stock: 2,
+        categoryId: 'sc_default', tier: 'daily',
+        assetPrice: { assetId: 'token', amount: 2 }, grants: [], sold: 0,
+      }));
+    });
+    api.buyProduct('p1');
+    const leg = api.getState().logs.find(l => l.src === 'purchase');
+    const r = api.undoLog(leg.id);
+    expect(r.ok).toBe(true);
+    const undoShadow = api.getState().ext.shadow.filter(x => String(x.src).indexOf('undo-purchase') === 0);
+    expect(undoShadow.length).toBeGreaterThan(0);
+    undoShadow.forEach(x => { expect(x.acct).toBe('card:token'); });
+  });
+
+  it('按资产筛选：资产流水全部归入对应资产，没有掉进「未知」', () => {
+    setFixture();
+    run(() => {
+      api.assetGrantCore({
+        mode: 'activity', assetId: 'star', amount: 2, cap: 3,
+        entry: g => ({ st: 'card', amt: g, desc: '发卡测试', src: 'card-grant', granted: g }),
+        reason: { src: 'card-grant' },
+      });
+      // 只传账户字符串的直接写入：同样要被补上 token
+      api.Ledger.post({ op: 'spend', account: 'card:token', delta: -1, reason: { src: 'purchase', desc: '令牌消耗' } });
+    });
+    cardLogs().forEach(l => { expect(l.card).toBeTruthy(); });
+    api.renderBank();
+    const rows = () => (document.getElementById('logList').innerHTML.match(/class="ledger-row /g) || []).length;
+    expect(rows()).toBe(2); // 未筛选：星星 + 令牌两条都在
+
+    api.setLedgerFilter('acct', 'card:star');
+    const meta = document.getElementById('logMeta');
+    expect(meta.textContent).toContain('命中 1 条'); // 只剩星星那条，令牌不混入，也没有「未知」桶
+    expect(rows()).toBe(1);
+    api.clearLedgerFilter();
+  });
+});
+
 describe('Ledger.liability：负债生命周期', () => {
   it('open / mutate / close 都留在审计里', () => {
     api.resetState();

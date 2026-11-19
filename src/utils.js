@@ -1,4 +1,3 @@
-import { ACTIVITY_MAX_DAYS } from './constants.js';
 import { normalizeChoreConfig } from './defaults.js';
 import { round2, splitCents } from './pure.js';
 import { state } from './state.js';

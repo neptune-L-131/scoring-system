@@ -3,7 +3,7 @@
 // 结构递归与比较在内核 cond-kernel.js，本文件不 import entities / ledger / render，
 // 也不被 conditions.js 之外的业务模块反向依赖（budget 通过 provider 注册注入）。
 import { evalNode as evalTreeNode, opSatisfied } from './cond-kernel.js';
-import { affairLastAdvance, condWindowByRange, dayKey, effectiveLastTs, getTaskDomainIds, idleDaysSince, isAffairMetric, isChoreMetric, isPointMetric, isArchivedEntity, round2, round4, validRange } from './pure.js';
+import { affairLastAdvance, condWindowByRange, dayKey, effectiveLastTs, getTaskDomainIds, idleDaysSince, isAffairMetric, isAssetMetric, isChoreMetric, isPointMetric, isArchivedEntity, round2, validRange } from './pure.js';
 import { state } from './state.js';
 import { dayDiff } from './time.js';
 import { activityCountForDomain, choreOverdueDays, domainProgress, totalProgress } from './utils.js';
@@ -71,6 +71,48 @@ function pointMetricValue(metric,it,ts){
   }
   return 0;
 }
+// ===== 资产类指标 =====
+// 余额直接读 state.cards：资产停用/归档只是冻结语义，余额仍在，照常取值。
+// 发放/消耗按窗口汇总「可见资产流水 + 隐形余额调整记录」：
+//   - 可见流水优先看 assetCat；旧流水没有类别时按金额正负归档（阶段 2 之前的兼容口径）
+//   - 隐形记录（撤销补账、旧版豁免消耗）按 src 归类：exempt-use 记消耗，其余记手动调整不吃掉计量
+// 流水/调整记录受 LOG_MAX / SHADOW_MAX 截断，超出保留范围的历史不计入（与其它窗口指标同一约定）。
+function assetShadowCat(r){
+  if(r&&r.assetCat)return r.assetCat;
+  if(r&&r.src==='exempt-use')return 'spend';
+  return 'adjust';
+}
+function assetMovementInWindow(assetId,w){
+  let issued=0,spent=0;
+  const consider=function(amt,cat){
+    amt=Number(amt)||0;
+    if(!amt)return;
+    if(cat==='issue'||(!cat&&amt>0))issued+=amt;
+    else if(cat==='spend'||cat==='expire'||(!cat&&amt<0))spent+=Math.abs(amt);
+  };
+  (state.logs||[]).forEach(function(l){
+    if(!l||l.st!=='card'||l.card!==assetId)return;
+    const t=Number(l.time)||0;
+    if(!(t>=w.start&&t<w.end))return;
+    consider(l.amt,l.assetCat||'');
+  });
+  const sh=(state.ext&&state.ext.shadow)||[];
+  sh.forEach(function(r){
+    if(!r||r.acct!=='card:'+assetId)return;
+    const t=Number(r.ts)||0;
+    if(!(t>=w.start&&t<w.end))return;
+    consider(r.delta,assetShadowCat(r));
+  });
+  return {issued:issued,spent:spent};
+}
+// 无法取值（未选择资产）时返回 NaN：任何比较都为假，不把「取不到」伪装成 0。
+function assetMetricValue(metric,it,w){
+  const id=String((it&&it.target)||'');
+  if(!id)return NaN;
+  if(metric==='asset_hold')return Number((state.cards||{})[id])||0;
+  const m=assetMovementInWindow(id,w);
+  return metric==='asset_issued'?m.issued:m.spent;
+}
 // 不活跃项目：未完成且未归档
 function affairActive(a){return !!a&&!a.doneAt&&!a.archived;}
 function weekScore(start,end){
@@ -87,9 +129,6 @@ function weekScore(start,end){
   const investRate=spend>0?invest/spend*100:0;
   const score=prog + vit*0.5 + ach*10 + checkins*2;
   return {vit:vit,prog:prog,ach:ach,checkins:checkins,invest:invest,consume:consume,investRate:investRate,score:score};
-}
-function exemptionActivity(){
-  return (state.activities||[]).find(a=>a.enabled&&(a.result&&a.result.items||[]).some(it=>it.type==='card'&&it.card==='exemption'));
 }
 // 日志所属领域 id（缺省时回退到其任务的领域）
 function logDomainsOf(l){
@@ -317,6 +356,8 @@ function evalCondItem(it,act,ts){
     return opSatisfied(val,it.op,v);
   }
   const w=range==='total'?{start:0,end:ts+1}:condWindowByRange(range,act,ts,it.days);
+  // 自定义资产：持有数量是点态值（事件发生时刻即确定），发放/消耗按窗口汇总
+  if(isAssetMetric(it.metric))return opSatisfied(assetMetricValue(it.metric,it,w),it.op,v);
   // 阶段 3：领域活跃度读活跃度索引（不遍历日志，不受日志截断影响）
   if(it.metric==='domain_activity'){
     const did=(it.targetType==='domain')?(it.target||''):'';
@@ -360,4 +401,4 @@ function evalCondition(act,ts){
   return evalTreeNode({group:true,mode:c.mode==='any'?'any':'all',items:c.items||[]},{evalLeaf:function(n){return evalCondItem(n,act,ts);}});
 }
 
-export { weekScore, exemptionActivity, evalCondition, logDomainsOf, logMatchesTarget, taskMatchesTarget, domainMatchesTarget, eachStatsBucket, rangeStats, taskMetricValue, domainMetricValue, condLeafEntities, entityMetricValue, affairActive, pointMetricValue, sumLogsInWindow, countLogsInWindow, logAffairDomain, affairWindowValue, choreWindowValue, evalCountMetric, evalCondItem, registerPointMetricProvider };
+export { weekScore, evalCondition, logDomainsOf, logMatchesTarget, taskMatchesTarget, domainMatchesTarget, eachStatsBucket, rangeStats, taskMetricValue, domainMetricValue, condLeafEntities, entityMetricValue, affairActive, pointMetricValue, sumLogsInWindow, countLogsInWindow, logAffairDomain, affairWindowValue, choreWindowValue, evalCountMetric, evalCondItem, assetMetricValue, assetMovementInWindow, registerPointMetricProvider };

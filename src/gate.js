@@ -1,12 +1,11 @@
 import { gateConditionOf } from './cond-model.js';
-import { normalizeCondition } from './cond-model.js';
 import { evalNode } from './conditions.js';
 import { ACH_EARN_SOURCES, ACTIVITY_MAX_DAYS, PROD_TIERS } from './constants.js';
 import { condNLLeaf, condNLNode } from './cycle.js';
 import { newExtState, defaultProductGate } from './defaults.js';
 import { evalCondItem } from './cond-eval.js';
 import { Ledger } from './ledger.js';
-import { dayKey, dateKeyOffset, toNum, now } from './pure.js';
+import { dayKey, dateKeyOffset, now } from './pure.js';
 import { state } from './state.js';
 // gate.js —— 成果点累计、领域活跃度索引、商品门槛评估
 // 由 app.js 按功能拆分（第五轮可维护性重构），行为不变。

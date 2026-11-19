@@ -16,7 +16,7 @@
 // tests/sw-assets.test.js 会校验：清单与仓库实际文件一致、VERSION 与缓存名一致。
 'use strict';
 
-const VERSION = '2026-11-17.6';
+const VERSION = '2026-11-19.4';
 const CACHE = 'score-sys-' + VERSION;
 
 // 整版清单（相对 sw.js 所在目录）
@@ -27,6 +27,7 @@ const PRECACHE = [
   './src/constants.js',
   './src/time.js',
   './src/pure.js',
+  './src/exec-quota.js',
   './src/entity-kit.js',
   './src/entity-convert.js',
   './src/defaults.js',
@@ -47,7 +48,6 @@ const PRECACHE = [
   './src/ledger.js',
   './src/chore-core.js',
   './src/debt.js',
-  './src/metabolism.js',
   './src/gate.js',
   './src/budget.js',
   './src/budget-binding.js',
@@ -67,7 +67,6 @@ const PRECACHE = [
   './src/render-bank.js',
   './src/asset-ui.js',
   './src/asset-use.js',
-  './src/activity-migrate.js',
   './src/events.js',
   './src/post-commit.js',
   './src/event-bus.js',

@@ -1,14 +1,15 @@
-import { registerRenderer } from './render.js';
 import { BudgetEngine } from './budget.js';
 import { COND_RANGES } from './constants.js';
-import { cardName, isPointMetric, fmt } from './pure.js';
+import { isAffairMetric, isAssetHoldMetric, isAssetMetric, isChoreMetric, isPointMetric, fmt } from './pure.js';
 import { state } from './state.js';
-import { addDays, dayStart, now, rangeOf, relativeDay, weekStart } from './time.js';
+import { relativeDay } from './time.js';
 import { domainName, taskNameLabel } from './utils.js';
-// cycle.js —— 周期活动列表与编辑
+// cycle.js —— 周期页与条件文案
 // 由 app.js 按功能拆分（第五轮可维护性重构），行为不变。
 
-// ===== Cycle Settings (周期活动) =====
+// ===== 通用折叠面板 =====
+function toggleAcc(id){const el=document.getElementById(id);if(el)el.classList.toggle('open');}
+// ===== Cycle Settings =====
 function fmtDate(ts){
   if(!ts)return '—';
   const d=new Date(ts);
@@ -17,19 +18,6 @@ function fmtDate(ts){
   if(diffDays===1)return '明天';
   if(diffDays===2)return '后天';
   return(d.getMonth()+1)+'/'+d.getDate();
-}
-function cycleNextGrant(cfg){
-  const anchor=cfg.anchor||1;
-  if(cfg.period==='day')return addDays(dayStart(now()),1);
-  if(cfg.period==='month')return rangeOf('month',now()).end;
-  return addDays(weekStart(now(),anchor),7);
-}
-function updateExemptChip(){
-  const chip=document.getElementById('exemptChip');
-  if(!chip)return;
-  const bal=state.cards.exemption||0;
-  chip.style.display=bal>0?'inline-flex':'none';
-  chip.textContent='豁免卡 × '+bal;
 }
 function periodLabel(p){return p==='day'?'每天':p==='month'?'每月':'每周';}
 const COND_METRICS=[
@@ -58,9 +46,12 @@ const COND_METRICS=[
   {v:'domain_activity',n:'领域活跃次数'},
   {v:'milestone_unlocked',n:'里程碑已解锁'},
   {v:'checkin_streak',n:'连续打卡天数'},
-  {v:'budget_remaining',n:'预算剩余'}
+  {v:'budget_remaining',n:'预算剩余'},
+  {v:'asset_hold',n:'持有数量'},
+  {v:'asset_issued',n:'已发放数量'},
+  {v:'asset_spent',n:'已消耗数量'}
 ];
-const COND_TARGET_TYPES=[{v:'all',n:'全部'},{v:'domain',n:'按领域'},{v:'task',n:'按任务'},{v:'milestone',n:'按里程碑'},{v:'budget',n:'按预算分类'}];
+const COND_TARGET_TYPES=[{v:'all',n:'全部'},{v:'domain',n:'按领域'},{v:'task',n:'按任务'},{v:'milestone',n:'按里程碑'},{v:'budget',n:'按预算分类'},{v:'asset',n:'按资产'}];
 const COND_NEW_FILTERS=[{v:'none',n:'当前'},{v:'new_task',n:'本周期新增任务'},{v:'new_domain',n:'本周期新增领域'}];
 const COND_AGGREGATES=[{v:'sum',n:'总计'},{v:'any',n:'任意单个'}];
 // 主体类型：成果点仅全部；计数类(新增任务/新增领域)支持全部+领域；值类(打卡/活力/进度)支持全部+领域+任务
@@ -69,6 +60,7 @@ function condTargetTypesFor(metric){
   if(metric==='achievement'||metric==='lifetime_achievement')return ['all'];
   if(metric==='milestone_unlocked')return ['milestone'];
   if(metric==='budget_remaining')return ['budget'];
+  if(isAssetMetric(metric))return ['asset'];
   if(metric==='domain_activity')return ['domain'];
   if(metric.indexOf('budget_')===0)return ['all'];
   if(metric==='new_tasks'||metric==='new_domains')return ['all','domain'];
@@ -117,6 +109,11 @@ function condScopePhrase(it){
     const c=BudgetEngine.category(t);
     return c?c.name:'（预算分类已删除）';
   }
+  if(it.targetType==='asset'){
+    if(!t)return '（未选择资产）';
+    const d=(state.assetDefs||[]).find(x=>x&&x.id===t);
+    return d?d.name:'（资产已删除）';
+  }
   return '';
 }
 function metricLabel(it){
@@ -137,7 +134,7 @@ function rangeTimeWord(it,act){
 }
 function condItemLabel(it){
   if(!it)return '';
-  if(isPointMetric(it.metric))return metricLabel(it)+' '+opLabel(it.op)+' '+fmt(it.value);
+  if(isPointMetric(it.metric)||isAssetHoldMetric(it.metric))return metricLabel(it)+' '+opLabel(it.op)+' '+fmt(it.value);
   return rangeLabel(it.range,it.days)+' · '+metricLabel(it)+' '+opLabel(it.op)+' '+fmt(it.value);
 }
 function condNodeLabel(node){
@@ -149,7 +146,7 @@ function condNLLeaf(it,act){
   const mn=metricNameLabel(it);
   const tail=' '+opLabel(it.op)+' '+fmt(it.value);
   // 点态指标没有时间窗口：直接“主体·指标 ≥ N”
-  if(isPointMetric(it.metric))return (condScopePhrase(it)?condScopePhrase(it)+'·':'')+mn+tail;
+  if(isPointMetric(it.metric)||isAssetHoldMetric(it.metric))return (condScopePhrase(it)?condScopePhrase(it)+'·':'')+mn+tail;
   if(it.metric==='achievement')return rw+mn+tail;
   const scope=condScopePhrase(it);
   const ew=condEntityWord(it);
@@ -169,38 +166,11 @@ function condNLNode(node,act){
   if(node&&node.group)return '（'+((node.items||[]).map(n=>condNLNode(n,act)).join(node.mode==='any'?' 或 ':' 且 '))+'）';
   return condNLLeaf(node,act);
 }
-function rewardItemLabel(it){
-  if(!it)return '';
-  if(it.type==='archive'){
-    const ent=it.entity==='affair'?'项目':it.entity==='chore'?'杂事':'任务';
-    return '归档不活跃≥'+(it.idleDays||14)+'天的'+ent;
-  }
-  if(it.type==='card')return cardName(it.card||'exemption')+' ×'+(it.amount||0)+(it.cap?'（上限'+(it.cap||0)+'）':'');
-  if(it.type==='progress'){
-    if(it.domainId)return domainName(it.domainId)+'进度 +'+fmt(it.amount);
-    return '进度(全领域) +'+fmt(it.amount);
-  }
-  if(it.type==='vitality'){
-    const tName=it.taskId?(state.tasks.find(t=>t.id===it.taskId)||{}).name:'';
-    return tName?('「'+tName+'」活力 +'+fmt(it.amount)):('活力 +'+fmt(it.amount));
-  }
-  if(it.type==='achievement')return '成果 +'+fmt(it.amount);
-  return '';
-}
-function actMetaLabel(a){
-  const c=a.condition||{mode:'all',items:[]};
-  const condItems=c.items||[];
-  const condTxt=condItems.length?condItems.map(condNodeLabel).join(c.mode==='any'?' 或 ':' 且 '):'无条件';
-  const resItems=(a.result&&a.result.items)||[];
-  const resTxt=resItems.length?resItems.map(rewardItemLabel).join('、'):'无';
-  return '前提：'+condTxt+'　结果：'+resTxt;
-}
 
 
 
 
 
 
-export { fmtDate, cycleNextGrant, updateExemptChip, periodLabel, COND_METRICS, COND_TARGET_TYPES, COND_NEW_FILTERS, COND_AGGREGATES, condTargetTypesFor, condNewFilterOptions, rangeLabel, metricNameLabel, condEntityWord, condIsMulti, condScopePhrase, metricLabel, opLabel, rangeTimeWord, condItemLabel, condNodeLabel, condNLLeaf, condNLNode, rewardItemLabel, actMetaLabel };
+export { toggleAcc, fmtDate, periodLabel, COND_METRICS, COND_TARGET_TYPES, COND_NEW_FILTERS, COND_AGGREGATES, condTargetTypesFor, condNewFilterOptions, rangeLabel, metricNameLabel, condEntityWord, condIsMulti, condScopePhrase, metricLabel, opLabel, rangeTimeWord, condItemLabel, condNodeLabel, condNLLeaf, condNLNode };
 
-registerRenderer('exempt', updateExemptChip);

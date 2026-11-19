@@ -4,14 +4,15 @@ import { PROD_TIER_NAMES } from './constants.js';
 import { tierCurrency } from './defaults.js';
 import { evaluateProductGate, validProductTier } from './gate.js';
 import { buyProduct, delShopCategory, renameShopCategory } from './library.js';
+import { execBoughtCount } from './exec-quota.js';
 import { confirmDelProd, openProdModal } from './modals.js';
 import { save } from './persist.js';
-import { esc, fmt, fmtTime } from './pure.js';
+import { esc, fmt, fmtTime, now } from './pure.js';
 import { setScoreCell } from './render-work.js';
 import { render } from './render.js';
 import { state } from './state.js';
 import { toast } from './toast.js';
-import { drag, toggleCollapse } from './ui-events.js';
+import { toggleCollapse } from './ui-events.js';
 import { undoLog } from './undo.js';
 import { actionsRowHTML, collBodyHTML, collGroupHTML, collHeaderHTML, dragHandleHTML, logItemHTML } from './view-primitives.js';
 // render-shop.js —— 渲染：商店页
@@ -114,6 +115,18 @@ function shopCardHTML(p,catId,prevCatId){
     }
     return '赠'+(g.account==='vitality'?'活力点':'成果点')+' '+fmt(g.amount);
   }).join('、');
+  // 执行权：买一次 = 指定动作流执行一次；显示周期额度与剩余次数
+  const exec=(p.exec&&p.exec.flowId)?p.exec:null;
+  const execFlow=exec?((state.flows||[]).find(function(f){return f&&f.id===exec.flowId;})||null):null;
+  let execTxt='';
+  let execUsed=0;
+  if(exec){
+    const per=exec.period==='day'?'天':exec.period==='month'?'月':'周';
+    const lim=Number(exec.maxPerPeriod)||1;
+    execUsed=execBoughtCount(state.ext&&state.ext.execBuys,p.id,exec,now());
+    execTxt='买一次：执行「'+(execFlow?execFlow.name:'已删除的动作流')+'」一次 · 每'+per+'限'+lim+'次（本期 '+execUsed+'/'+lim+'）';
+  }
+  const execBad=!!exec&&(!execFlow||execFlow.enabled===false||execFlow.invalid||execUsed>=(Number(exec.maxPerPeriod)||1));
   const willLoan=!assetPrice&&balance<p.price;
   const isSoldout=p.stock===0;
   const gate=evaluateProductGate(p);
@@ -132,7 +145,9 @@ function shopCardHTML(p,catId,prevCatId){
       ?'<button class="btn btn-sm sh-buy" disabled>门槛未达标</button>'
       :assetLack
         ?'<button class="btn btn-sm sh-buy" disabled>资产不足</button>'
-        :'<button class="btn btn-sm sh-buy" onclick="buyProduct(\''+p.id+'\')">'+(willLoan?'贷款购买':'购买')+'</button>';
+        :execBad
+          ?'<button class="btn btn-sm sh-buy" disabled>'+(execUsed>=exec.maxPerPeriod?'本周期次数已用完':'动作流不可用')+'</button>'
+          :'<button class="btn btn-sm sh-buy" onclick="buyProduct(\''+p.id+'\')">'+(willLoan?'贷款购买':'购买')+'</button>';
   return '<div class="shop-card'+soldoutCls+lockedCls+'" data-prod-id="'+p.id+'" data-cat-id="'+catId+'"'+dataPrevCat+'>'
     +'<div class="card-top" style="margin-bottom:0"><div class="sh-name">'+esc(p.name)+'</div>'
     +actionsRowHTML('card-actions',dragHandleHTML('拖拽排序或跨分类移动')+'<button onclick="openProdModal(\''+p.id+'\')">编辑</button><button class="del" onclick="confirmDelProd(\''+p.id+'\')">删除</button>')+'</div>'
@@ -140,6 +155,7 @@ function shopCardHTML(p,catId,prevCatId){
     +((p.budget&&p.budget.categoryId&&Number(p.budget.amount)>0)
       ?'<div class="sh-budget">预算·'+esc((BudgetEngine.category(p.budget.categoryId)||{name:'已删除分类'}).name)+' '+fmt(p.budget.amount)+'</div>':'')
     +(grantTxt?'<div class="sh-budget">'+esc(grantTxt)+'</div>':'')
+    +(execTxt?'<div class="sh-budget">'+esc(execTxt)+'</div>':'')
     +'<div class="sh-cost '+(isV?'v':'a')+'">'+fmt(p.price)+'<span class="unit">'+cn+tierTxt+stockTxt+debtTxt+loanWarn+assetTxt+'</span></div>'
     +gateHTML
     +buyHTML

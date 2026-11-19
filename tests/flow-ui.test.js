@@ -22,7 +22,6 @@ function seed(patch) {
     cards: { exemption: 0, star: 0 },
     assetDefs: [builtinDef(), starDef()],
     flows: [],
-    activities: [],
   }, patch || {}));
 }
 function createFlow(over) {
@@ -64,12 +63,13 @@ describe('S9 流编辑器：保存只落配置', () => {
     expect(document.getElementById('flowList').innerHTML).toContain('已停用');
   });
 
-  it('编辑器只暴露 7 个已开放原子，未知原子写不进去', () => {
+  it('编辑器只暴露 8 个已开放原子，未知原子写不进去', () => {
     api.openFlowModal();
     setVal('flowName', '原子白名单');
     api.renderFlowSteps();
     const html = document.getElementById('flowStepList').innerHTML;
-    expect(api.FLOW_ATOM_IDS).toHaveLength(7);
+    expect(api.FLOW_ATOM_IDS).toHaveLength(9);
+    expect(api.FLOW_ATOM_IDS).toContain('task.exempt');
     expect((html.match(/flowStepAtomChanged\(/g) || []).length).toBe(1);
     api.flowStepAtomChanged('0', 'evil.arbitrary');
     api.flowStepAtomChanged('0', 'asset.grant');

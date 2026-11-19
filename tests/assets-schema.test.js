@@ -105,7 +105,7 @@ describe('v3 → v4 最小迁移', () => {
     expect(s.assetDefs.find(d => d.id === 'ghost').maxBalance).toBe(0);
   });
 
-  it('内置豁免卡的余额口径与语义字段不被存档改写', () => {
+  it('存档里的豁免卡定义按普通资产保留（不再强制覆盖语义字段）', () => {
     const s = api.parseState(rawV3({
       cards: { exemption: 2.5 },
       assetDefs: [{ id: 'exemption', name: '我的豁免', unit: '个', maxBalance: 99, origin: 'user' }],
@@ -113,7 +113,7 @@ describe('v3 → v4 最小迁移', () => {
     expect(s.cards.exemption).toBe(2.5);
     expect(s.assetDefs).toHaveLength(1);
     expect(s.assetDefs[0]).toMatchObject({
-      id: 'exemption', name: '断更豁免卡', unit: '张', maxBalance: null, origin: 'builtin',
+      id: 'exemption', name: '我的豁免', unit: '个', maxBalance: 99, origin: 'user',
     });
   });
 
@@ -204,6 +204,39 @@ describe('flows / 运行层归一', () => {
       flowId: 'f1', status: 'active', childLogIds: ['l1', 'l2'],
     });
     expect(s.ext.flowRuns.byId.r0.deltas).toMatchObject({ vitality: 5 });
+  });
+});
+
+describe('资产流水三要素（阶段 6）', () => {
+  it('旧流水缺字段可读，新字段缺省按「未知」呈现', () => {
+    const base = JSON.parse(JSON.stringify(api.defaults()));
+    base.logs = [{ id: 'old', time: 1, st: 'card', amt: 1, desc: '旧发放', card: 'star' }];
+    const s = api.parseState(JSON.stringify(base));
+    expect(s.logs[0].assetCat).toBeUndefined();
+    expect(api.assetLogMeta(s.logs[0])).toEqual({ cat: '', catName: '未知', from: '未知', to: '未知' });
+  });
+
+  it('新字段随存档往返保留；非法类别按缺失处理', () => {
+    const base = JSON.parse(JSON.stringify(api.defaults()));
+    base.logs = [
+      { id: 'a', time: 1, st: 'card', amt: -1, desc: '消耗', card: 'star', assetCat: 'spend', assetFrom: '动作流「A」', assetTo: '兑换「咖啡」' },
+      { id: 'b', time: 2, st: 'card', amt: 1, desc: '坏类别', card: 'star', assetCat: 'bogus' },
+    ];
+    const s = api.parseState(JSON.stringify(base));
+    expect(api.assetLogMeta(s.logs[0])).toEqual({ cat: 'spend', catName: '消耗', from: '动作流「A」', to: '兑换「咖啡」' });
+    expect(s.logs[1].assetCat).toBeUndefined();
+    expect(api.assetCatName('freeze')).toBe('冻结');
+    expect(api.assetCatName('')).toBe('未知');
+  });
+
+  it('旧流水仍可撤销（card-grant 适配器不受新字段影响）', () => {
+    api.resetState({ cards: { exemption: 1 } });
+    api.patchState(s => {
+      s.logs.unshift({ id: 'lg', time: Date.now(), st: 'card', amt: 1, desc: '旧发放 1 张', src: 'card-grant', card: 'exemption' });
+    });
+    const r = api.Ledger.reverse('lg');
+    expect(r && r.ok).toBe(true);
+    expect(api.getState().cards.exemption).toBe(0);
   });
 });
 

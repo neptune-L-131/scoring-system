@@ -1,16 +1,16 @@
 import { renderAssetDefs } from './asset-ui.js';
 import { registerRenderer } from './render.js';
 import { eachStatsBucket, weekScore } from './conditions.js';
-import { LOG_DISPLAY } from './constants.js';
+import { ASSET_LOG_CATS, LOG_DISPLAY } from './constants.js';
 import { delDomain, delMetric, openMetricModal, renameDomain } from './library.js';
 import { openAchModal } from './modals.js';
-import { dayKey, weekStartTs, esc, fmt, fmtTime, now } from './pure.js';
+import { assetCatName, assetLogMeta, dayKey, esc, escAttr, fmt, fmtTime, now } from './pure.js';
 import { achCardHTML, setScoreCell } from './render-work.js';
 import { registerPanelTarget } from './render-targets.js';
 import { state } from './state.js';
 import { accountLabel, shadowLabel } from './stats.js';
 import { addDays, dayDiff, dayStart as dayStartOf, weekStart } from './time.js';
-import { drag, toggleCollapse } from './ui-events.js';
+import { toggleCollapse } from './ui-events.js';
 import { UNDO_ADAPTERS, undoLog } from './undo.js';
 import { domainName, domainProgress, metricValue, totalProgress } from './utils.js';
 import { logRowView, shadowRowView } from './view-models.js';
@@ -109,22 +109,601 @@ function renderBank(){
   renderAssetDefs();
 }
 
+// ===== 账本视图（只读展示层） =====
+// 筛选/展开/折叠都是界面状态：只活在这个模块里，不写 state、不进存档，
+// 也不改变任何记账语义（撤销仍走原来的 undoLog，单条流水不变）。
+const LEDGER_SRC_GROUPS=[
+  {key:'checkin',name:'打卡'},
+  {key:'purchase',name:'购买'},
+  {key:'task',name:'任务'},
+  {key:'affair',name:'事项'},
+  {key:'chore',name:'杂事'},
+  {key:'budget',name:'预算'},
+  {key:'flow',name:'动作流'},
+  {key:'achievement',name:'里程碑'},
+  {key:'asset',name:'资产'},
+  {key:'system',name:'系统'},
+];
+const LEDGER_RANGES=[
+  {v:'today',n:'今天'},
+  {v:'7d',n:'最近7天'},
+  {v:'30d',n:'最近30天'},
+];
+const ledgerState={acct:'all',src:'all',cat:'all',range:'all',link:'all',withShadow:false,days:{},detail:''};
+
+// 来源类型：按前缀归组，未知来源落到「系统」，不隐藏任何一条记录
+function ledgerSrcGroup(l){
+  let s=String((l&&l.src)||'');
+  if(s.indexOf('undo-')===0)s=s.slice(5);
+  if(!s)return{key:'system',name:'系统'};
+  if(s.indexOf('checkin')===0)return{key:'checkin',name:'打卡'};
+  if(s.indexOf('purchase')===0)return{key:'purchase',name:'购买'};
+  if(s==='cost')return{key:'task',name:'任务'};
+  if(s.indexOf('affair')===0)return{key:'affair',name:'事项'};
+  if(s.indexOf('chore')===0)return{key:'chore',name:'杂事'};
+  if(s.indexOf('budget')===0)return{key:'budget',name:'预算'};
+  if(s.indexOf('flow')===0)return{key:'flow',name:'动作流'};
+  if(s.indexOf('achievement')===0)return{key:'achievement',name:'里程碑'};
+  if(s.indexOf('card')===0||s.indexOf('asset')===0||s==='exempt-use')return{key:'asset',name:'资产'};
+  return{key:'system',name:'系统'};
+}
+// 进度类流水可能一笔跨多个领域：拆分优先，缺失时退回 dom，再缺则归默认领域
+function ledgerProgressAccounts(l){
+  const doms=[];
+  if(Array.isArray(l.splits)){
+    l.splits.forEach(function(sp){if(sp&&sp.dom&&doms.indexOf(sp.dom)<0)doms.push(sp.dom);});
+  }
+  String(l.dom||'').split(',').forEach(function(d){if(d&&doms.indexOf(d)<0)doms.push(d);});
+  if(!doms.length)doms.push('d_default');
+  return doms.map(function(d){return 'progress:'+d;});
+}
+// 一条流水涉及的账户键：用于「按账户/资产」筛选
+function ledgerLogAccounts(l){
+  const out=[];
+  const add=function(k){if(k&&out.indexOf(k)<0)out.push(k);};
+  const st=l&&l.st;
+  if(st==='both'){
+    add('vitality');
+    ledgerProgressAccounts(l).forEach(add);
+  }else if(st==='vitality'||st==='achievement'){
+    add(st);
+  }else if(st==='progress'){
+    ledgerProgressAccounts(l).forEach(add);
+  }else if(st==='card'){
+    add('card:'+String(l.card||''));
+  }else if(typeof st==='string'&&st){
+    add('st:'+st);
+  }
+  if(!out.length)add('none');
+  return out;
+}
+function ledgerAssetName(id){
+  if(!id)return'未知';
+  const d=(state.assetDefs||[]).find(function(x){return x&&x.id===id;});
+  if(d&&d.name)return d.name;
+  return String(id);
+}
+function ledgerAccountLabel(key){
+  if(key==='vitality')return'活力点';
+  if(key==='achievement')return'成果点';
+  if(key==='none')return'无金额事件';
+  if(key==='unknown')return'未知';
+  if(key.indexOf('progress:')===0)return'进度·'+domainName(key.slice(9));
+  if(key.indexOf('card:')===0)return'资产·'+ledgerAssetName(key.slice(5));
+  if(key.indexOf('st:')===0)return'其他账户';
+  return key||'未知';
+}
+function ledgerAcctSort(key){
+  if(key==='vitality')return 0;
+  if(key==='achievement')return 1;
+  if(key.indexOf('progress:')===0)return 2;
+  if(key.indexOf('card:')===0)return 3;
+  if(key==='none')return 4;
+  return 5;
+}
+function ledgerShadowAccount(r){
+  const a=String((r&&r.acct)||'');
+  return a||'unknown';
+}
+function ledgerTaskName(id){const t=(state.tasks||[]).find(function(x){return x&&x.id===id;});return t&&t.name?t.name:'未知';}
+function ledgerAffairName(id){const a=(state.affairs||[]).find(function(x){return x&&x.id===id;});return a&&a.name?a.name:'未知';}
+function ledgerChoreName(id){const c=(state.chores||[]).find(function(x){return x&&x.id===id;});return c&&c.name?c.name:'未知';}
+function ledgerFlowName(id){const f=(state.flows||[]).find(function(x){return x&&x.id===id;});return f&&f.name?f.name:'未知动作流';}
+function ledgerRunOf(id){
+  const runs=state.ext&&state.ext.flowRuns;
+  return (runs&&runs.byId&&runs.byId[id])||null;
+}
+// 归一化会把购买执行退化成周期执行且丢掉 orderId：这里用流水反查，保证因果链跨刷新仍成立
+function ledgerRunOrderId(id){
+  const run=ledgerRunOf(id);
+  if(run&&run.orderId)return String(run.orderId);
+  const l=(state.logs||[]).find(function(x){return x&&x.execRunId===id&&x.orderId;});
+  return l?String(l.orderId):'';
+}
+function ledgerRunLabel(id){
+  const run=ledgerRunOf(id);
+  const name=(run&&run.flowName)||ledgerFlowName(run&&run.flowId);
+  return name||'未知动作流';
+}
+function ledgerRunTime(id){
+  const run=ledgerRunOf(id);
+  if(run&&run.startedAt)return run.startedAt;
+  const l=(state.logs||[]).find(function(x){return x&&(x.flowRunId===id||x.execRunId===id);});
+  return (l&&l.time)||0;
+}
+function ledgerRunTriggerLabel(run,runId){
+  const t=run&&run.trigger;
+  if(t==='manual')return'手动执行';
+  if(t==='event')return'事件触发';
+  if(t==='purchase'||ledgerRunOrderId(runId))return'购买执行';
+  return'周期执行';
+}
+function ledgerRunChildIds(run,l){
+  const out=[];
+  const add=function(arr){
+    if(!Array.isArray(arr))return;
+    arr.forEach(function(x){
+      x=String(x||'');
+      if(x&&out.indexOf(x)<0)out.push(x);
+    });
+  };
+  add(run&&run.childLogIds);
+  add(run&&run.journal&&run.journal.logIds);
+  add(l&&l.childLogIds);
+  return out;
+}
+// 事项级关联：任务 / 项目 / 杂事（只看某条关联记录）
+function ledgerLogLinks(l){
+  const out=[];
+  if(l.taskId)out.push({key:'task:'+l.taskId,kind:'task',id:String(l.taskId),kindLabel:'任务',name:ledgerTaskName(l.taskId)});
+  if(l.affairId)out.push({key:'affair:'+l.affairId,kind:'affair',id:String(l.affairId),kindLabel:'项目',name:ledgerAffairName(l.affairId)});
+  if(l.choreId)out.push({key:'chore:'+l.choreId,kind:'chore',id:String(l.choreId),kindLabel:'杂事',name:ledgerChoreName(l.choreId)});
+  return out;
+}
+function ledgerInRange(t,range){
+  if(!range||range==='all')return true;
+  const ts=Number(t)||0;
+  const start=dayStartOf(now());
+  if(range==='today')return ts>=start;
+  if(range==='7d')return ts>=addDays(start,-6);
+  if(range==='30d')return ts>=addDays(start,-29);
+  return true;
+}
+// 动作流筛选：执行产生的流水、执行事件本身、journal 流水、同一订单流水都算“相关”
+function ledgerMatchesLink(l,value){
+  const raw=String(value||'');
+  if(raw.indexOf('run:')===0){
+    const id=raw.slice(4);
+    if(!id)return false;
+    if(l.flowRunId===id||l.execRunId===id)return true;
+    const run=ledgerRunOf(id);
+    if(run){
+      if(run.journalLogId===l.id)return true;
+      if(Array.isArray(run.childLogIds)&&run.childLogIds.indexOf(l.id)>=0)return true;
+    }
+    const oid=ledgerRunOrderId(id);
+    return !!(oid&&l.orderId===oid);
+  }
+  if(raw.indexOf('task:')===0)return l.taskId===raw.slice(5);
+  if(raw.indexOf('affair:')===0)return l.affairId===raw.slice(7);
+  if(raw.indexOf('chore:')===0)return l.choreId===raw.slice(6);
+  return false;
+}
+function ledgerLogMatch(l){
+  if(ledgerState.acct!=='all'&&ledgerLogAccounts(l).indexOf(ledgerState.acct)<0)return false;
+  if(ledgerState.src!=='all'&&ledgerSrcGroup(l).key!==ledgerState.src)return false;
+  if(ledgerState.cat!=='all'&&(l.assetCat||'')!==ledgerState.cat)return false;
+  if(!ledgerInRange(l.time,ledgerState.range))return false;
+  if(ledgerState.link!=='all'&&!ledgerMatchesLink(l,ledgerState.link))return false;
+  return true;
+}
+function ledgerShadowMatch(r){
+  if(ledgerState.acct!=='all'&&ledgerShadowAccount(r)!==ledgerState.acct)return false;
+  if(ledgerState.src!=='all'&&ledgerSrcGroup({src:r&&r.src}).key!==ledgerState.src)return false;
+  if(ledgerState.cat!=='all'&&((r&&r.assetCat)||'')!==ledgerState.cat)return false;
+  if(!ledgerInRange(r&&r.ts,ledgerState.range))return false;
+  if(ledgerState.link!=='all')return false;
+  return true;
+}
+function ledgerVisibleRows(){
+  const rows=(state.logs||[]).map(function(l){return{log:l,shadow:false,time:Number(l.time)||0};});
+  if(ledgerState.withShadow&&state.ext&&Array.isArray(state.ext.shadow)){
+    state.ext.shadow.forEach(function(r){rows.push({log:r,shadow:true,time:Number(r&&r.ts)||0});});
+  }
+  const out=rows.filter(function(row){
+    return row.shadow?ledgerShadowMatch(row.log):ledgerLogMatch(row.log);
+  });
+  out.sort(function(a,b){return b.time-a.time;});
+  return out;
+}
+function ledgerFilterActive(){
+  return ledgerState.acct!=='all'||ledgerState.src!=='all'||ledgerState.cat!=='all'
+    ||ledgerState.range!=='all'||ledgerState.link!=='all'||ledgerState.withShadow;
+}
+function ledgerOptions(){
+  const logs=state.logs||[];
+  const acc={},src={},cat={},links={};
+  const addLink=function(x){
+    if(!links[x.key])links[x.key]={key:x.key,kind:x.kind,id:x.id,kindLabel:x.kindLabel,name:x.name,time:x.time||0,count:0};
+    links[x.key].count++;
+  };
+  // 购买单里只有主腿带 execRunId：用订单反查，让发放腿也计入同一次执行的「相关记录」
+  const orderRun={};
+  logs.forEach(function(l){
+    if(l.execRunId&&l.orderId)orderRun[l.orderId]=l.execRunId;
+  });
+  logs.forEach(function(l){
+    ledgerLogAccounts(l).forEach(function(k){acc[k]=(acc[k]||0)+1;});
+    src[ledgerSrcGroup(l).key]=(src[ledgerSrcGroup(l).key]||0)+1;
+    if(l.assetCat)cat[l.assetCat]=(cat[l.assetCat]||0)+1;
+    ledgerLogLinks(l).forEach(addLink);
+    const rid=l.flowRunId||l.execRunId||orderRun[l.orderId]||'';
+    if(rid)addLink({key:'run:'+rid,kind:'run',id:String(rid),kindLabel:'动作流',name:ledgerRunLabel(rid),time:ledgerRunTime(rid)});
+  });
+  const shadow=(ledgerState.withShadow&&state.ext&&Array.isArray(state.ext.shadow))?state.ext.shadow:[];
+  shadow.forEach(function(r){
+    const k=ledgerShadowAccount(r);acc[k]=(acc[k]||0)+1;
+    const g=ledgerSrcGroup({src:r&&r.src});src[g.key]=(src[g.key]||0)+1;
+    if(r&&r.assetCat)cat[r.assetCat]=(cat[r.assetCat]||0)+1;
+  });
+  const accounts=Object.keys(acc).map(function(k){return{v:k,n:ledgerAccountLabel(k)+' ('+acc[k]+')'};});
+  accounts.sort(function(a,b){return ledgerAcctSort(a.v)-ledgerAcctSort(b.v);});
+  const srcs=LEDGER_SRC_GROUPS.filter(function(g){return src[g.key];}).map(function(g){
+    return{v:g.key,n:g.name+' ('+src[g.key]+')'};
+  });
+  const cats=ASSET_LOG_CATS.filter(function(c){return cat[c];}).map(function(c){
+    return{v:c,n:assetCatName(c)+' ('+cat[c]+')'};
+  });
+  const kindOrder={task:0,affair:1,chore:2,run:3};
+  const linkList=Object.keys(links).map(function(k){return links[k];});
+  linkList.sort(function(a,b){
+    const ka=kindOrder[a.kind]===undefined?9:kindOrder[a.kind];
+    const kb=kindOrder[b.kind]===undefined?9:kindOrder[b.kind];
+    const d=ka-kb;
+    return d!==0?d:(b.time||0)-(a.time||0);
+  });
+  const linkOpts=linkList.map(function(x){
+    const label=x.kind==='run'
+      ?'动作流·'+x.name+'（'+fmtTime(x.time)+'）'
+      :x.kindLabel+'·'+x.name;
+    return{v:x.key,n:label+' ('+x.count+')'};
+  });
+  return{accounts:accounts,srcs:srcs,cats:cats,links:linkOpts};
+}
+function ledgerSelectHTML(key,allLabel,opts,cur){
+  let h='<select class="ledger-sel" onchange="setLedgerFilter(\''+key+'\',this.value)">';
+  h+='<option value="all"'+(cur==='all'?' selected':'')+'>'+esc(allLabel)+'</option>';
+  opts.forEach(function(o){
+    h+='<option value="'+escAttr(o.v)+'"'+(o.v===cur?' selected':'')+'>'+esc(o.n)+'</option>';
+  });
+  return h+'</select>';
+}
+function renderLedgerBar(){
+  const bar=document.getElementById('ledgerBar');
+  if(!bar)return;
+  if(!(state.logs||[]).length){
+    bar.innerHTML='';
+    return;
+  }
+  const o=ledgerOptions();
+  // 选中的值可能因数据变化消失：回落到“全部”，避免列表空白且无从恢复
+  const hasOpt=function(list,v){return list.some(function(x){return x.v===v;});};
+  if(ledgerState.acct!=='all'&&!hasOpt(o.accounts,ledgerState.acct))ledgerState.acct='all';
+  if(ledgerState.src!=='all'&&!hasOpt(o.srcs,ledgerState.src))ledgerState.src='all';
+  if(ledgerState.cat!=='all'&&!hasOpt(o.cats,ledgerState.cat))ledgerState.cat='all';
+  if(ledgerState.link!=='all'&&!hasOpt(o.links,ledgerState.link))ledgerState.link='all';
+  let html='<div class="ledger-bar">';
+  html+=ledgerSelectHTML('acct','全部账户/资产',o.accounts,ledgerState.acct);
+  html+=ledgerSelectHTML('src','全部来源',o.srcs,ledgerState.src);
+  if(o.cats.length)html+=ledgerSelectHTML('cat','全部资产动作',o.cats,ledgerState.cat);
+  html+=ledgerSelectHTML('range','全部时间',LEDGER_RANGES,ledgerState.range);
+  html+=ledgerSelectHTML('link','全部关联',o.links,ledgerState.link);
+  html+='<label class="ledger-check"><input type="checkbox"'+(ledgerState.withShadow?' checked':'')
+    +' onchange="toggleLedgerShadowFilter(this.checked)"> 含隐形调整</label>';
+  if(ledgerFilterActive())html+='<button class="ledger-clear" onclick="clearLedgerFilter()">清除筛选</button>';
+  html+='</div>';
+  bar.innerHTML=html;
+}
+function ledgerHasDetail(l){
+  if(!l)return false;
+  return !!(l.taskId||l.affairId||l.choreId||l.flowRunId||l.execRunId||l.orderId||l.prodId||l.st==='card'||l.assetCat);
+}
+function ledgerDetailHTML(l){
+  let h='<div class="log-detail">';
+  const line=function(k,v){
+    h+='<div class="ld-line"><span class="ld-k">'+esc(k)+'</span><span class="ld-v">'+v+'</span></div>';
+  };
+  line('账户',esc(ledgerLogAccounts(l).map(ledgerAccountLabel).join('、')));
+  line('来源',esc(ledgerSrcGroup(l).name));
+  if(l.st==='card'||l.assetCat){
+    const m=assetLogMeta(l);
+    line('资产动作',esc(m.catName));
+    line('资产去向',esc(m.from)+' → '+esc(m.to));
+  }
+  if(l.prodId){
+    const p=(state.products||[]).find(function(x){return x&&x.id===l.prodId;});
+    line('商品',esc(p&&p.name?p.name:'未知'));
+  }
+  if(l.orderId)line('订单',esc(String(l.orderId)));
+  const links=ledgerLogLinks(l);
+  if(links.length){
+    h+='<div class="ld-sec">关联事项</div>';
+    links.forEach(function(x){
+      h+='<div class="ld-line"><span class="ld-k">'+esc(x.kindLabel)+'</span><span class="ld-v">'+esc(x.name)
+        +' <button class="ledger-link" onclick="focusLedgerLink(\''+escAttr(x.kind)+'\',\''+escAttr(x.id)+'\')">只看相关</button></span></div>';
+    });
+  }
+  if(l.orderId){
+    const sibs=(state.logs||[]).filter(function(x){return x&&x.orderId===l.orderId;});
+    if(sibs.length>1){
+      h+='<div class="ld-sec">本单流水 · '+sibs.length+' 笔</div><div class="ld-list">';
+      sibs.forEach(function(x){
+        const cv=logRowView(x,[]);
+        h+='<div class="ld-chg"><span class="ld-chg-t">'+esc(fmtTime(x.time))+'</span>'
+          +'<span class="ld-chg-d">'+esc(x.desc||'未知')+'</span>'
+          +'<span class="ld-chg-a '+cv.amtCls+'">'+cv.amount+'</span></div>';
+      });
+      h+='</div>';
+    }
+  }
+  const rid=l.flowRunId||l.execRunId||'';
+  if(rid){
+    if(l.src==='flow-run'&&l.flowRunId){
+      h+=ledgerRunBlockHTML(rid,l);
+    }else{
+      h+='<div class="ld-sec">执行</div><div class="ld-line"><span class="ld-k">动作流</span><span class="ld-v">'
+        +esc(ledgerRunLabel(rid))+' · '+esc(ledgerRunTriggerLabel(ledgerRunOf(rid),rid))
+        +' <button class="ledger-link" onclick="focusLedgerLink(\'run\',\''+escAttr(rid)+'\')">只看这次执行</button></span></div>';
+    }
+  }
+  h+='</div>';
+  return h;
+}
+function ledgerRunBlockHTML(runId,l){
+  const run=ledgerRunOf(runId);
+  const orderId=ledgerRunOrderId(runId);
+  let h='<div class="ld-sec">本次执行 · '+esc(ledgerRunLabel(runId))
+    +' <span class="ld-sub">'+esc(ledgerRunTriggerLabel(run,runId))+' · '+esc(fmtTime(ledgerRunTime(runId)))+'</span>'
+    +' <button class="ledger-link" onclick="focusLedgerLink(\'run\',\''+escAttr(runId)+'\')">只看这次执行</button></div>';
+  if(orderId)h+='<div class="ld-line"><span class="ld-k">来源订单</span><span class="ld-v">'+esc(orderId)+'</span></div>';
+  const ids=ledgerRunChildIds(run,l);
+  h+='<div class="ld-sec">产生的变动 · '+ids.length+' 笔</div><div class="ld-list">';
+  if(!ids.length)h+='<div class="ld-chg"><span class="ld-chg-d">没有独立的变动流水</span><span class="ld-chg-a">—</span></div>';
+  ids.forEach(function(id){
+    const c=(state.logs||[]).find(function(x){return x&&x.id===id;});
+    if(!c){
+      h+='<div class="ld-chg"><span class="ld-chg-d">该笔记录已裁剪或不存在</span><span class="ld-chg-a">—</span></div>';
+      return;
+    }
+    const cv=logRowView(c,[]);
+    h+='<div class="ld-chg"><span class="ld-chg-t">'+esc(fmtTime(c.time))+'</span>'
+      +'<span class="ld-chg-d">'+esc(c.desc||'未知')+'</span>'
+      +'<span class="ld-chg-a '+cv.amtCls+'">'+cv.amount+'</span></div>';
+  });
+  h+='</div>';
+  const accounts=(run&&run.journal&&Array.isArray(run.journal.accounts))?run.journal.accounts.filter(function(a){
+    return a&&Number(a.delta)!==0;
+  }):[];
+  if(accounts.length){
+    h+='<div class="ld-sec">账户变化</div><div class="ld-list">';
+    accounts.forEach(function(a){
+      const d=Number(a.delta)||0;
+      h+='<div class="ld-chg"><span class="ld-chg-d">'+esc(ledgerAccountLabel(String(a.key||'')))+'</span>'
+        +'<span class="ld-chg-a'+(d>0?' pos':' neg')+'">'+esc(fmt(a.before)+' → '+fmt(a.after))+'</span></div>';
+    });
+    h+='</div>';
+  }
+  const assets=(run&&run.journal&&Array.isArray(run.journal.assets))?run.journal.assets.filter(function(a){
+    return a&&Number(a.delta)!==0;
+  }):[];
+  if(assets.length){
+    h+='<div class="ld-sec">资产变化</div><div class="ld-list">';
+    assets.forEach(function(a){
+      const d=Number(a.delta)||0;
+      h+='<div class="ld-chg"><span class="ld-chg-d">资产·'+esc(ledgerAssetName(String(a.assetId||'')))+'</span>'
+        +'<span class="ld-chg-a'+(d>0?' pos':' neg')+'">'+esc(fmt(a.before)+' → '+fmt(a.after))+'</span></div>';
+    });
+    h+='</div>';
+  }
+  if(!run)h+='<div class="ld-note">运行记录已裁剪：只能看到流水与执行标识，无法还原账户前后值。</div>';
+  return h;
+}
+function ledgerRowHTML(row,undoableSrc){
+  if(row.shadow)return ledgerShadowRowHTML(row.log);
+  const l=row.log;
+  const v=logRowView(l,undoableSrc);
+  const amt=Number(l.amt)||0;
+  const dir=amt>0?'in':amt<0?'out':'flat';
+  const open=ledgerState.detail===String(l.id);
+  let action=v.canUndo?'<button class="log-undo" onclick="undoLog(\''+v.id+'\')">撤销</button>':'';
+  if(ledgerHasDetail(l)){
+    action+='<button class="log-more'+(open?' on':'')+'" onclick="toggleLedgerDetail(\''+v.id+'\')">'+(open?'收起':'因果')+'</button>';
+  }
+  return '<div class="ledger-row '+dir+(l.st==='card'?' asset':'')+(open?' open':'')+'">'
+    +logItemHTML({
+      dot:v.dot,
+      desc:'<span class="log-src">'+esc(ledgerSrcGroup(l).name)+'</span>'+esc(l.desc?String(l.desc):'未知'),
+      amt:v.amount,amtCls:v.amtCls,time:fmtTime(v.time),action:action,
+    })
+    +(open?ledgerDetailHTML(l):'')
+    +'</div>';
+}
+function ledgerShadowRowHTML(r){
+  const src=r||{};
+  const v=shadowRowView({acct:String(src.acct||''),delta:Number(src.delta)||0,before:src.before,after:src.after,ts:src.ts});
+  const label=shadowLabel(String(src.src||''),src.label?String(src.label):'');
+  const acct=ledgerAccountLabel(ledgerShadowAccount(src));
+  const card=String(src.acct||'').indexOf('card:')===0;
+  return '<div class="ledger-row shadow'+(card?' asset':'')+'">'
+    +logItemHTML({
+      dot:'s',
+      desc:'<span class="log-src">隐形</span>'+esc(label)+'<span class="log-sub"> · '+esc(acct)+v.range+'</span>',
+      amt:v.amount,amtCls:v.amtCls,time:fmtTime(v.time),
+    })
+    +'</div>';
+}
+function ledgerDayLabel(ts){
+  const today=dayStartOf(now());
+  const t=dayStartOf(ts||0);
+  if(t===today)return'今天';
+  if(t===addDays(today,-1))return'昨天';
+  const d=new Date(ts);
+  return (d.getMonth()+1)+'月'+d.getDate()+'日';
+}
+function ledgerGroups(rows){
+  const groups=[],idx={};
+  rows.forEach(function(row){
+    const key=dayKey(row.time||0);
+    if(!idx[key]){idx[key]={key:key,time:row.time||0,rows:[]};groups.push(idx[key]);}
+    idx[key].rows.push(row);
+  });
+  return groups;
+}
+// 默认只展开最近一天，其余按天折叠：手机上一屏约 8-12 行，不会一次铺满几百条
+function ledgerDayOpen(key,index){
+  if(Object.prototype.hasOwnProperty.call(ledgerState.days,key))return !!ledgerState.days[key];
+  return index===0;
+}
+function ledgerDayHeadHTML(group,open){
+  return '<div class="ledger-day-head" onclick="toggleLedgerDay(\''+escAttr(group.key)+'\')">'
+    +'<span class="coll-toggle">▼</span>'
+    +'<span class="ld-day">'+esc(ledgerDayLabel(group.time))+'</span>'
+    +'<span class="ld-day-meta">'+esc(group.key)+' · '+group.rows.length+' 笔</span>'
+    +'</div>';
+}
+// ===== 事件派发失败提示（只读展示 ext.events 的结果，不写任何数据） =====
+// 事件在提交后派发失败时，结果只落在 event-bus 的 ext.events[].results 与一条流水里。
+// 这里把结果翻译成中文提示放到流水面板顶部；没有失败时返回空串，不制造噪声。
+const EVENT_FAIL_TEXT={
+  EVENT_BAD:'事件数据不合法，已忽略派发',
+  EVENT_DEPTH_LIMIT:'事件链深度超过上限，拒绝派发',
+  EVENT_OVERFLOW:'单次事件触发的动作流超出上限，部分未执行',
+  EVENT_REENTRANT:'事件派发过程中产生的新事件不会递归执行',
+  FLOW_COMPILE_FAILED:'动作流无法编译',
+  FLOW_EVENT_EXCEPTION:'动作流执行时抛出异常',
+  FLOW_EVENT_FAILED:'动作流执行失败',
+};
+function ledgerEventFailKind(kind){
+  return kind==='purchase'?'购买':'打卡';
+}
+function ledgerEventFailReason(r){
+  const msg=String((r&&r.message)||'').trim();
+  if(msg)return msg;
+  const code=String((r&&r.code)||'');
+  return EVENT_FAIL_TEXT[code]||('动作流执行失败'+(code?'（'+code+'）':''));
+}
+// 读取已有结果：只挑真正的失败（幂等跳过不算失败），新的在前
+function ledgerEventFails(){
+  const store=state.ext&&state.ext.events;
+  const recent=(store&&Array.isArray(store.recent))?store.recent:[];
+  const out=[];
+  recent.forEach(function(ev){
+    const results=(ev&&Array.isArray(ev.results))?ev.results:[];
+    results.forEach(function(r){
+      if(!r||r.ok!==false)return;
+      if(r.skipped==='already-run'||r.code==='EVENT_ALREADY_RUN')return;
+      out.push({
+        time:Number(ev.occurredAt)||0,
+        kind:ev.kind,
+        flowId:String(r.flowId||''),
+        reason:ledgerEventFailReason(r),
+      });
+    });
+  });
+  return out;
+}
+function ledgerEventFailHTML(){
+  const fails=ledgerEventFails();
+  if(!fails.length)return '';
+  const max=5;
+  let h='<div class="ledger-event-fail"><div class="ledger-event-fail-head">最近事件派发失败 '+fails.length+' 条</div>';
+  fails.slice(0,max).forEach(function(f){
+    const who=f.flowId?'动作流「'+ledgerFlowName(f.flowId)+'」':'事件派发';
+    h+='<div class="ledger-event-fail-row"><span class="lef-t">'+esc(fmtTime(f.time))+'</span>'
+      +'<span class="lef-k">'+esc(ledgerEventFailKind(f.kind))+'</span>'
+      +'<span class="lef-f">'+esc(who)+'</span>'
+      +'<span class="lef-r">'+esc(f.reason)+'</span></div>';
+  });
+  if(fails.length>max)h+='<div class="ledger-event-fail-more">另有 '+(fails.length-max)+' 条更早的失败未展开</div>';
+  h+='</div>';
+  return h;
+}
 // 流水面板：最近记录行（bank.logs 的独立入口）
 function renderBankLogs(){
-  const logTotal=state.logs.length;
-  document.getElementById('logMeta').textContent=logTotal+' 条'+(logTotal>LOG_DISPLAY?'（仅显示最近 '+LOG_DISPLAY+' 条）':'');
-  const ll=document.getElementById('logList');
-  if(!state.logs.length){
-    ll.innerHTML='<div class="empty" style="padding:24px"><p style="margin:0">暂无记录</p></div>';
-  }else{
-    // 可撤销白名单直接来自适配器注册表：新增一种可撤销类型只需在 UNDO_ADAPTERS 加 key
-    const undoableSrc=Object.keys(UNDO_ADAPTERS);
-    ll.innerHTML=state.logs.slice(0,LOG_DISPLAY).map(l=>{
-      const v=logRowView(l,undoableSrc);
-      return logItemHTML({dot:v.dot,desc:esc(v.desc),amt:v.amount,amtCls:v.amtCls,time:fmtTime(v.time),
-        action:v.canUndo?'<button class="log-undo" onclick="undoLog(\''+v.id+'\')">撤销</button>':''});
-    }).join('');
+  const all=state.logs||[];
+  const rows=ledgerVisibleRows();
+  const meta=document.getElementById('logMeta');
+  if(meta){
+    let txt=all.length+' 条';
+    if(ledgerFilterActive())txt+=' · 命中 '+rows.length+' 条';
+    if(rows.length>LOG_DISPLAY)txt+='（仅显示最近 '+LOG_DISPLAY+' 条）';
+    meta.textContent=txt;
   }
+  renderLedgerBar();
+  const ll=document.getElementById('logList');
+  if(!ll)return;
+  const failHTML=ledgerEventFailHTML();
+  if(!all.length){
+    ll.innerHTML=failHTML+'<div class="empty" style="padding:24px"><p style="margin:0">暂无记录</p></div>';
+    return;
+  }
+  const shown=rows.slice(0,LOG_DISPLAY);
+  if(!shown.length){
+    ll.innerHTML=failHTML+'<div class="empty" style="padding:24px"><p style="margin:0">当前筛选没有匹配的记录</p>'
+      +'<button class="btn btn-sm" onclick="clearLedgerFilter()">清除筛选</button></div>';
+    return;
+  }
+  // 可撤销白名单直接来自适配器注册表：新增一种可撤销类型只需在 UNDO_ADAPTERS 加 key
+  const undoableSrc=Object.keys(UNDO_ADAPTERS);
+  ll.innerHTML=failHTML+ledgerGroups(shown).map(function(group,gi){
+    const open=ledgerDayOpen(group.key,gi);
+    return '<div class="coll-group ledger-day'+(open?'':' collapsed')+'">'
+      +ledgerDayHeadHTML(group,open)
+      +collBodyHTML(group.rows.map(function(row){return ledgerRowHTML(row,undoableSrc);}).join(''))
+      +'</div>';
+  }).join('');
+}
+// ===== 账本视图交互（来自筛选栏与行内按钮） =====
+function setLedgerFilter(key,value){
+  if(!Object.prototype.hasOwnProperty.call(ledgerState,key))return;
+  ledgerState[key]=String(value||'all')||'all';
+  renderBankLogs();
+}
+function clearLedgerFilter(){
+  ledgerState.acct='all';
+  ledgerState.src='all';
+  ledgerState.cat='all';
+  ledgerState.range='all';
+  ledgerState.link='all';
+  ledgerState.withShadow=false;
+  renderBankLogs();
+}
+function toggleLedgerShadowFilter(on){
+  ledgerState.withShadow=!!on;
+  renderBankLogs();
+}
+function toggleLedgerDay(key){
+  key=String(key||'');
+  if(!key)return;
+  const groups=ledgerGroups(ledgerVisibleRows().slice(0,LOG_DISPLAY));
+  let cur=false;
+  for(let i=0;i<groups.length;i++){
+    if(groups[i].key===key){cur=ledgerDayOpen(key,i);break;}
+  }
+  ledgerState.days[key]=!cur;
+  renderBankLogs();
+}
+function toggleLedgerDetail(id){
+  id=String(id||'');
+  ledgerState.detail=(ledgerState.detail===id)?'':id;
+  renderBankLogs();
+}
+// 从任意记录跳到“只看这次执行 / 只看这个事项”：时间范围同时放宽到全部
+function focusLedgerLink(kind,id){
+  ledgerState.link=String(kind||'')+':'+String(id||'');
+  ledgerState.range='all';
+  ledgerState.detail='';
+  renderBankLogs();
 }
 // 余额调整记录：visible:false 的账户增减在这里留痕（贷款放款、撤销、活动回收、删除搬运、重算等）
 function toggleShadowList(){
@@ -551,7 +1130,7 @@ function renderMetricChips(){
   mc.innerHTML=html;
 }
 
-export { renderBank, toggleShadowList, renderShadowList, chartState, toggleChartSeries, toggleTrendMode, showChartTip, hideChartTip, drawChart, drawVitalityFlowChart, drawWeekCompareChart, renderRadar, renderMetricChips };
+export { renderBank, toggleShadowList, renderShadowList, chartState, toggleChartSeries, toggleTrendMode, showChartTip, hideChartTip, drawChart, drawVitalityFlowChart, drawWeekCompareChart, renderRadar, renderMetricChips, setLedgerFilter, clearLedgerFilter, toggleLedgerShadowFilter, toggleLedgerDay, toggleLedgerDetail, focusLedgerLink };
 
 registerRenderer('bank', renderBank);
 

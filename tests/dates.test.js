@@ -35,7 +35,7 @@ describe('weekStartTs / weekStartKey：任意周起始日', () => {
   });
 });
 
-describe('periodKey：周期活动 / 预算共用同一套周期键', () => {
+describe('periodKey：预算与动作流共用同一套周期键', () => {
   const wed = at(2024, 1, 10, 9, 0);
   it('day / week / month', () => {
     expect(api.periodKey({ period: 'day' }, wed)).toBe('2024-01-10');
@@ -148,7 +148,7 @@ describe('dayStartTs / idleDaysSince / condWindowByRange', () => {
     expect(api.condWindowByRange('recent', null, ts, 0)).toEqual({ start: ts - 7 * DAY, end: ts });
   });
 
-  it('周期窗口取“上一个周期”，与周期活动的结算时点一致', () => {
+  it('周期窗口取“上一个周期”，与动作流的结算时点一致', () => {
     const act = { period: 'week', anchor: 1 };
     const ts = at(2024, 1, 10, 9, 0); // 周三
     expect(api.condWindowByRange('period', act, ts)).toEqual({ start: at(2024, 1, 1), end: at(2024, 1, 8) });

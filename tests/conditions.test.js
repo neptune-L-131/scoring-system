@@ -267,3 +267,86 @@ describe('门槛点态指标', () => {
     expect(api.pointMetricValue('checkin_streak', { targetType: 'all' }, T)).toBe(9);
   });
 });
+
+describe('资产类指标', () => {
+  const at = (m, d, h) => new Date(2026, m, d, h || 12, 0, 0, 0).getTime();
+  const T0 = at(4, 10); // 2026-05-10 周日；周锚点 1 的上一周期是 04-27 ~ 05-04
+  const inPrev = at(3, 30);
+  const assetItem = (over) => Object.assign({ range: 'total', metric: 'asset_hold', op: '>=', value: 1, targetType: 'asset', target: 'star', newFilter: 'none', aggregate: 'sum' }, over);
+
+  function seed() {
+    api.resetState({
+      scores: { vitality: 0, progress: {}, achievement: 0 },
+      cards: { star: 4, old: 2 },
+      assetDefs: [
+        api.normalizeAssetDef({ id: 'star', name: '星星', unit: '颗', enabled: true }),
+        api.normalizeAssetDef({ id: 'old', name: '旧券', unit: '张', enabled: false, archived: true }),
+      ],
+    });
+    api.patchState(s => {
+      s.logs.unshift(
+        { id: 'g1', time: inPrev, st: 'card', amt: 2, desc: '发 2', src: 'flow-asset-grant', card: 'star' },
+        { id: 'g2', time: inPrev + 1000, st: 'card', amt: 1, desc: '发 1', src: 'flow-asset-grant', card: 'star' },
+        { id: 's1', time: inPrev + 2000, st: 'card', amt: -1, desc: '耗 1', src: 'flow-asset-spend', card: 'star' },
+        { id: 'x1', time: inPrev + 3000, st: 'card', amt: 9, desc: '别的资产', src: 'flow-asset-grant', card: 'other' },
+        { id: 'v1', time: inPrev + 4000, st: 'vitality', amt: 5, desc: '活力', src: 'flow-currency-grant' }
+      );
+      // 旧版豁免：不可见消耗，只留隐形调整记录
+      s.ext.shadow.unshift({ id: 'sh1', ts: inPrev + 5000, acct: 'card:star', delta: -1, before: 5, after: 4, src: 'exempt-use', label: '旧版豁免' });
+    });
+  }
+
+  it('持有数量读余额；停用/归档仍可取值', () => {
+    seed();
+    expect(api.evalCondItem(assetItem({ value: 4 }), week, T0)).toBe(true);
+    expect(api.evalCondItem(assetItem({ value: 5 }), week, T0)).toBe(false);
+    expect(api.evalCondItem(assetItem({ target: 'old', value: 2 }), week, T0)).toBe(true);
+  });
+
+  it('发放/消耗按窗口汇总，只统计目标资产', () => {
+    seed();
+    expect(api.evalCondItem(assetItem({ metric: 'asset_issued', range: 'period', value: 3 }), week, T0)).toBe(true);
+    expect(api.evalCondItem(assetItem({ metric: 'asset_issued', range: 'period', value: 4 }), week, T0)).toBe(false);
+    // 可见消耗 1 + 旧版豁免隐形消耗 1
+    expect(api.evalCondItem(assetItem({ metric: 'asset_spent', range: 'period', value: 2 }), week, T0)).toBe(true);
+    expect(api.evalCondItem(assetItem({ metric: 'asset_spent', range: 'period', value: 3 }), week, T0)).toBe(false);
+  });
+
+  it('撤销补账（手动调整）不计入发放/消耗', () => {
+    seed();
+    api.patchState(s => {
+      s.ext.shadow.unshift({ id: 'sh2', ts: inPrev + 6000, acct: 'card:star', delta: 3, before: 4, after: 7, src: 'undo-flow', label: '撤销发放' });
+    });
+    expect(api.evalCondItem(assetItem({ metric: 'asset_issued', range: 'period', value: 3 }), week, T0)).toBe(true);
+    expect(api.evalCondItem(assetItem({ metric: 'asset_spent', range: 'period', value: 2 }), week, T0)).toBe(true);
+  });
+
+  it('未选择资产返回 NaN，条件恒假（不冒充 0）', () => {
+    seed();
+    expect(Number.isNaN(api.assetMetricValue('asset_hold', { target: '' }, { start: 0, end: T0 }))).toBe(true);
+    expect(api.evalCondItem(assetItem({ target: '', value: 0 }), week, T0)).toBe(false);
+  });
+
+  it('文案：持有数量按点态展示，发放/消耗带范围前缀', () => {
+    expect(api.condItemLabel(assetItem({ range: 'today', value: 2 }))).toBe('星星·持有数量 ≥ 2');
+    expect(api.condItemLabel(assetItem({ range: 'period', metric: 'asset_issued', value: 3 }))).toContain('星星·已发放数量');
+    expect(api.condItemLabel(assetItem({ target: 'gone' }))).toContain('（资产已删除）');
+  });
+
+  it('归一化保留资产主体；事件触发可编译（持有数量）', () => {
+    seed();
+    const cond = api.normalizeCondNode({ group: true, mode: 'all', items: [assetItem({ range: 'today' })] });
+    expect(cond.items[0].targetType).toBe('asset');
+    expect(cond.items[0].target).toBe('star');
+    api.patchState(s => {
+      s.flows.push(api.normalizeFlow({
+        id: 'f_evt', name: '事件流', trigger: { type: 'event', event: { kind: 'checkin' } },
+        condition: { mode: 'all', items: [assetItem({ range: 'today', value: 1 })] },
+        steps: [{ id: 's', atom: 'log.note', params: { desc: 'ok' } }],
+      }));
+    });
+    const r = api.FlowEngine.runFlow('f_evt', { trigger: 'event', ts: T0, event: { key: 'evt1' } });
+    expect(r.ok).toBe(true);
+  });
+});
+

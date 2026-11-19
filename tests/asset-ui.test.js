@@ -24,7 +24,6 @@ function seed(patch) {
     cards: { exemption: 0, star: 0 },
     assetDefs: [builtinDef(), starDef()],
     flows: [],
-    activities: [],
   }, patch || {}));
 }
 
@@ -67,10 +66,10 @@ describe('S8 资产定义校验', () => {
     expect(r.message).toContain('资产 ID 不合法');
   });
 
-  it('保留 id exemption 被拒绝', () => {
+  it('exemption 不再是保留 id：新建时按重复 id 校验', () => {
     const r = api.validateAssetDraft(draft({ id: 'exemption' }), { defs: api.getState().assetDefs });
     expect(r.ok).toBe(false);
-    expect(r.code).toBe('ASSET_ID_RESERVED');
+    expect(r.code).toBe('ASSET_ID_DUP');
   });
 
   it('重复 id 被拒绝', () => {
@@ -102,11 +101,10 @@ describe('S8 资产定义校验', () => {
     expect(r.message).toContain('本期已发 3');
   });
 
-  it('内置资产不可被修改', () => {
-    const r = api.validateAssetDraft(draft({ id: 'exemption', name: '新名字' }), { defs: api.getState().assetDefs, builtin: true });
-    expect(r.ok).toBe(false);
-    expect(r.code).toBe('ASSET_BUILTIN_LOCKED');
-    expect(r.message).toContain('内置资产');
+  it('exemption 可按普通资产规则修改', () => {
+    const r = api.validateAssetDraft(draft({ id: 'exemption', name: '新名字' }), { defs: api.getState().assetDefs, originalId: 'exemption' });
+    expect(r.ok).toBe(true);
+    expect(r.value).toMatchObject({ id: 'exemption', name: '新名字' });
   });
 
   it('合法输入返回规范化值，空上限为 null', () => {
@@ -140,13 +138,12 @@ describe('S8 资产定义处理器', () => {
     expect(api.getState().cards.star2).toBe(0);
   });
 
-  it('编辑内置资产被拒绝且定义不变', () => {
+  it('编辑默认播种的资产可改名并写回', () => {
     api.openAssetModal('exemption');
     document.getElementById('assetName').value = '改名';
     const r = api.handleAssetSave();
-    expect(r.ok).toBe(false);
-    expect(r.code).toBe('ASSET_BUILTIN_LOCKED');
-    expect(api.getState().assetDefs.find(d => d.id === 'exemption').name).toBe(builtinDef().name);
+    expect(r.ok).toBe(true);
+    expect(api.getState().assetDefs.find(d => d.id === 'exemption').name).toBe('改名');
   });
 
   it('停用有余额的资产被拒绝', () => {
@@ -176,9 +173,19 @@ describe('S8 资产定义处理器', () => {
     expect(def.enabled).toBe(true);
   });
 
-  it('内置资产不能删除或停用', () => {
-    expect(api.delAssetDef('exemption')).toMatchObject({ ok: false, code: 'ASSET_BUILTIN_LOCKED' });
-    expect(api.toggleAssetEnabled('exemption')).toMatchObject({ ok: false, code: 'ASSET_BUILTIN_LOCKED' });
+  it('默认播种的资产可停用、可删除，与普通资产同权', () => {
+    expect(api.toggleAssetEnabled('exemption').ok).toBe(true);
+    expect(api.getState().assetDefs.find(d => d.id === 'exemption').enabled).toBe(false);
+    expect(api.delAssetDef('exemption').ok).toBe(true);
+    expect(api.getState().assetDefs.some(d => d.id === 'exemption')).toBe(false);
+  });
+
+  it('默认播种的资产有余额时同样受余额校验保护', () => {
+    seed({ cards: { exemption: 2, star: 0 } });
+    const r = api.delAssetDef('exemption');
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('ASSET_BALANCE_NOT_ZERO');
+    expect(api.getState().assetDefs.some(d => d.id === 'exemption')).toBe(true);
   });
 
   it('被动作流引用的资产不能删除', () => {
@@ -204,28 +211,36 @@ describe('S8 资产定义处理器', () => {
     expect(api.getState().ext.assetMeters.byAsset.star).toBeUndefined();
   });
 
-  it('引用扫描同时覆盖动作流步骤与周期活动动作项', () => {
+  it('引用扫描覆盖动作流步骤与商品', () => {
     seed({
       flows: [{ id: 'f1', name: '周结流', steps: [{ id: 's1', atom: 'asset.spend', params: { assetId: 'star', amount: 1 } }] }],
-      activities: [{ id: 'a1', name: '每日奖励', result: { items: [{ type: 'card', card: 'star', amount: 1 }] } }],
+      products: [
+        { id: 'p1', name: '兑换星星', price: 1, assetPrice: { assetId: 'star', amount: 1 }, grants: [] },
+        { id: 'p2', name: '买星星', price: 1, assetPrice: null, grants: [{ kind: 'asset', assetId: 'star', amount: 2 }] },
+      ],
     });
     const refs = api.assetReferencesOf('star');
-    expect(refs).toHaveLength(2);
+    expect(refs).toHaveLength(3);
     expect(refs[0]).toMatchObject({ kind: 'flow', name: '周结流', stepLabel: 's1', action: '消耗' });
-    expect(refs[1]).toMatchObject({ kind: 'activity', name: '每日奖励', action: '发放' });
+    expect(refs[1]).toMatchObject({ kind: 'product', name: '兑换星星', stepLabel: '资产定价', action: '消耗' });
+    expect(refs[2]).toMatchObject({ kind: 'product', name: '买星星', stepLabel: '购买赠送', action: '赠送' });
   });
 });
 
 describe('S8 资产定义渲染与清空数据说明', () => {
   beforeEach(() => seed());
 
-  it('列表渲染内置锁定说明与引用提示', () => {
+  it('列表渲染统一操作入口与引用提示', () => {
     seed({
       flows: [{ id: 'f1', name: '周结流', steps: [{ id: 's1', atom: 'asset.grant', params: { assetId: 'star', amount: 1 } }] }],
     });
     api.renderAssetDefs();
     const html = document.getElementById('assetDefsList').innerHTML;
-    expect(html).toContain('内置资产：名称、单位、上限与周期由系统固定，不可改名或删除');
+    expect(html).not.toContain('内置资产：名称、单位、上限与周期由系统固定');
+    expect(html).toContain('编辑');
+    expect(html).toContain('停用');
+    expect(html).toContain('归档');
+    expect(html).toContain('删除');
     expect(html).toContain('引用：动作流');
     expect(html).toContain('执行到该步骤会失败');
     expect(html).toContain('余额 0 ');

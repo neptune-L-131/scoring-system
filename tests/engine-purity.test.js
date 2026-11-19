@@ -38,8 +38,9 @@ describe('命令层静态禁令', () => {
 
   it('杂事三函数：命令层统一开事务与副作用', () => {
     const src = read('src/render-work.js');
-    ['settleChoreBatches', 'processChoreDecay', 'toggleChoreDone'].forEach(name => {
-      const body = bodyOf(src, name);
+    const core = read('src/chore-core.js');
+    [['settleChoreBatches', src], ['processChoreDecay', core], ['toggleChoreDone', src]].forEach(([name, text]) => {
+      const body = bodyOf(text, name);
       expect(body, name).toMatch(/runCommand\(/);
       expect(body, name).not.toMatch(/Ledger\.txn\(/);
       expect(body, name).not.toMatch(/\bsave\(\)/);

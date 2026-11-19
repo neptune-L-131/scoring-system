@@ -7,11 +7,11 @@
 // 4. 失败抛 __txn 错误，由 Ledger.txn 统一回滚；原子不吞错、不落盘、不渲染、不弹提示；
 // 5. 运行计量（ext.assetMeters）只读；写入由后续执行器统一负责——本文件只负责“读额度 + 拦截”。
 import {
-  FLOW_ATOM_IDLE_DAYS_MAX, FLOW_ATOM_MAX_ARCHIVE, FLOW_ATOM_MAX_ASSET,
-  FLOW_ATOM_MAX_CURRENCY, FLOW_ATOM_MAX_NOTES, FLOW_ATOM_NOTE_MAX_LEN, FLOW_MAX_STEPS,
+  FLOW_ATOM_CREATE_NAME_MAX, FLOW_ATOM_IDLE_DAYS_MAX, FLOW_ATOM_MAX_ARCHIVE, FLOW_ATOM_MAX_ASSET,
+  FLOW_ATOM_MAX_CREATE, FLOW_ATOM_MAX_CURRENCY, FLOW_ATOM_MAX_NOTES, FLOW_ATOM_NOTE_MAX_LEN, FLOW_MAX_STEPS,
 } from './constants.js';
 import { checkAchievements, exemptTaskCore } from './business.js';
-import { archiveIdleEntities, assetGrantCore } from './entities.js';
+import { archiveIdleEntities, assetGrantCore, createEntitiesFromTemplate } from './entities.js';
 import { Ledger } from './ledger.js';
 import { state } from './state.js';
 import { periodKeyOf } from './time.js';
@@ -232,6 +232,7 @@ function assetGrant(ctx, params) {
     fail('FLOW_ASSET_PERIOD_CAP', { assetId: assetId, periodKey: pk, issued: meter.issued, amount: amount, max: periodMax });
   }
   const desc = descOf(params, '动作流发放 ' + assetId);
+  const assetFrom = '动作流「' + (ctx.flowName || '未命名') + '」';
   const plan = hasCap
     ? assetGrantCore({
       mode: 'activity', assetId: assetId, amount: amount, cap: cap,
@@ -239,7 +240,7 @@ function assetGrant(ctx, params) {
         st: 'card', amt: granted, desc: desc, src: 'flow-asset-grant', dom: '',
         card: assetId, flowRunId: ctx.runId || '', stepId: ctx.stepId || '', granted: granted,
       }),
-      reason: { src: 'flow-asset-grant', desc: desc },
+      reason: { src: 'flow-asset-grant', desc: desc, assetCat: 'issue', assetFrom: assetFrom },
     })
     : assetGrantCore({
       mode: 'flow', assetId: assetId, amount: amount, maxBalance: def.maxBalance,
@@ -247,7 +248,7 @@ function assetGrant(ctx, params) {
         st: 'card', amt: granted, desc: desc, src: 'flow-asset-grant', dom: '',
         card: assetId, flowRunId: ctx.runId || '', stepId: ctx.stepId || '', granted: granted,
       }),
-      reason: { src: 'flow-asset-grant', desc: desc },
+      reason: { src: 'flow-asset-grant', desc: desc, assetCat: 'issue', assetFrom: assetFrom },
     });
   if (!plan.ok) {
     if (hasCap && plan.code === 'CARD_AT_CAP') {
@@ -277,13 +278,21 @@ function assetSpend(ctx, params) {
   const before = Ledger.balance('card:' + assetId);
   if (before - amount < 0) fail('FLOW_INSUFFICIENT', { assetId: assetId, balance: before, amount: amount });
   const desc = descOf(params, '动作流消耗 ' + assetId);
+  // 去向：资产使用配方（use: 前缀）消耗时能确定被豁免的任务
+  let assetTo = '';
+  const useFlow = String((ctx.flow && ctx.flow.id) || '').indexOf('use:') === 0;
+  const useTaskId = useFlow && ctx.inputs ? ctx.inputs.taskId : '';
+  if (useTaskId) {
+    const useTask = (state.tasks || []).find(function (x) { return x && x.id === useTaskId; });
+    assetTo = '豁免任务「' + ((useTask && useTask.name) || useTaskId) + '」';
+  }
   const r = Ledger.post({
     op: 'spend', account: 'card:' + assetId, delta: -amount, idemKey: idemOf(ctx),
     entry: {
       st: 'card', amt: -amount, desc: desc, src: 'flow-asset-spend', dom: '',
       card: assetId, flowRunId: ctx.runId || '', stepId: ctx.stepId || '', spent: amount,
     },
-    reason: { src: 'flow-asset-spend', desc: desc },
+    reason: { src: 'flow-asset-spend', desc: desc, assetCat: 'spend', assetFrom: '动作流「' + (ctx.flowName || '未命名') + '」', assetTo: assetTo },
   });
   totals.assetSpent += amount;
   return { ok: true, spent: amount, entryId: (r && r.entryId) || null };
@@ -320,7 +329,60 @@ function archiveIdle(ctx, params) {
   return { ok: true, count: done, archived: done, ids: ids };
 }
 
-// ===== F. log.note =====
+// ===== F. entity.create =====
+// 按模板创建任务 / 项目 / 杂事（一次调用只创建一类）。
+// 只开放模板所需的最小字段；项目不带步骤，杂事不带进度，避免造出复杂形态。
+// 先完整校验再写入；任一校验失败整步抛错，由事务统一回滚。
+function entityCreate(ctx, params) {
+  const kind = params.kind;
+  if (kind !== 'task' && kind !== 'affair' && kind !== 'chore') fail('FLOW_INVALID_ENTITY', { kind: kind });
+  const name = String(params.name === undefined || params.name === null ? '' : params.name).trim();
+  if (!name) fail('FLOW_BAD_PARAMS', { field: 'name' });
+  if (name.length > FLOW_ATOM_CREATE_NAME_MAX) {
+    fail('FLOW_NAME_TOO_LONG', { length: name.length, max: FLOW_ATOM_CREATE_NAME_MAX });
+  }
+  let count = 1;
+  if (params.count !== undefined && params.count !== null && String(params.count).trim() !== '') {
+    count = Number(params.count);
+  }
+  if (!Number.isInteger(count) || count < 1 || count > FLOW_ATOM_MAX_CREATE) {
+    fail('FLOW_CREATE_LIMIT', { count: params.count, max: FLOW_ATOM_MAX_CREATE });
+  }
+  let amount = 0;
+  const hasAmount = params.amount !== undefined && params.amount !== null && String(params.amount).trim() !== '';
+  if (kind === 'chore' && hasAmount) fail('FLOW_BAD_PARAMS', { field: 'amount' });
+  if (kind !== 'chore' && hasAmount) {
+    amount = Number(params.amount);
+    if (!isFinite(amount) || amount < 0) fail('FLOW_INVALID_AMOUNT', { amount: params.amount });
+    if (Math.abs(amount * 100 - Math.round(amount * 100)) > 1e-6) fail('FLOW_INVALID_AMOUNT', { amount: params.amount });
+    amount = Math.round(amount * 100) / 100;
+    if (amount > FLOW_ATOM_MAX_CURRENCY) fail('FLOW_AMOUNT_LIMIT', { amount: amount, max: FLOW_ATOM_MAX_CURRENCY });
+    if (kind === 'affair' && amount <= 0) fail('FLOW_INVALID_AMOUNT', { amount: params.amount });
+  }
+  let domainId = '';
+  if (kind !== 'chore') {
+    domainId = String(params.domainId === undefined || params.domainId === null ? '' : params.domainId).trim();
+    if (!domainId) fail('FLOW_BAD_PARAMS', { field: 'domainId' });
+    if (!(state.domains || []).some(d => d && d.id === domainId)) {
+      fail('FLOW_INVALID_ACCOUNT', { domainId: domainId });
+    }
+  } else if (params.domainId !== undefined && String(params.domainId).trim() !== '') {
+    fail('FLOW_BAD_PARAMS', { field: 'domainId' });
+  }
+  const list = createEntitiesFromTemplate(kind, { name: name, count: count, domainId: domainId, amount: amount }, ctx.ts);
+  const kindName = kind === 'affair' ? '项目' : kind === 'chore' ? '杂事' : '任务';
+  list.forEach(function (e) {
+    Ledger.event('按模板创建' + kindName + '「' + e.name + '」', 'entity-create', {
+      kind: e.kind, entityId: e.id, flowRunId: ctx.runId || '', stepId: ctx.stepId || '',
+    });
+  });
+  return {
+    ok: true, kind: kind, count: list.length,
+    ids: list.map(function (e) { return e.id; }), names: list.map(function (e) { return e.name; }),
+  };
+}
+
+// ===== G. log.note =====
 function logNote(ctx, params) {
   const desc = params.desc === undefined || params.desc === null ? '' : String(params.desc).trim();
   if (!desc) fail('FLOW_BAD_PARAMS', { field: 'desc' });
@@ -350,7 +412,7 @@ function taskExempt(ctx, params) {
   const ts = (ctx.ts === undefined || ctx.ts === null) ? Date.now() : (Number(ctx.ts) || 0);
   const label = descOf(params, ctx.flowName || '动作流豁免');
   const r = exemptTaskCore(taskId, {
-    ts: ts, consumeCard: false, processDebts: false, src: 'flow-task-exempt', desc: label,
+    ts: ts, processDebts: false, src: 'flow-task-exempt', desc: label,
   });
   if (!r.ok) fail(r.code || 'FLOW_TASK_EXEMPT', { taskId: taskId, reason: r.reason });
   return {
@@ -381,6 +443,12 @@ const FLOW_ATOMS = {
   'entity.archiveIdle': {
     id: 'entity.archiveIdle', params: ['kind', 'idleDays', 'desc'], run: archiveIdle,
     describe: p => '归档不活跃 ' + p.idleDays + ' 天的 ' + p.kind,
+  },
+  'entity.create': {
+    id: 'entity.create', name: '创建事项',
+    params: ['kind', 'name', 'domainId', 'amount', 'count'], run: entityCreate,
+    describe: p => '创建 ' + (Number(p.count) > 1 ? Number(p.count) + ' 个' : '') +
+      (p.kind === 'affair' ? '项目' : p.kind === 'chore' ? '杂事' : '任务') + '「' + (p.name || '') + '」',
   },
   'log.note': {
     id: 'log.note', params: ['desc'], run: logNote,

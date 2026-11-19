@@ -3,12 +3,12 @@
 // 只负责「定义层」的增删改查、边界校验与说明展示：
 // - 不触发任何动作流执行，不调用 FlowEngine / dryRun / undoFlowRun；
 // - 余额写入仍走既有账务/清空入口，这里只做资产定义的编辑与状态切换；
-// - 内置豁免卡的定义由归一化层固定，本模块对它的修改一律明确拒绝并给出可见文案。
+// - 所有资产（含默认播种的示例）在编辑权限与操作入口上完全一致。
 import { ASSET_VERSION } from './constants.js';
 import { openModal, closeModal } from './modal-host.js';
 import { isValidAssetId } from './normalize.js';
 import { save } from './persist.js';
-import { esc, escAttr, fmt, now } from './pure.js';
+import { assetLogMeta, esc, escAttr, fmt, now } from './pure.js';
 import { render } from './render.js';
 import { state } from './state.js';
 import { toast } from './toast.js';
@@ -16,7 +16,6 @@ import { periodKeyOf } from './time.js';
 
 const NAME_MAX = 20;
 const ID_HINT = '资产 ID 不合法：需小写字母开头，仅含小写字母/数字/下划线，长度 3–32';
-const BUILTIN_LOCKED = '内置资产「断更豁免卡」由系统固定，不能改名、改上限或删除';
 
 function fail(code, message, extra) {
   return Object.assign({ ok: false, code: code, message: message }, extra || {});
@@ -38,22 +37,18 @@ function useRecipeFromDraft(d) {
   return { v: 1, type: 'task-exempt', cost: 1 };
 }
 
-// 纯校验：不读写 DOM、不写 state。ctx = { defs, balance, periodIssued, builtin, originalId }
+// 纯校验：不读写 DOM、不写 state。ctx = { defs, balance, periodIssued, originalId }
 function validateAssetDraft(draft, ctx) {
   const d = draft || {};
   const c = ctx || {};
   const defs = Array.isArray(c.defs) ? c.defs : [];
   const originalId = c.originalId ? String(c.originalId) : '';
-  const builtin = c.builtin === true || originalId === 'exemption';
-
-  if (builtin) return fail('ASSET_BUILTIN_LOCKED', BUILTIN_LOCKED);
 
   let id = originalId;
   if (!originalId) {
     id = String(d.id === null || d.id === undefined ? '' : d.id).trim();
     if (!id) return fail('ASSET_ID_REQUIRED', '请填写资产 ID');
     if (!isValidAssetId(id)) return fail('ASSET_ID_INVALID', ID_HINT);
-    if (id === 'exemption') return fail('ASSET_ID_RESERVED', '「exemption」是内置资产 ID，请换一个');
     if (defs.some(x => x && x.id === id)) {
       return fail('ASSET_ID_DUP', '已存在 ID 为「' + id + '」的资产，请换一个');
     }
@@ -131,7 +126,7 @@ function issuedThisPeriod(def) {
   return Number(m.issued) || 0;
 }
 
-// 引用扫描：动作流步骤 + 周期活动发卡动作项。只读，不执行任何流。
+// 引用扫描：动作流步骤 + 商品。只读，不执行任何流。
 function assetReferencesOf(assetId) {
   const refs = [];
   (Array.isArray(state.flows) ? state.flows : []).forEach(function (f) {
@@ -145,18 +140,6 @@ function assetReferencesOf(assetId) {
         name: String(f.name || f.id || '未命名动作流'),
         stepLabel: String(s.id || ('#' + (i + 1))),
         action: s.atom === 'asset.grant' ? '发放' : '消耗',
-      });
-    });
-  });
-  (Array.isArray(state.activities) ? state.activities : []).forEach(function (a) {
-    if (!a || !a.result || !Array.isArray(a.result.items)) return;
-    a.result.items.forEach(function (it, i) {
-      if (!it || it.type !== 'card' || it.card !== assetId) return;
-      refs.push({
-        kind: 'activity',
-        name: String(a.name || a.id || '未命名活动'),
-        stepLabel: '动作项 ' + (i + 1),
-        action: '发放',
       });
     });
   });
@@ -180,21 +163,33 @@ function attrId(id) {
 
 function refsHTML(assetId) {
   const refs = assetReferencesOf(assetId);
-  if (!refs.length) return '<div class="asset-refs">未被动作流或周期活动引用</div>';
+  if (!refs.length) return '<div class="asset-refs">未被动作流或商品引用</div>';
   const parts = refs.map(function (r) {
     if (r.kind === 'flow') {
       return '动作流「' + esc(r.name) + '」步骤 ' + esc(r.stepLabel) + '（' + esc(r.action) + '，执行到该步骤会失败）';
     }
-    return '周期活动「' + esc(r.name) + '」' + esc(r.stepLabel) + '（发放，活动仍会按余额上限发放，请在活动中移除）';
+    return '商品「' + esc(r.name) + '」' + esc(r.stepLabel) + '（' + esc(r.action) + '，请先在商品中调整）';
   });
   return '<div class="asset-refs">引用：' + parts.join('；') + '</div>';
+}
+
+// 最近资产流水：类别/来源/去向三个可选字段；旧流水缺字段时按「未知」呈现
+function recentFlowsHTML(assetId) {
+  const list = (state.logs || []).filter(function (l) {
+    return l && l.st === 'card' && l.card === assetId;
+  }).slice(0, 3);
+  if (!list.length) return '';
+  const lines = list.map(function (l) {
+    const m = assetLogMeta(l);
+    return '· ' + esc(l.desc || '（无说明）') + '（类别 ' + esc(m.catName) + '，来源 ' + esc(m.from) + '，去向 ' + esc(m.to) + '）';
+  });
+  return '<div class="asset-refs">最近流水：<br>' + lines.join('<br>') + '</div>';
 }
 
 function assetRowHTML(def) {
   const id = String(def.id || '');
   const name = String(def.name || id);
   const unit = String(def.unit || '张');
-  const builtin = id === 'exemption';
   const archived = !!def.archived;
   const enabled = def.enabled !== false;
   const balance = balanceOf(id);
@@ -206,25 +201,17 @@ function assetRowHTML(def) {
   const maxBal = (def.maxBalance === null || def.maxBalance === undefined) ? '不限' : fmt(def.maxBalance);
   const maxIssued = (def.maxIssuedPerPeriod === null || def.maxIssuedPerPeriod === undefined) ? '不限' : fmt(def.maxIssuedPerPeriod);
 
-  let ops = '';
-  if (builtin) {
-    ops = '<div class="asset-ops">'
-      + '<button class="btn btn-sm" onclick="openAssetModal(\'' + attrId(id) + '\')">配置使用配方</button>'
-      + '</div>'
-      + '<div class="asset-locked">内置资产：名称、单位、上限与周期由系统固定，不可改名或删除</div>';
+  let ops = '<div class="asset-ops">'
+    + '<button class="btn btn-sm" onclick="openAssetModal(\'' + attrId(id) + '\')">编辑</button>';
+  if (archived) {
+    ops += '<button class="btn btn-sm" onclick="unarchiveAssetDef(\'' + attrId(id) + '\')">恢复</button>';
   } else {
-    ops = '<div class="asset-ops">'
-      + '<button class="btn btn-sm" onclick="openAssetModal(\'' + attrId(id) + '\')">编辑</button>';
-    if (archived) {
-      ops += '<button class="btn btn-sm" onclick="unarchiveAssetDef(\'' + attrId(id) + '\')">恢复</button>';
-    } else {
-      ops += '<button class="btn btn-sm" onclick="toggleAssetEnabled(\'' + attrId(id) + '\')">'
-        + (enabled ? '停用' : '启用') + '</button>'
-        + '<button class="btn btn-sm" onclick="archiveAssetDef(\'' + attrId(id) + '\')">归档</button>';
-    }
-    ops += '<button class="btn btn-sm btn-danger" onclick="delAssetDef(\'' + attrId(id) + '\')">删除</button>'
-      + '</div>';
+    ops += '<button class="btn btn-sm" onclick="toggleAssetEnabled(\'' + attrId(id) + '\')">'
+      + (enabled ? '停用' : '启用') + '</button>'
+      + '<button class="btn btn-sm" onclick="archiveAssetDef(\'' + attrId(id) + '\')">归档</button>';
   }
+  ops += '<button class="btn btn-sm btn-danger" onclick="delAssetDef(\'' + attrId(id) + '\')">删除</button>'
+    + '</div>';
 
   let stateNote = '';
   if (archived) {
@@ -237,7 +224,6 @@ function assetRowHTML(def) {
     + '<div class="asset-head">'
     + '<span class="asset-name">' + esc(name) + '</span>'
     + '<span class="asset-tag ' + statusCls + '">' + status + '</span>'
-    + (builtin ? '<span class="asset-tag builtin">内置</span>' : '')
     + '<span class="asset-balance">余额 ' + fmt(balance) + ' ' + esc(unit) + '</span>'
     + '</div>'
     + '<div class="asset-meta">ID ' + esc(id) + ' · 余额上限 ' + maxBal + ' · 单期发放上限 ' + maxIssued
@@ -246,6 +232,7 @@ function assetRowHTML(def) {
     + '</div>'
     + stateNote
     + refsHTML(id)
+    + recentFlowsHTML(id)
     + ops
     + '</div>';
 }
@@ -283,7 +270,6 @@ function setHint(msg) {
 
 function openAssetModal(assetId) {
   const def = assetId ? assetDefOf(assetId) : null;
-  const builtin = !!def && def.id === 'exemption';
   const title = document.getElementById('assetModalTitle');
   if (title) title.textContent = def ? '编辑资产' : '新建资产';
   setFieldValue('assetOriginalId', def ? def.id : '');
@@ -295,17 +281,9 @@ function openAssetModal(assetId) {
   setFieldValue('assetCycle', def && def.issuePeriod && def.issuePeriod.cycle === 'month' ? 'month' : 'week');
   setFieldValue('assetAnchor', def && def.issuePeriod ? String(def.issuePeriod.anchor || 1) : '1');
   setFieldValue('assetUse', def && def.useRecipe && def.useRecipe.type === 'task-exempt' ? 'task-exempt' : 'none');
-  // 编辑时 ID 不可改；内置资产整组定义由系统固定
+  // 编辑时 ID 不可改（对所有资产一致）
   setReadOnly('assetId', !!def);
-  setReadOnly('assetName', builtin);
-  setReadOnly('assetUnit', builtin);
-  setReadOnly('assetMaxBalance', builtin);
-  setReadOnly('assetMaxIssued', builtin);
-  const cycleEl = document.getElementById('assetCycle');
-  if (cycleEl) cycleEl.disabled = builtin;
-  const anchorEl = document.getElementById('assetAnchor');
-  if (anchorEl) anchorEl.disabled = builtin;
-  setHint(builtin ? '内置资产由系统固定：名称、单位、上限与周期不可修改。使用配方可自行开启或关闭。' : '');
+  setHint('');
   openModal('assetModal');
 }
 
@@ -319,35 +297,11 @@ function handleAssetSave() {
     toast(lost.message, 'err');
     return lost;
   }
-  // 内置资产的语义字段锁定，但「使用配方」是用户配置项，允许单独修改
-  if (originalId === 'exemption') {
-    const lockedChanged = fieldValue('assetName').trim() !== existing.name
-      || fieldValue('assetUnit').trim() !== existing.unit
-      || Number(fieldValue('assetMaxBalance')) !== existing.maxBalance
-      || Number(fieldValue('assetMaxIssued')) !== existing.maxIssuedPerPeriod
-      || fieldValue('assetCycle') !== (existing.issuePeriod && existing.issuePeriod.cycle)
-      || Number(fieldValue('assetAnchor')) !== (existing.issuePeriod && existing.issuePeriod.anchor);
-    if (lockedChanged) {
-      const locked = fail('ASSET_BUILTIN_LOCKED', '内置资产的名称、单位、上限与周期不可修改；只能调整使用配方');
-      setHint(locked.message);
-      toast(locked.message, 'err');
-      return locked;
-    }
-    existing.useRecipe = useRecipeFromDraft({ useType: fieldValue('assetUse') });
-    existing.updatedAt = now();
-    save();
-    render();
-    closeModal('assetModal');
-    const message = existing.useRecipe ? '已开启内置资产的「任务豁免」使用配方' : '已关闭内置资产的使用配方';
-    toast(message);
-    return { ok: true, message: message };
-  }
   const balance = originalId ? balanceOf(originalId) : 0;
   const ctx = {
     defs: defs,
     balance: balance,
     periodIssued: existing ? issuedThisPeriod(existing) : 0,
-    builtin: originalId === 'exemption',
     originalId: originalId,
   };
   const res = validateAssetDraft({
@@ -393,7 +347,7 @@ function handleAssetSave() {
       createdAt: ts,
       updatedAt: ts,
     });
-    if (!state.cards || typeof state.cards !== 'object') state.cards = { exemption: 0 };
+    if (!state.cards || typeof state.cards !== 'object') state.cards = {};
     state.cards[v.id] = 0;
   }
 
@@ -405,11 +359,6 @@ function handleAssetSave() {
   return { ok: true, message: message, value: v };
 }
 
-function guardBuiltin(def) {
-  if (def.id === 'exemption') return fail('ASSET_BUILTIN_LOCKED', BUILTIN_LOCKED);
-  return null;
-}
-
 function toggleAssetEnabled(assetId) {
   const def = assetDefOf(assetId);
   if (!def) {
@@ -417,8 +366,6 @@ function toggleAssetEnabled(assetId) {
     toast(r.message, 'err');
     return r;
   }
-  const locked = guardBuiltin(def);
-  if (locked) { toast(locked.message, 'err'); return locked; }
   if (def.archived) {
     const r = fail('ASSET_ARCHIVED', '「' + def.name + '」已归档，请先恢复再修改启用状态');
     toast(r.message, 'err');
@@ -458,8 +405,6 @@ function archiveAssetDef(assetId) {
     toast(r.message, 'err');
     return r;
   }
-  const locked = guardBuiltin(def);
-  if (locked) { toast(locked.message, 'err'); return locked; }
   if (def.archived) {
     const r = fail('ASSET_ALREADY_ARCHIVED', '「' + def.name + '」已经归档');
     toast(r.message, 'err');
@@ -490,8 +435,6 @@ function unarchiveAssetDef(assetId) {
     toast(r.message, 'err');
     return r;
   }
-  const locked = guardBuiltin(def);
-  if (locked) { toast(locked.message, 'err'); return locked; }
   if (!def.archived) {
     const r = fail('ASSET_NOT_ARCHIVED', '「' + def.name + '」未归档');
     toast(r.message, 'err');
@@ -513,8 +456,6 @@ function delAssetDef(assetId) {
     toast(r.message, 'err');
     return r;
   }
-  const locked = guardBuiltin(def);
-  if (locked) { toast(locked.message, 'err'); return locked; }
   const balance = balanceOf(def.id);
   if (balance > 0) {
     const r = fail('ASSET_BALANCE_NOT_ZERO', '「' + def.name + '」仍有余额 ' + fmt(balance) + '，请先清零后再删除');

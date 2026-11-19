@@ -2,13 +2,34 @@ import { BudgetEngine } from './budget.js';
 import { checkAchievements } from './business.js';
 import { reverseBoundBudget } from './budget-binding.js';
 import { runCommand } from './command.js';
-import { parseCardGrantAmt } from './cond-ui.js';
 import { noteCheckinActivity } from './gate.js';
 import { Ledger, applyCheckinGain, setReverseHandler } from './ledger.js';
 import { processDailyTaskDebts, processLoansWithDecayReserve, skipNextLoanAutoPay } from './debt.js';
 import { logAmt, clone, now } from './pure.js';
+import { normalizeProductExec } from './normalize.js';
+import { releaseExecBuy } from './exec-quota.js';
+import { undoFlowRunInTxn } from './flow-engine.js';
 import { state } from './state.js';
 import { toast } from './toast.js';
+// 旧版卡券流水没有 granted 字段时，从描述「N 张」里还原张数
+function parseCardGrantAmt(desc){
+  const m=/(\d+)\s*张/.exec(desc||'');return m?parseInt(m[1],10):0;
+}
+// 执行权购买：执行撤销的前置拒绝原因（面向用户的中文说明）
+function execUndoText(err){
+  const code=(err&&err.code)||'';
+  if(code==='FLOW_UNDO_NOT_FOUND')return '该次执行记录已超出最近 50 次保留窗口';
+  if(code==='FLOW_UNDO_NO_JOURNAL')return '该次执行缺少撤销日志';
+  if(code==='FLOW_UNDO_LOG_TRIMMED')return '该次执行的流水已超出保留窗口';
+  if(code==='FLOW_UNDO_ENTITY_USED')return '该次执行创建的事项已被使用或修改';
+  if(code==='FLOW_UNDO_ENTITY_MISSING')return '该次执行创建的事项已被删除';
+  if(code==='FLOW_UNDO_ASSET_CONSUMED')return '该次执行发放的资产已被使用';
+  if(code==='FLOW_UNDO_CROSS_PERIOD')return '该次执行发放的资产已跨周期';
+  if(code==='FLOW_UNDO_ASSET_MISSING')return '该次执行涉及的资产已不存在';
+  if(code==='FLOW_UNDO_NO_REVERSER')return '该次执行包含无法反转的步骤';
+  if(err&&err.message)return String(err.message);
+  return code||'未知原因';
+}
 // undo.js —— 撤销适配器与快照
 // 由 app.js 按功能拆分（第五轮可维护性重构），行为不变。
 function undoAbort(code,reason){
@@ -97,6 +118,21 @@ const UNDO_ADAPTERS={
           undoAbort('UNDO_GRANT_SPENT','赠送的货币已被使用，无法整单撤销');
         }
       });
+      // 执行权：先联动撤销该次执行（同一事务内），撤不掉就拒绝整单撤销并说明原因
+      const execLog=orderLogs.find(function(l){return l&&l.execRunId;})||null;
+      if(execLog){
+        let fr=null;
+        try{
+          fr=undoFlowRunInTxn(execLog.execRunId,{ts:now()});
+        }catch(e){
+          undoAbort('UNDO_EXEC_FAILED','购买附带执行无法撤销：'+execUndoText(e));
+        }
+        if(!fr||!fr.ok)undoAbort('UNDO_EXEC_FAILED','购买附带执行无法撤销：'+execUndoText(fr&&fr.error));
+        // 执行已撤回：同周期内退回一次限购额度（跨周期撤销不改当前周期计数）
+        const ep=state.products.find(function(x){return x&&x.id===execLog.prodId;});
+        const ecfg=ep?normalizeProductExec(ep.exec):null;
+        if(ep&&ecfg)releaseExecBuy(state.ext&&state.ext.execBuys,ep.id,ecfg,execLog.time);
+      }
       // 现实预算只联动货币腿；资产定价商品本就不会产生预算账目
       orderLogs.filter(function(l){return l.src==='purchase'&&l.st!=='card';}).forEach(function(cl){
         let budEntry=null;

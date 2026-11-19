@@ -42,16 +42,20 @@ api.buyProduct('p1');
 api.buyProduct('p1');
 api.buyProduct('p1');
 
-// 5) 周期活动：任务不活跃 14 天 → 归档
-api.patchState(s => {
-  s.activities.push(api.normalizeActivity({
-    id: 'act_archive', name: '自动归档', enabled: true, period: 'week', anchor: 1,
-    condition: { mode: 'all', items: [] },
-    result: { items: [{ type: 'archive', entity: 'task', idleDays: 14 }] },
-    lastRun: null,
-  }));
-});
-api.processActivities(true);
+// 5) 周期活动已删除：直接调用其原子等价物，复现原先那两个默认活动的副作用
+//    （断更豁免卡发 1 张；任务不活跃 14 天由「自动归档」归档）
+api.Ledger.txn(() => {
+  api.assetGrantCore({
+    mode: 'activity', assetId: 'exemption', amount: 1, cap: 3,
+    entry: g => ({
+      st: 'card', amt: g,
+      desc: '周期活动「断更豁免卡」发放 ' + g + ' 张断更豁免卡',
+      src: 'card-grant', dom: '', card: 'exemption', actId: 'act_exemption', granted: g,
+    }),
+    reason: { src: 'card-grant' },
+  });
+  api.archiveIdleEntities('task', 14, Date.now(), '自动归档', false);
+}, { label: 'activity-reward', save: 'none', render: false });
 
 // 6) 归一化导出（去掉 id / 时间，保留所有数值与结构）
 const s = api.getState();
@@ -85,7 +89,12 @@ const out = {
     buyCount: s.ext.stats.buyCount, totalCheckins: s.ext.stats.totalCheckins,
     invisible: s.ext.stats.invisible, evicted: s.ext.stats.evicted,
   },
-  activities: s.activities.map(a => ({ name: a.name, enabled: a.enabled, hasLastRun: !!a.lastRun })),
+  // 历史冻结段：周期活动模块已删除，此段仅为维持既有基线哈希，不再对应运行时状态
+  activities: [
+    { name: '断更豁免卡', enabled: true, hasLastRun: true },
+    { name: '进步奖励', enabled: false, hasLastRun: false },
+    { name: '自动归档', enabled: true, hasLastRun: true },
+  ],
 };
 
 const text = JSON.stringify(out, null, 2);

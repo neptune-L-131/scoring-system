@@ -6,8 +6,8 @@
 // 3. 原子复用 S3 的 runFlowAtom，不新造写入路径；
 // 4. 条件不成立 = “本次未发生”：不写 lastRun、不写幂等键、不落流水，同一周期可再次求值。
 import {
-  FLOW_ATOM_IDLE_DAYS_MAX, FLOW_ATOM_MAX_ASSET, FLOW_ATOM_MAX_CURRENCY,
-  FLOW_ATOM_NOTE_MAX_LEN, FLOW_IDEM_KEEP, FLOW_MAX_DEPTH, FLOW_MAX_STEPS, FLOW_RUN_KEEP,
+  FLOW_ATOM_CREATE_NAME_MAX, FLOW_ATOM_IDLE_DAYS_MAX, FLOW_ATOM_MAX_ASSET, FLOW_ATOM_MAX_CREATE,
+  FLOW_ATOM_MAX_CURRENCY, FLOW_ATOM_NOTE_MAX_LEN, FLOW_IDEM_KEEP, FLOW_MAX_DEPTH, FLOW_MAX_STEPS, FLOW_RUN_KEEP,
 } from './constants.js';
 import { registerFlowDueProcessor } from './flow-scheduler.js';
 import { FLOW_ATOMS, assetPeriodKeyOf, runFlowAtom } from './flow-atoms.js';
@@ -28,6 +28,7 @@ const ATOM_OUTPUT_FIELDS = {
   'asset.grant': ['granted', 'amount'],
   'asset.spend': ['spent'],
   'entity.archiveIdle': ['count', 'archived'],
+  'entity.create': ['count'],
   'log.note': [],
   'engine.recheckAchievements': ['count'],
   'task.exempt': [],
@@ -231,7 +232,7 @@ function checkStaticParams(step, params, insideBranch, st, errors) {
       }
       return;
     }
-    if (k === 'amount' && (typeof v !== 'number' || !isFinite(v) || v <= 0)) errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'amount'));
+    if (k === 'amount' && (typeof v !== 'number' || !isFinite(v) || v <= 0) && atomId !== 'entity.create') errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'amount'));
     if (k === 'account' && typeof v !== 'string') errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'account'));
     if (k === 'assetId' && typeof v !== 'string') errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'assetId'));
     if (k === 'idleDays' && (!Number.isInteger(v) || v < 1 || v > FLOW_ATOM_IDLE_DAYS_MAX)) errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'idleDays'));
@@ -280,6 +281,37 @@ function checkStaticParams(step, params, insideBranch, st, errors) {
   if (atomId === 'entity.archiveIdle') {
     if (params.kind === undefined) errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'kind'));
     if (params.idleDays === undefined) errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'idleDays'));
+  }
+  if (atomId === 'entity.create') {
+    const validKind = params.kind === 'task' || params.kind === 'affair' || params.kind === 'chore';
+    if (params.kind === undefined) errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'kind'));
+    if (params.name === undefined) errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'name'));
+    else if (typeof params.name !== 'string' || !params.name.trim()) errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'name'));
+    else if (params.name.trim().length > FLOW_ATOM_CREATE_NAME_MAX) errors.push(cErr('FLOW_NAME_TOO_LONG', step.id, params.name.length));
+    if (validKind && params.kind !== 'chore') {
+      if (params.domainId === undefined) errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'domainId'));
+      else if (typeof params.domainId !== 'string' || !(state.domains || []).some(d => d && d.id === params.domainId)) {
+        errors.push(cErr('FLOW_INVALID_ACCOUNT', step.id, params.domainId));
+      }
+    } else if (params.kind === 'chore' && params.domainId !== undefined) {
+      errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'domainId'));
+    }
+    if (params.count !== undefined && (!Number.isInteger(params.count) || params.count < 1 || params.count > FLOW_ATOM_MAX_CREATE)) {
+      errors.push(cErr('FLOW_CREATE_LIMIT', step.id, params.count));
+    }
+    if (params.amount !== undefined) {
+      const isRefAmount = params.amount && typeof params.amount === 'object' && !Array.isArray(params.amount) && params.amount.ref !== undefined;
+      if (!isRefAmount) {
+        if (params.kind === 'chore') errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'amount'));
+        else if (typeof params.amount !== 'number' || !isFinite(params.amount) || params.amount < 0) {
+          errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'amount'));
+        } else if (params.amount > FLOW_ATOM_MAX_CURRENCY) {
+          errors.push(cErr('FLOW_AMOUNT_LIMIT', step.id, params.amount));
+        } else if (params.kind === 'affair' && params.amount <= 0) {
+          errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'amount'));
+        }
+      }
+    }
   }
   if (atomId === 'log.note') {
     if (params.desc === undefined) errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'desc'));
@@ -453,6 +485,9 @@ function writeRunRecord(flow, ctx, journalId, deltas, journal) {
     childLogIds: ctx.stepLogIds.slice(), deltas: deltas, stepOutputs: ctx.stepOutputs,
     journal: journal || null,
   };
+  // 执行权购买：运行记录与购买单双向可识别
+  if (ctx.orderId) rec.orderId = ctx.orderId;
+  if (ctx.productId) rec.productId = ctx.productId;
   runs.byId[rec.id] = rec;
   runs.recent.unshift(rec.id);
   if (runs.recent.length > FLOW_RUN_KEEP) runs.recent.length = FLOW_RUN_KEEP;
@@ -528,6 +563,7 @@ function execute(flow, plan, meta) {
     flow: flow, flowName: flow.name, limits: plan.limits,
     runId: runId, runKey: meta.runKey, trigger: meta.trigger, periodKey: meta.period,
     ts: meta.ts, actLike: meta.actLike, startedAt: now(), silent: true, dryRun: false,
+    orderId: meta.orderId || '', productId: meta.productId || '',
     inputs: (meta && meta.inputs && typeof meta.inputs === 'object') ? meta.inputs : {},
     outputs: {}, stepOutputs: {}, stepLogIds: [], assetOps: {}, journalSteps: [],
     totals: { granted: 0, spent: 0, assetGranted: 0, assetSpent: 0, steps: 0, notes: 0, recheck: 0 },
@@ -566,8 +602,19 @@ function execute(flow, plan, meta) {
 
 // 执行一条流。trigger='period' 时走幂等闸门；'manual' 为显式手动执行，不占周期额度。
 function runFlow(flowId, opts) {
+  return runFlowCore(flowId, opts, false);
+}
+// 在既有事务内执行（购买执行权专用）：不占流周期额度、不写幂等键，成败随外层事务。
+function runFlowInTxn(flowId, opts) {
+  return runFlowCore(flowId, opts, true);
+}
+function runFlowCore(flowId, opts, inTxn) {
   opts = opts || {};
-  if (Ledger.inTxn()) return { ok: false, error: { code: 'FLOW_BUSY', message: '流执行不能嵌套在事务内' } };
+  if (inTxn) {
+    if (!Ledger.inTxn()) return { ok: false, error: { code: 'FLOW_NO_TXN', message: '必须在事务内调用' } };
+  } else if (Ledger.inTxn()) {
+    return { ok: false, error: { code: 'FLOW_BUSY', message: '流执行不能嵌套在事务内' } };
+  }
   const flow = (state.flows || []).find(f => f && f.id === flowId) || null;
   if (!flow) return { ok: false, error: { code: 'FLOW_NOT_FOUND' } };
   if (flow.enabled === false || flow.invalid) return { ok: false, error: { code: 'FLOW_DISABLED' } };
@@ -586,7 +633,9 @@ function runFlow(flowId, opts) {
   ensureRuntimeStructures();
 
   const ts = Number.isFinite(Number(opts.ts)) ? Number(opts.ts) : now();
-  const trigger = opts.trigger === 'manual' ? 'manual' : (opts.trigger === 'event' ? 'event' : 'period');
+  const trigger = opts.trigger === 'manual' ? 'manual'
+    : opts.trigger === 'event' ? 'event'
+      : opts.trigger === 'purchase' ? 'purchase' : 'period';
   let runKey = '';
   let period = '';
   let base = '';
@@ -609,6 +658,11 @@ function runFlow(flowId, opts) {
     if (flow.lastEventKey === eventKey || state.ext.assetMeters.idem[runKey]) {
       return { ok: true, skipped: 'already-run', runKey: runKey };
     }
+  } else if (trigger === 'purchase') {
+    // 执行权：由购买单驱动，一次购买执行一次，不占流自身的周期额度
+    const orderId = typeof opts.orderId === 'string' ? opts.orderId : '';
+    if (!orderId) return { ok: false, error: { code: 'FLOW_BAD_PURCHASE' } };
+    runKey = flow.id + '@purchase@' + orderId;
   } else {
     runKey = flow.id + '@manual@' + ts;
   }
@@ -642,7 +696,7 @@ function runFlow(flowId, opts) {
   try {
     return execute(flow, compiled.plan, {
       trigger: trigger, ts: ts, runKey: runKey, period: period, actLike: actLike, inputs: inputs,
-      eventKey: eventKey,
+      eventKey: eventKey, orderId: opts.orderId || '', productId: opts.productId || '',
     });
   } finally {
     _active.delete(flow.id);
@@ -1066,9 +1120,42 @@ const FLOW_REVERSERS = {
     reverseGenericStep(step, ctx);
     restoreArchivedEntities(step, ctx);
   },
+  'entity.create': function (step, ctx) {
+    reverseGenericStep(step, ctx);
+    removeCreatedEntities(step, ctx);
+  },
   'engine.recheckAchievements': reverseGenericStep,
   'task.exempt': restoreTaskExempt,
 };
+
+// entity.create 反转：删除本次创建的事项。已被使用/修改过的一律拒绝（不夹 0、不留半截）
+function createdEntityList(kind) {
+  return kind === 'affair' ? (state.affairs || [])
+    : kind === 'chore' ? (state.chores || []) : (state.tasks || []);
+}
+function entityUsedSinceCreate(kind, e) {
+  if (!e) return true;
+  if (e.archived) return true;
+  if (kind === 'task') return Number(e.checkInCount) > 0 || !!e.lastCheckIn;
+  if (kind === 'affair') {
+    return Number(e.currentCell) > 0 || Number(e.alreadyGiven) > 0 || !!e.doneAt || !!e.startedAt ||
+      (Array.isArray(e.steps) && e.steps.length > 0);
+  }
+  return !!e.done || !!e.settled;
+}
+function removeCreatedEntities(step, ctx) {
+  const kind = (step && step.input && step.input.kind) || 'task';
+  const list = createdEntityList(kind);
+  const ids = (step && step.output && step.output.ids) || [];
+  ids.forEach(function (id) {
+    const idx = list.findIndex(function (x) { return x && x.id === id; });
+    if (idx < 0) undoFail('FLOW_UNDO_ENTITY_MISSING', { kind: kind, id: id });
+    if (entityUsedSinceCreate(kind, list[idx])) undoFail('FLOW_UNDO_ENTITY_USED', { kind: kind, id: id });
+    list.splice(idx, 1);
+    if (!ctx.removedEntities) ctx.removedEntities = 0;
+    ctx.removedEntities += 1;
+  });
+}
 
 function restoreAssetMeters(journal, ctx) {
   const meters = state.ext && state.ext.assetMeters;
@@ -1138,6 +1225,19 @@ function preflightUndo(rec, journal, ts) {
     });
   });
 
+  // 4b. 按模板创建的事项：必须仍存在，且未被使用/修改（否则删除会留下统计残差）
+  (journal.steps || []).forEach(function (step) {
+    if (step.kind === 'branch' || step.atom !== 'entity.create') return;
+    const kind = (step.input && step.input.kind) || 'task';
+    const list = createdEntityList(kind);
+    const ids = (step.output && step.output.ids) || [];
+    ids.forEach(function (id) {
+      const e = list.find(function (x) { return x && x.id === id; });
+      if (!e) undoFail('FLOW_UNDO_ENTITY_MISSING', { kind: kind, id: id });
+      if (entityUsedSinceCreate(kind, e)) undoFail('FLOW_UNDO_ENTITY_USED', { kind: kind, id: id });
+    });
+  });
+
   // 5. 成就存在：要回锁的成就必须还在
   const achIds = [];
   ids.forEach(function (id) {
@@ -1152,18 +1252,63 @@ function preflightUndo(rec, journal, ts) {
 }
 
 // 撤销一次流运行：单事务回滚整条流的全部产出
-function undoFlowRun(runId, opts) {
-  opts = opts || {};
-  if (Ledger.inTxn()) {
-    return { ok: false, error: { code: 'FLOW_UNDO_BUSY', message: '撤销不能在事务内调用' } };
-  }
+function findUndoRun(runId) {
   const runs = state.ext && state.ext.flowRuns;
   const rec = (runs && runs.byId) ? runs.byId[runId] : null;
   if (!rec) return { ok: false, error: { code: 'FLOW_UNDO_NOT_FOUND' } };
   if (rec.status === 'reversed') return { ok: false, error: { code: 'FLOW_UNDO_ALREADY' } };
   const journal = rec.journal;
   if (!journal || !journal.v) return { ok: false, error: { code: 'FLOW_UNDO_NO_JOURNAL' } };
+  return { ok: true, rec: rec, journal: journal };
+}
 
+function applyUndoWrites(rec, journal, ctx) {
+  // 逆序：最后发生的步骤先反转；步骤内的子日志也逆序
+  const steps = (journal.steps || []).slice().reverse();
+  steps.forEach(function (step) {
+    if (step.kind === 'branch') return;
+    const reverse = FLOW_REVERSERS[step.atom];
+    if (!reverse) undoFail('FLOW_UNDO_NO_REVERSER', { atom: step.atom });
+    reverse(step, ctx);
+  });
+  // 主日志最后删
+  if (rec.journalLogId) {
+    Ledger.removeLogs(function (l) { return l.id !== rec.journalLogId; });
+    ctx.removedLogs += 1;
+  }
+  // 资产计量回到执行前（前置扫描已保证没有跨期）
+  restoreAssetMeters(journal, ctx);
+  // status 最后写
+  rec.status = 'reversed';
+  rec.reversedAt = now();
+  rec.undo = {
+    at: rec.reversedAt, removedLogs: ctx.removedLogs,
+    restoredEntities: ctx.restoredEntities, restoredAssets: ctx.restoredAssets,
+    removedEntities: ctx.removedEntities || 0,
+  };
+}
+
+function undoResult(runId, rec, ctx) {
+  return {
+    ok: true, runId: runId, flowId: rec.flowId, reversedAt: rec.reversedAt,
+    removedLogs: ctx.removedLogs, restoredEntities: ctx.restoredEntities,
+    restoredAssets: ctx.restoredAssets, removedEntities: ctx.removedEntities || 0,
+  };
+}
+
+function undoFlowRun(runId, opts) {
+  opts = opts || {};
+  if (Ledger.inTxn()) {
+    return { ok: false, error: { code: 'FLOW_UNDO_BUSY', message: '撤销不能在事务内调用' } };
+  }
+  const found = findUndoRun(runId);
+  if (!found.ok) return found;
+  const rec = found.rec;
+  // 购买产生的运行不能单独撤销：必须与购买记录整单进退，避免“钱付了、效果没了”
+  if (rec.trigger === 'purchase') {
+    return { ok: false, error: { code: 'FLOW_UNDO_PURCHASE_BOUND', message: '该运行由商品购买产生，请在对应购买记录上整单撤销' } };
+  }
+  const journal = found.journal;
   const ts = Number.isFinite(Number(opts.ts)) ? Number(opts.ts) : now();
   try {
     preflightUndo(rec, journal, ts);
@@ -1175,52 +1320,49 @@ function undoFlowRun(runId, opts) {
   }
 
   const ctx = { removedLogs: 0, restoredEntities: 0, restoredAssets: 0 };
-  const txr = Ledger.txn(function () {
-    // 逆序：最后发生的步骤先反转；步骤内的子日志也逆序
-    const steps = (journal.steps || []).slice().reverse();
-    steps.forEach(function (step) {
-      if (step.kind === 'branch') return;
-      const reverse = FLOW_REVERSERS[step.atom];
-      if (!reverse) undoFail('FLOW_UNDO_NO_REVERSER', { atom: step.atom });
-      reverse(step, ctx);
-    });
-    // 主日志最后删
-    if (rec.journalLogId) {
-      Ledger.removeLogs(function (l) { return l.id !== rec.journalLogId; });
-      ctx.removedLogs += 1;
-    }
-    // 资产计量回到执行前（前置扫描已保证没有跨期）
-    restoreAssetMeters(journal, ctx);
-    // status 最后写
-    rec.status = 'reversed';
-    rec.reversedAt = now();
-    rec.undo = {
-      at: rec.reversedAt, removedLogs: ctx.removedLogs,
-      restoredEntities: ctx.restoredEntities, restoredAssets: ctx.restoredAssets,
-    };
-  }, {
+  const txr = Ledger.txn(function () { applyUndoWrites(rec, journal, ctx); }, {
     label: 'undo-flow:' + (rec.flowId || ''),
     save: opts.save === false ? 'none' : undefined,
     render: false,
   });
 
   if (!txr.ok) return { ok: false, error: txr.error };
-  return {
-    ok: true, runId: runId, flowId: rec.flowId, reversedAt: rec.reversedAt,
-    removedLogs: ctx.removedLogs, restoredEntities: ctx.restoredEntities,
-    restoredAssets: ctx.restoredAssets,
-  };
+  return undoResult(runId, rec, ctx);
+}
+
+// 供“购买撤销”在同一事务内联动撤销执行：不做事务/购买归属检查，由调用方保证事务边界。
+// 前置扫描失败返回错误；写入阶段抛错则由外层事务整体回滚。
+function undoFlowRunInTxn(runId, opts) {
+  opts = opts || {};
+  if (!Ledger.inTxn()) return { ok: false, error: { code: 'FLOW_NO_TXN', message: '必须在事务内调用' } };
+  const found = findUndoRun(runId);
+  if (!found.ok) return found;
+  const rec = found.rec;
+  const journal = found.journal;
+  const ts = Number.isFinite(Number(opts.ts)) ? Number(opts.ts) : now();
+  try {
+    preflightUndo(rec, journal, ts);
+  } catch (e) {
+    return {
+      ok: false,
+      error: { code: e.code || 'FLOW_UNDO_REFUSED', message: e.message, info: e.info || {} },
+    };
+  }
+  const ctx = { removedLogs: 0, restoredEntities: 0, restoredAssets: 0 };
+  applyUndoWrites(rec, journal, ctx);
+  return undoResult(runId, rec, ctx);
 }
 
 const FlowEngine = {
-  compile: compile, runFlow: runFlow, processDue: processDue, dryRun: dryRun, undoFlowRun: undoFlowRun,
+  compile: compile, runFlow: runFlow, runFlowInTxn: runFlowInTxn, processDue: processDue,
+  dryRun: dryRun, undoFlowRun: undoFlowRun, undoFlowRunInTxn: undoFlowRunInTxn,
   runAssetUse: runAssetUse, dryRunAssetUse: dryRunAssetUse,
 };
 
 registerFlowDueProcessor(processDue);
 
 export {
-  compile, runFlow, processDue, dryRun, undoFlowRun,
+  compile, runFlow, runFlowInTxn, processDue, dryRun, undoFlowRun, undoFlowRunInTxn,
   runAssetUse, dryRunAssetUse, buildAssetUseFlow,
   FLOW_REVERSERS, FlowEngine,
 };

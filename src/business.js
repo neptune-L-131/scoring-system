@@ -4,9 +4,7 @@ import { budgetOf, budgetRefOf, openBudgetAmountDialog, rememberBudgetDraft, res
 import { runCommand } from './command.js';
 import { Ledger } from './ledger.js';
 import { processDailyTaskDebts, processLoansWithDecayReserve } from './debt.js';
-import { save } from './persist.js';
 import { stageCellLabel, stageNetAt, stageSel, taskIsStaged, effectiveLastTs, fmt, getTaskDomainIds, now, taskCheckedToday, taskScoreTypes, uid, calcCheckIn } from './pure.js';
-import { render } from './render.js';
 import { state } from './state.js';
 import { addDays, dayDiff, dayStart } from './time.js';
 import { toast } from './toast.js';
@@ -171,9 +169,8 @@ function checkIn(taskId,stageIdx,resolved){
   });
 }
 
-// 豁免内核：登记字段 + 可见流水；是否扣卡 / 是否联动债务结算由调用方决定。
-// 动作流 task.exempt 以 consumeCard:false 调用（扣卡由同一事务里的 asset.spend 完成），
-// 旧入口 useExemption 以 consumeCard:true 调用，保持历史账目与撤销适配器不变。
+// 豁免内核：登记字段 + 可见流水；是否联动债务结算由调用方决定。
+// 扣资产由同一运行里的 asset.spend 完成，豁免本身不绑死任何资产。
 function exemptTaskCore(taskId,opts){
   opts=opts||{};
   const t=state.tasks.find(x=>x.id===taskId);
@@ -183,9 +180,6 @@ function exemptTaskCore(taskId,opts){
   const todayStart=dayStart(ts);
   if(t.lastCheckIn&&t.lastCheckIn>=todayStart)return {ok:false,code:'FLOW_TASK_CHECKED',reason:'今日已打卡，无需豁免'};
   if(t.lastExempt&&t.lastExempt>=todayStart)return {ok:false,code:'FLOW_TASK_EXEMPTED',reason:'今日已豁免'};
-  if(opts.consumeCard!==false&&(state.cards.exemption||0)<=0){
-    return {ok:false,code:'FLOW_INSUFFICIENT',reason:'没有可用豁免卡'};
-  }
   const lastEff=effectiveLastTs(t);
   const gapDays=dayDiff(todayStart,lastEff);
   const wasBroken=gapDays>=2;
@@ -193,13 +187,10 @@ function exemptTaskCore(taskId,opts){
   const prevPendingDebt=t.pendingDebt||0;
   const prevLastDebtDate=t.lastDebtDate||null;
 
-  if(opts.consumeCard!==false){
-    Ledger.post({op:'spend',account:'card:exemption',delta:-1,visible:false,reason:{src:'exempt-use'}});
-  }
   t.lastExempt=addDays(todayStart,1)-1000; // end of today
   t.pendingDebt=0;
   delete t.lastDebtDate;
-  const desc=opts.desc||('「'+t.name+'」使用断更豁免卡'+(wasBroken?'（补救）':'（请假）'));
+  const desc=opts.desc||('「'+t.name+'」任务豁免'+(wasBroken?'（补救）':'（请假）'));
   const entry=Ledger.event(desc,opts.src||'exempt',{
     taskId:t.id,prevLastExempt:prevLastExempt,prevPendingDebt:prevPendingDebt,prevLastDebtDate:prevLastDebtDate,
   });
@@ -210,17 +201,6 @@ function exemptTaskCore(taskId,opts){
     prevLastExempt:prevLastExempt,prevPendingDebt:prevPendingDebt,prevLastDebtDate:prevLastDebtDate,
     wasBroken:wasBroken,gapDays:gapDays,
   };
-}
-
-function useExemption(taskId){
-  const r=exemptTaskCore(taskId,{consumeCard:true});
-  if(!r.ok){
-    toast(r.reason,r.code==='FLOW_TASK_CHECKED'||r.code==='FLOW_TASK_EXEMPTED'?'warn':'err');
-    return;
-  }
-  save();
-  toast('已使用断更豁免卡'+(r.wasBroken?'，待扣债已清零':''));
-  render();
 }
 
 // 成就复核：opts.silent=true 时不弹 toast（干跑/动作流用）；
@@ -242,4 +222,4 @@ function checkAchievements(domId,opts){
   return unlocked;
 }
 
-export { checkIn, useExemption, exemptTaskCore, checkAchievements };
+export { checkIn, exemptTaskCore, checkAchievements };

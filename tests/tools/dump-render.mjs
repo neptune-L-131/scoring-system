@@ -138,6 +138,20 @@ api.patchState(s => {
     { acct: 'achievement', delta: 2, label: '活动回收', src: 'activity', before: 7, after: 9, ts: at(10, 5) },
     { acct: 'progress:d2', delta: -1.5, label: '重算搬运', src: 'recalc', before: 3, after: 1.5, ts: at(9, 6) },
   ];
+  // 覆盖新增的「事件派发失败」提示：只放既有结构，不引入新的写入通道
+  s.flows = [{ id: 'f2', name: '打卡奖励', enabled: true, trigger: { type: 'event', event: { kind: 'checkin' } }, steps: [] }];
+  s.ext.events = {
+    v: 1,
+    recent: [{
+      v: 1, kind: 'checkin', key: 'checkin:t1', sourceId: 't1', occurredAt: at(10, 11),
+      payload: { taskId: 't1' },
+      results: [
+        { flowId: 'f2', ok: false, code: 'FLOW_EVENT_EXCEPTION', message: '步骤执行时余额发生变化', runId: '', skipped: '' },
+        { flowId: 'f2', ok: false, code: 'FLOW_COMPILE_FAILED', message: '', runId: '', skipped: '' },
+        { flowId: 'f2', ok: true, code: '', message: '', runId: 'run_ok', skipped: '' },
+      ],
+    }],
+  };
 });
 
 function capturePanel(id) {

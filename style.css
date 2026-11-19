@@ -497,6 +497,87 @@ body{
   .log-undo{opacity:1}
 }
 
+/* ===== 银行流水账本视图（只读展示：筛选 / 分组 / 因果） ===== */
+.ledger-bar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:8px}
+.ledger-sel{
+  font-family:inherit;font-size:12px;color:var(--text-2);cursor:pointer;
+  background:var(--surface);border:1px solid var(--border-2);border-radius:var(--radius);
+  padding:4px 6px;max-width:47%;
+}
+.ledger-sel:focus{outline:none;border-color:var(--text-3)}
+.ledger-check{display:flex;align-items:center;gap:4px;font-size:12px;color:var(--text-3);user-select:none}
+.ledger-clear{
+  background:none;border:none;color:var(--text-3);cursor:pointer;
+  font-size:12px;font-family:inherit;padding:3px 6px;border-radius:4px;
+}
+.ledger-clear:hover{background:var(--surface-2);color:var(--text)}
+.ledger-day-head{
+  display:flex;align-items:center;gap:8px;padding:9px 13px;
+  background:var(--surface-2);border-bottom:1px solid var(--border);
+  font-size:12px;color:var(--text-2);cursor:pointer;user-select:none;
+}
+.ledger-day-head .ld-day{font-weight:600;color:var(--text)}
+.ledger-day-head .ld-day-meta{margin-left:auto;font-size:11px;color:var(--text-3)}
+.ledger-row{border-bottom:1px solid var(--border)}
+.ledger-row .log-item{border-bottom:none}
+.ledger-day:last-child .ledger-row:last-child{border-bottom:none}
+.ledger-row .log-amt{white-space:nowrap}
+.ledger-row .log-src{
+  display:inline-block;margin-right:6px;padding:0 4px;border:1px solid var(--border-2);
+  border-radius:4px;font-size:10px;line-height:15px;color:var(--text-3);vertical-align:1px;
+}
+/* 进项/出项只用一条细边区分，主体仍沿用原有配色 */
+.ledger-row.in{box-shadow:inset 2px 0 0 var(--vitality)}
+.ledger-row.out{box-shadow:inset 2px 0 0 var(--danger)}
+/* 资产行：圆点改方形，与货币行区分（不靠颜色） */
+.ledger-row.asset .log-dot{border-radius:2px}
+/* 隐形变动：虚线边 + 「隐形」标签，提示不进入可见余额 */
+.ledger-row.shadow{border-left:2px dashed var(--border-2)}
+.ledger-row.shadow .log-src{border-style:dashed}
+/* 事件派发失败提示：只读汇总，无失败时整块不渲染 */
+.ledger-event-fail{margin:8px;padding:8px 10px;border:1px solid rgba(214,69,69,.35);border-radius:var(--radius);background:rgba(214,69,69,.06)}
+.ledger-event-fail-head{font-size:11px;font-weight:600;color:var(--danger);margin-bottom:4px}
+.ledger-event-fail-row{display:flex;gap:6px;flex-wrap:wrap;font-size:11px;line-height:1.7;color:var(--text-2)}
+.lef-t{color:var(--text-3);font-variant-numeric:tabular-nums}
+.lef-k{color:var(--text-3)}
+.lef-f{color:var(--text)}
+.lef-r{color:var(--danger)}
+.ledger-event-fail-more{font-size:10px;color:var(--text-3);margin-top:2px}
+.log-more{
+  background:none;border:none;color:var(--text-3);cursor:pointer;
+  font-size:11px;padding:2px 6px;border-radius:4px;transition:all .15s;font-family:inherit;
+  flex-shrink:0;opacity:0;
+}
+.log-item:hover .log-more{opacity:1}
+.log-more:hover{background:var(--surface-2);color:var(--text)}
+.ledger-row.open .log-more{opacity:1;color:var(--text)}
+@media (hover:none),(pointer:coarse){
+  .log-more{opacity:1}
+}
+/* 因果详情：只读展开块 */
+.log-detail{
+  padding:8px 13px 10px 30px;background:var(--surface-2);
+  font-size:11px;color:var(--text-2);
+}
+.ld-line{display:flex;gap:8px;padding:2px 0;line-height:1.6}
+.ld-k{color:var(--text-3);flex-shrink:0;min-width:52px}
+.ld-v{flex:1;word-break:break-word}
+.ld-sec{margin-top:8px;color:var(--text);font-weight:600}
+.ld-sub{color:var(--text-3);font-weight:400}
+.ld-list{margin-top:2px}
+.ld-chg{display:flex;gap:8px;padding:2px 0;align-items:baseline}
+.ld-chg-t{color:var(--text-3);flex-shrink:0}
+.ld-chg-d{flex:1;word-break:break-word}
+.ld-chg-a{flex-shrink:0;font-weight:600}
+.ld-chg-a.pos{color:var(--vitality)}
+.ld-chg-a.neg{color:var(--danger)}
+.ld-note{margin-top:6px;color:var(--text-3)}
+.ledger-link{
+  background:none;border:1px solid var(--border-2);border-radius:4px;color:var(--text-2);
+  font-family:inherit;font-size:11px;padding:1px 6px;cursor:pointer;
+}
+.ledger-link:hover{border-color:var(--text-3);color:var(--text)}
+
 /* ===== Inline add ===== */
 .inline-add{
   display:flex;gap:6px;align-items:center;
@@ -1008,18 +1089,29 @@ body{
 
 .shop-card .sh-budget{font-size:10px;color:var(--text-3);margin-top:2px;overflow-wrap:anywhere}
 
-/* ===== P2：“今天该做什么”只读聚合清单（日程区顶部） ===== */
-.agenda-box{margin:8px 0 10px;padding:8px 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface-2)}
-.agenda-head{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600;color:var(--text)}
-.agenda-count{margin-left:auto;font-size:11px;font-weight:400;color:var(--text-3)}
-.agenda-list{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
-.agenda-chip{display:inline-flex;align-items:center;gap:4px;max-width:100%;font-size:11px;line-height:1.5;color:var(--text-2);background:var(--surface);border:1px solid var(--border-2);border-radius:999px;padding:2px 8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.agenda-chip i{font-style:normal;color:var(--text-3)}
-.agenda-chip b{font-weight:600;color:var(--danger)}
-.agenda-chip.affair{border-color:var(--tag-p-bg)}
-.agenda-chip.chore{border-color:var(--tag-v-bg)}
-.agenda-chip.done{opacity:.6;text-decoration:line-through}
-.agenda-chip.overdue{color:var(--danger);border-color:var(--danger)}
+/* ===== 打工页主入口：“今天该做什么”只读议程（逾期 / 今天 / 进行中） ===== */
+.agenda-panel{margin:0 0 16px;padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius);background:var(--surface)}
+.agenda-panel-head{display:flex;align-items:baseline;gap:8px}
+.agenda-title{font-size:14px;font-weight:600;color:var(--text)}
+.agenda-summary{margin-left:auto;font-size:11px;color:var(--text-3)}
+.agenda-scroll{margin-top:4px;max-height:228px;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}
+.agenda-group{padding-top:4px}
+.agenda-group+.agenda-group{border-top:1px solid var(--border);margin-top:4px}
+.agenda-group-head{display:flex;align-items:center;gap:6px;padding:2px 2px;font-size:11px;font-weight:600;color:var(--text-2)}
+.agenda-group-count{min-width:16px;padding:0 5px;border-radius:999px;background:var(--surface-2);color:var(--text-2);font-size:10px;font-weight:400;text-align:center}
+.agenda-group.is-overdue .agenda-group-name,.agenda-group.is-overdue .agenda-group-count{color:var(--danger)}
+.agenda-group.is-today .agenda-group-name{color:var(--progress)}
+.agenda-row{display:flex;align-items:center;gap:6px;padding:5px 6px;border-radius:6px;font-size:12px;line-height:1.5;cursor:pointer;transition:background .15s}
+.agenda-row:hover,.agenda-row:active{background:var(--hover-bg)}
+.agenda-row-tag{flex:none;font-size:10px;line-height:1.6;padding:0 5px;border-radius:4px;border:1px solid var(--border-2);color:var(--text-3)}
+.agenda-row-name{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}
+.agenda-row-sub{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--text-3)}
+.agenda-row-when{margin-left:auto;flex:none;font-size:11px;color:var(--text-3);font-variant-numeric:tabular-nums}
+.agenda-group.is-overdue .agenda-row-when{color:var(--danger)}
+.agenda-empty{padding:6px 2px;font-size:12px;color:var(--text-3)}
+/* 点击议程后的定位高亮：只做视觉提示，1.8s 后自动消失 */
+.card.agenda-hit{outline:2px solid var(--progress);outline-offset:1px;animation:agenda-hit-pulse 1.8s ease-out}
+@keyframes agenda-hit-pulse{0%,60%{box-shadow:0 0 0 3px var(--tag-p-bg)}100%{box-shadow:0 0 0 0 transparent}}
 
 /* ===== P4：杂事产出进度 ===== */
 .chore-progress{color:var(--progress);font-size:11px}

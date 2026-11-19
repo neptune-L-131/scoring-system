@@ -146,6 +146,18 @@ describe('entity-kit：todayAgenda', () => {
     expect(items.find(i => i.kind === 'task' && i.id === 't2').status).toBe('todo');
   });
 
+  it('每条带 bucket 分组口径：overdue / today / active', () => {
+    const items = api.todayAgenda();
+    const bucketOf = (kind, id, stepIndex) => items.find(i =>
+      i.kind === kind && i.id === id && (stepIndex === undefined || i.stepIndex === stepIndex)).bucket;
+    expect(bucketOf('affair', 'a1', 1)).toBe('overdue');
+    expect(bucketOf('affair', 'a1', 0)).toBe('today');
+    expect(bucketOf('chore', 'c1')).toBe('overdue');
+    expect(bucketOf('chore', 'c2')).toBe('today');
+    expect(bucketOf('task', 't1')).toBe('active');
+    expect(bucketOf('task', 't2')).toBe('active');
+  });
+
   it('只读：调用前后 state 完全一致，且不触发任何写盘副作用', () => {
     const before = JSON.stringify(api.getState());
     api.todayAgenda();

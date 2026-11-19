@@ -1,12 +1,9 @@
 // asset-use.js —— 资产使用入口（阶段 5 第一步）
 //
-// 职责：把「用资产做事」从周期活动配置里解耦出来。
-// - 资产定义声明 useRecipe（当前只有 task-exempt）后，任务卡/豁免面板都能直接发起一次
+// 职责：把「用资产做事」从旧周期活动配置里解耦出来。
+// - 资产定义声明 useRecipe（当前只有 task-exempt）后，任务卡能直接发起一次
 //   可见、可干跑、可撤销的资产运行；
-// - 运行本身复用 flow-engine 的 runAssetUse（同一事务、同一 journal、同一整单撤销）；
-// - 未配置配方的存量用户仍走旧的 useExemption（活动驱动）路径，保证行为不变。
-import { exemptionActivity } from './conditions.js';
-import { useExemption } from './business.js';
+// - 运行本身复用 flow-engine 的 runAssetUse（同一事务、同一 journal、同一整单撤销）。
 import { dryRunAssetUse, runAssetUse } from './flow-engine.js';
 import { save } from './persist.js';
 import { render } from './render.js';
@@ -24,11 +21,6 @@ function usableExemptAssets() {
       && d.useRecipe && d.useRecipe.type === 'task-exempt'
       && cardBalance(d.id) >= Math.max(1, Number(d.useRecipe.cost) || 1);
   });
-}
-
-function legacyExemptAvailable() {
-  const act = exemptionActivity();
-  return !!(act && act.enabled) && (state.cards.exemption || 0) > 0;
 }
 
 function errText(err) {
@@ -78,7 +70,7 @@ function previewText(def, taskId) {
     + '确认后会留下一条运行记录，可在「周期 → 动作流 → 运行记录」整单撤销。';
 }
 
-// 对外入口：任务卡按钮与豁免面板共用
+// 对外入口：任务卡按钮
 function useTaskExemption(taskId, assetId) {
   const candidates = usableExemptAssets();
   let def = null;
@@ -91,10 +83,6 @@ function useTaskExemption(taskId, assetId) {
   } else if (candidates.length) {
     def = pickAsset(candidates);
     if (!def) return { ok: false, canceled: true };
-  } else if (legacyExemptAvailable()) {
-    // 存量活动驱动路径：行为与旧版完全一致
-    useExemption(taskId);
-    return { ok: true, legacy: true };
   } else {
     toast('没有可用的豁免资产：请先在「资产定义」里配置「任务豁免」使用配方', 'err');
     return { ok: false, error: { code: 'FLOW_NO_USE_RECIPE' } };
@@ -119,13 +107,4 @@ function useTaskExemption(taskId, assetId) {
   return r;
 }
 
-// 豁免面板：显式选择资产后调用（面板本身已有下拉）
-function useExemptionFromPanel(taskId, assetId) {
-  if (!taskId) {
-    toast('请先选择要豁免的任务', 'warn');
-    return { ok: false };
-  }
-  return useTaskExemption(taskId, assetId || '');
-}
-
-export { usableExemptAssets, legacyExemptAvailable, useTaskExemption, useExemptionFromPanel };
+export { usableExemptAssets, useTaskExemption };

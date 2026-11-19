@@ -84,7 +84,7 @@ describe('journal：随运行落地的撤销证据', () => {
     const runId = run();
     const rec = record(runId);
 
-    expect(Object.keys(api.FLOW_REVERSERS)).toHaveLength(7);
+    expect(Object.keys(api.FLOW_REVERSERS)).toHaveLength(9);
     expect(rec.journal.v).toBe(1);
     expect(rec.journal.steps).toHaveLength(5);
     const s3 = rec.journal.steps.find(x => x.stepId === 's3');

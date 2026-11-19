@@ -211,15 +211,6 @@ describe('归一化函数', () => {
     expect(node.items).toHaveLength(1);
   });
 
-  it('normalizeRewardItem：结构动作 archive 有独立默认值', () => {
-    expect(api.normalizeRewardItem({ type: 'archive', entity: 'nope' })).toEqual({ type: 'archive', entity: 'task', idleDays: 1 });
-    expect(api.normalizeRewardItem({ type: 'archive', entity: 'chore', idleDays: '5' })).toEqual({ type: 'archive', entity: 'chore', idleDays: 5 });
-    expect(api.normalizeRewardItem({ type: 'vitality', amount: '7.5' })).toEqual({ type: 'vitality', amount: 7.5 });
-    // cap 为 0/空时回落到默认上限 3（与奖励项编辑器一致）
-    expect(api.normalizeRewardItem({ type: 'card', card: 'exemption', amount: 2, cap: 0 })).toMatchObject({ amount: 2, cap: 3 });
-    expect(api.normalizeRewardItem({ type: 'bogus' })).toBe(null);
-  });
-
   it('normalizeTaskNums：字符串转数字，计数不为负，非法时间归空', () => {
     const t = api.normalizeTaskNums({
       initialValue: '12.5', interestRate: '5', debtRate: 'x', vitalityCost: null,
@@ -250,12 +241,5 @@ describe('归一化函数', () => {
     expect(g.milestoneId).toBe('');
     expect(g.condition.mode).toBe('any');
     expect(g.condition.items).toHaveLength(1);
-  });
-
-  it('normalizeActivity：缺省字段补齐，禁用的活动保持禁用', () => {
-    const a = api.normalizeActivity({ name: '', enabled: false });
-    expect(a.name).toBe('未命名活动');
-    expect(a.enabled).toBe(false);
-    expect(a.period).toBe('week');
   });
 });

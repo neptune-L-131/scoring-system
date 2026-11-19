@@ -19,7 +19,6 @@
     <div class="app-date" id="todayDate"></div>
   </div>
   <div class="header-btns">
-    <span class="hchip" id="exemptChip" onclick="goTab('cycle')" title="查看周期设定" style="display:none"></span>
     <button class="hbtn" id="themeToggle" onclick="toggleTheme()">🌙</button>
     <button class="hbtn" id="installBtn" onclick="installApp()">下载至桌面</button>
     <button class="hbtn" onclick="exportData()">导出</button>
@@ -40,6 +39,8 @@
 
 <!-- ==================== 打工 ==================== -->
 <div class="panel active" id="panel-work">
+  <!-- 主入口：今天该做什么（只读聚合，点击仅定位高亮） -->
+  <div id="todayAgenda"></div>
   <div class="score-bar">
     <div class="score-cell">
       <div class="label">活力点</div>
@@ -204,6 +205,7 @@
   <div class="chart-tooltip" id="chartTooltip" style="display:none"></div>
 
   <div class="sec-head"><div class="sec-title">流水记录</div><div class="sec-head-tools"><button class="btn btn-sm" onclick="manualAdjustBalance()">手动修正余额</button><button class="btn btn-sm btn-danger" onclick="openModal('clearDataModal')">清除</button><div class="sec-meta" id="logMeta"></div></div></div>
+  <div id="ledgerBar"></div>
   <div class="log-list" id="logList"></div>
 
   <div class="sec-head" style="margin-top:8px">
@@ -257,28 +259,7 @@
 
 <!-- ==================== 周期 ==================== -->
 <div class="panel" id="panel-cycle">
-  <div class="score-bar">
-    <div class="score-cell"><div class="label">豁免卡余额</div><div class="num" id="cyCardBal">0</div><div class="sub" id="cyCardSub"></div></div>
-    <div class="score-cell"><div class="label">运行中活动</div><div class="num num-sm" id="cyGranted">0</div><div class="sub" id="cyGrantedSub"></div></div>
-    <div class="score-cell"><div class="label">下次结算</div><div class="num num-sm" id="cyNext">—</div><div class="sub" id="cyNextSub"></div></div>
-  </div>
-
   <div class="sec-head sec-head-major">
-    <div class="sec-title">周期活动</div>
-    <div style="display:flex;gap:6px">
-      <div class="sec-meta" style="align-self:center">设定周期规则，自动发放奖励 / 执行结构操作</div>
-      <button class="btn btn-sm" onclick="openActivityModal()">+ 新建活动</button>
-    </div>
-  </div>
-  <div id="cycleActivities"></div>
-
-  <div class="sec-head mt-lg">
-    <div class="sec-title">从周期活动迁移</div>
-    <div class="sec-meta">旧活动停用保留；迁移出的流默认停用、简易模式</div>
-  </div>
-  <div id="activityMigrationPanel"></div>
-
-  <div class="sec-head sec-head-major mt-lg">
     <div class="sec-title">动作流</div>
     <div style="display:flex;gap:6px">
       <div class="sec-meta" style="align-self:center">有序步骤 + 条件；保存只落配置，试跑不写盘，执行需手动发起</div>
@@ -293,11 +274,6 @@
   </div>
   <div id="flowDryPanel"></div>
   <div id="flowRunList"></div>
-
-  <div class="sec-head sec-head-major mt-lg">
-    <div class="sec-title">断更豁免卡</div>
-  </div>
-  <div class="rule-card" id="exemptUsePanel"></div>
 </div>
 
 </div>
@@ -666,105 +642,6 @@
   </div>
 </div>
 
-<!-- ===== Activity (周期活动) Modal ===== -->
-<div class="modal-bg" id="activityModal">
-  <div class="modal">
-    <h2 id="activityModalTitle">新建周期活动</h2>
-    <input type="hidden" id="activityId">
-
-    <div class="acc open" id="accBasic">
-      <div class="acc-head" onclick="toggleAcc('accBasic')">
-        <div class="acc-title">基本信息</div>
-        <div class="acc-sum" id="accBasicSum"></div>
-        <span class="acc-arrow">▾</span>
-      </div>
-      <div class="acc-body">
-        <div class="fg">
-          <label>活动名称</label>
-          <input type="text" id="activityName" placeholder="例如：周进步奖励" maxlength="20" autocomplete="off">
-        </div>
-        <div class="fg-row">
-          <div class="fg">
-            <label>周期 <span class="h">积分按周期独立统计，历史累计不参与</span></label>
-            <select id="activityPeriod" onchange="activityPeriodChanged()">
-              <option value="day">每天</option>
-              <option value="week" selected>每周</option>
-              <option value="month">每月</option>
-            </select>
-          </div>
-          <div class="fg" id="activityAnchorFg">
-            <label>周起始日</label>
-            <select id="activityAnchor" onchange="updateCondPreview()">
-              <option value="1">周一</option><option value="2">周二</option><option value="3">周三</option>
-              <option value="4">周四</option><option value="5">周五</option><option value="6">周六</option><option value="7">周日</option>
-            </select>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div class="acc" id="accCond">
-      <div class="acc-head" onclick="toggleAcc('accCond')">
-        <div class="acc-title">前提条件</div>
-        <div class="acc-sum" id="accCondSum"></div>
-        <span class="acc-arrow">▾</span>
-      </div>
-      <div class="acc-body">
-        <div class="fg">
-          <label>满足方式 <span class="h">作用于最外层；条件组内部可单独设定「全部/任意」</span></label>
-          <select id="activityCondMode" onchange="onCondModeChange()">
-            <option value="all">全部满足（且）</option>
-            <option value="any">任一满足（或）</option>
-          </select>
-        </div>
-        <div class="fg">
-          <label>前提条件 <span class="h">点击芯片逐项编辑；可用条件组嵌套，最多两层</span></label>
-          <div id="activityCondItems"></div>
-          <div class="cond-actions" style="margin-top:6px">
-            <button class="btn btn-sm" onclick="addCondItem('')">+ 添加条件</button>
-            <button class="btn btn-sm" onclick="addCondGroup('')">+ 添加条件组</button>
-          </div>
-          <div class="cond-preview" id="condPreview"></div>
-        </div>
-      </div>
-    </div>
-
-    <div class="acc" id="accResult">
-      <div class="acc-head" onclick="toggleAcc('accResult')">
-        <div class="acc-title">结果动作</div>
-        <div class="acc-sum" id="accResultSum"></div>
-        <span class="acc-arrow">▾</span>
-      </div>
-      <div class="acc-body">
-        <div class="fg">
-          <label>动作项 <span class="h">奖励类发放资产；归档类按不活跃天数修改实体状态</span></label>
-          <div id="activityResultDetails"></div>
-          <button class="btn btn-sm" style="margin-top:4px" onclick="addRewardRow()">+ 添加动作项</button>
-        </div>
-      </div>
-    </div>
-
-    <div class="modal-foot" style="flex-wrap:wrap">
-      <button class="btn" onclick="closeModal('activityModal')">取消</button>
-      <button class="btn btn-danger" id="activityDeleteBtn" style="display:none;flex:0 0 auto" onclick="askDelActivityFromModal()">删除活动</button>
-      <button class="btn" id="activitySaveBtn">保存</button>
-    </div>
-  </div>
-</div>
-
-<!-- ===== Activity Delete Modal ===== -->
-<div class="modal-bg" id="activityDeleteModal">
-  <div class="modal">
-    <h2>删除周期活动</h2>
-    <p style="font-size:13px;color:var(--text-2);line-height:1.7;margin-bottom:18px" id="activityDeleteMsg"></p>
-    <div style="display:flex;flex-direction:column;gap:10px">
-      <button class="btn" onclick="doDeleteActivity(false)">删除并保留历史获得</button>
-      <button class="btn btn-danger" onclick="doDeleteActivity(true)">删除并撤销历史获得</button>
-      <button class="btn" onclick="closeModal('activityDeleteModal')">取消</button>
-    </div>
-  </div>
-</div>
-
 <!-- ===== Domain Change Modal ===== -->
 <div class="modal-bg" id="domainChangeModal">
   <div class="modal">
@@ -950,6 +827,34 @@
     </div>
     <div class="fg"><label>价格 <span class="h">支持小数；有资产定价时可填 0</span></label><input type="number" id="prodPrice" value="10" min="0" step="0.1"></div>
     <div class="fg">
+      <label>商品类型 <span class="h">执行权 = 买到的不是东西，而是某条动作流发生一次</span></label>
+      <select id="prodKind" onchange="onProdKindChange()">
+        <option value="normal">普通商品（扣费 / 赠送）</option>
+        <option value="exec">执行权（购买时在同一事务内执行一次动作流）</option>
+      </select>
+    </div>
+    <div id="prodExecBox" style="display:none">
+      <div class="fg">
+        <label>兑换动作流 <span class="h">只列已启用的周期 / 手动动作流</span></label>
+        <select id="prodExecFlow" onchange="onProdKindChange()"></select>
+      </div>
+      <div class="fg-row">
+        <div class="fg"><label>每周期最多购买</label><input type="number" id="prodExecMax" value="1" min="1" max="10" step="1"></div>
+        <div class="fg">
+          <label>周期口径</label>
+          <select id="prodExecPeriod">
+            <option value="day">每天</option>
+            <option value="week" selected>每周（周一起）</option>
+            <option value="month">每月</option>
+          </select>
+        </div>
+      </div>
+      <div class="fg">
+        <label>买一次会发生什么 <span class="h">付款与执行同生共死，执行失败整单退回</span></label>
+        <div id="prodExecPreview" class="cond-preview"></div>
+      </div>
+    </div>
+    <div class="fg">
       <label>资产定价 <span class="h">选填：额外消耗自定义资产；有资产定价时禁用贷款与现实预算</span></label>
       <div style="display:flex;gap:6px">
         <select id="prodAssetPriceId" style="flex:1" onchange="onProdAssetPriceChange()"></select>
@@ -1011,7 +916,7 @@
         </select>
       </div>
       <div class="fg" id="budgetCatAnchorWrap">
-        <label>周起始日 <span class="h">与周期活动的周界一致</span></label>
+        <label>周起始日 <span class="h">与动作流的周界一致</span></label>
         <select id="budgetCatAnchor">
           <option value="1">周一</option>
           <option value="2">周二</option>

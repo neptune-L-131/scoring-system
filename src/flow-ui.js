@@ -6,11 +6,10 @@
 // 3. 保存只落配置，绝不执行；执行必须由用户显式点击并二次确认；
 // 4. 试跑复用 FlowEngine.dryRun，撤销复用 FlowEngine.undoFlowRun，不另造账务语义。
 import {
-  FLOW_ATOM_IDLE_DAYS_MAX, FLOW_ATOM_MAX_ASSET, FLOW_ATOM_MAX_CURRENCY,
-  FLOW_ATOM_NOTE_MAX_LEN, FLOW_MAX_DEPTH, FLOW_MAX_STEPS, FLOW_RUN_KEEP,
+  FLOW_ATOM_CREATE_NAME_MAX, FLOW_ATOM_IDLE_DAYS_MAX, FLOW_ATOM_MAX_ASSET, FLOW_ATOM_MAX_CREATE,
+  FLOW_ATOM_MAX_CURRENCY, FLOW_ATOM_NOTE_MAX_LEN, FLOW_MAX_DEPTH, FLOW_MAX_STEPS, FLOW_RUN_KEEP,
   FLOW_VERSION, LOG_MAX,
 } from './constants.js';
-import { deleteMigratedFlow } from './activity-migrate.js';
 import { FLOW_ATOMS, FLOW_ATOM_IDS, assetPeriodKeyOf, describeFlowAtom } from './flow-atoms.js';
 import { FlowEngine, FLOW_REVERSERS } from './flow-engine.js';
 import { normalizeCondition } from './cond-model.js';
@@ -20,7 +19,7 @@ import { EVENT_KINDS } from './events.js';
 import { closeModal, openModal } from './modal-host.js';
 import { normalizeFlow } from './normalize.js';
 import { save } from './persist.js';
-import { cardName, esc, escAttr, fmt, isPointMetric, now, uid } from './pure.js';
+import { esc, escAttr, fmt, isPointMetric, now, uid } from './pure.js';
 import { registerRenderer, render } from './render.js';
 import { state } from './state.js';
 import { accountLabel } from './stats.js';
@@ -147,6 +146,10 @@ function defaultParams(atom) {
   if (atom === 'currency.grant' || atom === 'currency.spend') return { account: 'vitality', amount: '1', desc: '' };
   if (atom === 'asset.grant' || atom === 'asset.spend') return { assetId: firstUsableAssetId(), amount: '1', desc: '' };
   if (atom === 'entity.archiveIdle') return { kind: 'task', idleDays: '30', desc: '' };
+  if (atom === 'entity.create') {
+    const d = (state.domains || []).find(function (x) { return x && x.id; });
+    return { kind: 'task', name: '按模板创建', domainId: d ? d.id : '', amount: '0', count: '1' };
+  }
   if (atom === 'log.note') return { desc: '' };
   return {};
 }
@@ -291,6 +294,30 @@ function validateStepParams(atom, params, id) {
     }
     return null;
   }
+  if (atom === 'entity.create') {
+    if (['task', 'affair', 'chore'].indexOf(p.kind) < 0) return fail('FLOW_BAD_PARAMS', '步骤「' + id + '」的创建类型只能是任务/项目/杂事');
+    const name = String(p.name === undefined || p.name === null ? '' : p.name).trim();
+    if (!name) return fail('FLOW_BAD_PARAMS', '步骤「' + id + '」请填写事项名称');
+    if (name.length > FLOW_ATOM_CREATE_NAME_MAX) return fail('FLOW_NAME_TOO_LONG', '步骤「' + id + '」的事项名称最多 ' + FLOW_ATOM_CREATE_NAME_MAX + ' 个字符');
+    const count = (p.count === undefined || p.count === null || String(p.count).trim() === '') ? 1 : Number(p.count);
+    if (!Number.isInteger(count) || count < 1 || count > FLOW_ATOM_MAX_CREATE) {
+      return fail('FLOW_CREATE_LIMIT', '步骤「' + id + '」单次创建数量必须是 1–' + FLOW_ATOM_MAX_CREATE + ' 的整数');
+    }
+    if (p.kind !== 'chore') {
+      if (!p.domainId) return fail('FLOW_BAD_PARAMS', '步骤「' + id + '」请选择所属领域');
+      if (!(state.domains || []).some(function (d) { return d && d.id === p.domainId; })) {
+        return fail('FLOW_INVALID_ACCOUNT', '步骤「' + id + '」的所属领域不存在');
+      }
+      const amt = Number(p.amount === undefined || String(p.amount).trim() === '' ? 0 : p.amount);
+      if (!isFinite(amt) || amt < 0) return fail('FLOW_INVALID_AMOUNT', '步骤「' + id + '」的数值必须是非负数');
+      if (Math.abs(amt * 100 - Math.round(amt * 100)) > 1e-6) return fail('FLOW_INVALID_AMOUNT', '步骤「' + id + '」的数值最多两位小数');
+      if (amt > FLOW_ATOM_MAX_CURRENCY) return fail('FLOW_AMOUNT_LIMIT', '步骤「' + id + '」的数值不能超过 ' + FLOW_ATOM_MAX_CURRENCY);
+      if (p.kind === 'affair' && amt <= 0) return fail('FLOW_INVALID_AMOUNT', '步骤「' + id + '」的项目奖励必须大于 0');
+    } else if (p.domainId || (p.amount !== undefined && String(p.amount).trim() !== '')) {
+      return fail('FLOW_BAD_PARAMS', '步骤「' + id + '」杂事不接受领域或数值');
+    }
+    return null;
+  }
   if (atom === 'log.note') {
     const desc = String(p.desc || '').trim();
     if (!desc) return fail('FLOW_BAD_PARAMS', '步骤「' + id + '」请填写记录内容');
@@ -426,7 +453,7 @@ export function sanitizeFlowSteps(list) {
     const src = (s && s.params) || {};
     const params = {};
     allowed.forEach(function (k) {
-      if (k === 'amount' || k === 'idleDays' || k === 'cap') {
+      if (k === 'amount' || k === 'idleDays' || k === 'cap' || k === 'count') {
         // 未填写的数值型参数直接省略：Number('') === 0 会把可选参数写成 0
         const raw = src[k];
         if (raw === undefined || raw === null || String(raw).trim() === '') return;
@@ -487,7 +514,6 @@ function buildCandidate() {
     condition: normalizeCondition(flowDraft.condition),
     settleWhenConditionFalse: flowDraft.settleWhenConditionFalse === true,
     editorMode: (existing ? existing.editorMode : flowDraft.editorMode) === 'simple' ? 'simple' : 'advanced',
-    migratedFromActivity: existing ? existing.migratedFromActivity : (flowDraft.migratedFromActivity || ''),
     limits: existing ? existing.limits : {},
     steps: sanitizeFlowSteps(flowDraft.steps),
     lastRun: existing ? existing.lastRun : null,
@@ -583,6 +609,23 @@ function paramsHTML(atom, params, path) {
   if (atom === 'log.note') {
     return '<label>记录内容<input type="text" maxlength="' + FLOW_ATOM_NOTE_MAX_LEN + '" value="' + escAttr(p.desc || '') + '" onchange="flowStepParamChanged(\'' + path + '\',\'desc\',this.value)"></label>';
   }
+  if (atom === 'entity.create') {
+    const kinds = [{ id: 'task', name: '任务' }, { id: 'affair', name: '项目' }, { id: 'chore', name: '杂事' }];
+    const kind = p.kind === 'affair' || p.kind === 'chore' ? p.kind : 'task';
+    const doms = (state.domains || []).filter(function (d) { return d && d.id; })
+      .map(function (d) { return { id: d.id, name: d.name || d.id }; });
+    const amountLabel = kind === 'affair' ? '项目奖励（进度点）' : '活力成本';
+    const amountTip = kind === 'affair' ? '大于 0，最多两位小数' : '0–' + FLOW_ATOM_MAX_CURRENCY + '，最多两位小数';
+    return '<label>类型<select onchange="flowStepParamChanged(\'' + path + '\',\'kind\',this.value)">' +
+      optionsHTML(kinds, kind, true) + '</select></label>' +
+      '<label>名称<input type="text" maxlength="' + FLOW_ATOM_CREATE_NAME_MAX + '" value="' + escAttr(p.name || '') + '" onchange="flowStepParamChanged(\'' + path + '\',\'name\',this.value)"></label>' +
+      (kind !== 'chore'
+        ? '<label>所属领域<select onchange="flowStepParamChanged(\'' + path + '\',\'domainId\',this.value)">' +
+          optionsHTML(doms, p.domainId || (doms[0] ? doms[0].id : ''), true) + '</select></label>' +
+          '<label>' + amountLabel + ' <span class="h">' + amountTip + '</span><input type="number" min="0" max="' + FLOW_ATOM_MAX_CURRENCY + '" step="0.01" value="' + escAttr(p.amount === undefined ? '0' : p.amount) + '" onchange="flowStepParamChanged(\'' + path + '\',\'amount\',this.value)"></label>'
+        : '<div class="flow-step-none">杂事只创建名称，不带进度与领域</div>') +
+      '<label>数量<input type="number" min="1" max="' + FLOW_ATOM_MAX_CREATE + '" step="1" value="' + escAttr(p.count === undefined ? '1' : p.count) + '" onchange="flowStepParamChanged(\'' + path + '\',\'count\',this.value)"></label>';
+  }
   return '<div class="flow-step-none">此原子无需参数</div>';
 }
 function stepHeadHTML(label, path, extra) {
@@ -669,9 +712,6 @@ function flowCardHTML(flow) {
   const eventFlow = !!(flow.trigger && flow.trigger.type === 'event');
   const onNote = eventFlow ? '打卡/购买成功提交后自动执行一次；每次运行都可在下方整单撤销。' : '到点会自动执行；每次运行都可在下方整单撤销。';
   const offNote = eventFlow ? '已停用：打卡/购买后不会执行；开启后才生效。' : '已停用：不会自动执行；新建的流默认停用，启用后才按周期运行。';
-  const deleteBtn = flow.migratedFromActivity
-    ? '<button class="btn btn-sm btn-danger" onclick="deleteMigratedFlowConfig(\'' + attrId(flow.id) + '\')">删除</button>'
-    : '';
   const steps = (flow.steps || []).map(function (s, i) {
     return '<div class="flow-step-line"><span class="flow-step-idx">' + (i + 1) + '</span>' + esc(stepSummary(s)) + '</div>';
   }).join('') || '<div class="flow-step-none">还没有步骤</div>';
@@ -681,7 +721,6 @@ function flowCardHTML(flow) {
     '<button class="btn btn-sm" onclick="openFlowModal(\'' + attrId(flow.id) + '\')">编辑</button>' +
     '<button class="btn btn-sm" onclick="dryRunFlow(\'' + attrId(flow.id) + '\')">试跑</button>' +
     '<button class="btn btn-sm btn-primary" onclick="executeFlow(\'' + attrId(flow.id) + '\')"' + (enabled && !eventFlow ? '' : ' disabled') + (eventFlow ? ' title="事件触发流不能手动执行"' : '') + '>立即执行</button>' +
-    deleteBtn +
     '<label class="flow-switch" title="' + (eventFlow ? '启用后打卡/购买提交时会自动执行' : '启用后才会按周期自动执行') + '"><input type="checkbox"' + (enabled ? ' checked' : '') + ' onchange="toggleFlowEnabled(\'' + attrId(flow.id) + '\')"><span></span></label>' +
     '</div></div>' +
     '<div class="flow-meta">' + esc(flowTriggerText(flow)) + ' · 条件：' + esc(flowCondSummary(flow)) + ' · ' + countSteps(flow.steps) + ' 个步骤</div>' +
@@ -763,6 +802,8 @@ function runStepLine(s) {
 export function flowUndoBlockReason(rec) {
   if (!rec) return UNDO_TEXT.NOT_FOUND;
   if (rec.status === 'reversed') return UNDO_TEXT.ALREADY;
+  // 购买执行权产生的运行必须随购买单整单撤销，不允许单独回滚（避免“钱付了、效果没了”）
+  if (rec.trigger === 'purchase') return '该运行由商品购买产生，请在对应购买记录上整单撤销';
   const journal = rec.journal;
   if (!journal || !journal.v) return UNDO_TEXT.NO_JOURNAL;
   const logById = {};
@@ -772,6 +813,24 @@ export function flowUndoBlockReason(rec) {
   if (missing || (rec.journalLogId && !logById[rec.journalLogId])) return UNDO_TEXT.LOG_TRIMMED;
   const noRev = (journal.steps || []).some(function (s) { return s && s.kind !== 'branch' && !FLOW_REVERSERS[s.atom]; });
   if (noRev) return UNDO_TEXT.NO_REVERSER;
+  // 动作流创建的事项：必须仍存在且未被使用，否则撤销会留下统计残差
+  const createBad = (journal.steps || []).some(function (s) {
+    if (!s || s.kind === 'branch' || s.atom !== 'entity.create') return false;
+    const kind = (s.input && s.input.kind) || 'task';
+    const list = kind === 'affair' ? state.affairs : (kind === 'chore' ? state.chores : state.tasks);
+    const ids = (s.output && s.output.ids) || [];
+    return ids.some(function (id) {
+      const e = (list || []).find(function (x) { return x && x.id === id; });
+      if (!e || e.archived) return true;
+      if (kind === 'task') return Number(e.checkInCount) > 0 || !!e.lastCheckIn;
+      if (kind === 'affair') {
+        return Number(e.currentCell) > 0 || Number(e.alreadyGiven) > 0 || !!e.doneAt || !!e.startedAt ||
+          (Array.isArray(e.steps) && e.steps.length > 0);
+      }
+      return !!e.done || !!e.settled;
+    });
+  });
+  if (createBad) return '创建的事项已被使用或删除，无法撤销';
   const defs = Array.isArray(state.assetDefs) ? state.assetDefs : [];
   for (let i = 0; i < (journal.assets || []).length; i += 1) {
     const a = journal.assets[i];
@@ -805,7 +864,9 @@ function runCardHTML(rec) {
   if (!rec) return '';
   const reversed = rec.status === 'reversed';
   const tag = reversed ? '<span class="flow-tag off">已撤销</span>' : '<span class="flow-tag on">可撤销</span>';
-  const trig = rec.trigger === 'manual' ? '手动' : (rec.trigger === 'event' ? '事件' : '周期');
+  const trig = rec.trigger === 'manual' ? '手动'
+    : rec.trigger === 'event' ? '事件'
+      : rec.trigger === 'purchase' ? '购买执行' : '周期';
   const journal = rec.journal;
   const steps = journal && Array.isArray(journal.steps) ? journal.steps.map(runStepLine).join('') : '<div class="flow-step-none">没有可展示的步骤明细</div>';
   const accounts = journal && Array.isArray(journal.accounts) ? journal.accounts : [];
@@ -952,7 +1013,6 @@ export function openFlowModal(flowId) {
       condition: { mode: 'all', items: [] },
       settleWhenConditionFalse: false,
       editorMode: 'advanced',
-      migratedFromActivity: '',
       limits: {},
       steps: [],
     };
@@ -1008,21 +1068,6 @@ export function flowSwitchToAdvanced() {
   flowDraft.editorMode = 'advanced';
   renderFlowEditorMode();
   toast('已切换到高级编辑；保存后生效');
-}
-export function deleteMigratedFlowConfig(flowId) {
-  const flow = findFlow(flowId);
-  if (!flow) { toast('动作流不存在或已被删除', 'err'); return; }
-  if (typeof confirm === 'function' && !confirm('删除动作流「' + (flow.name || flow.id) + '」？\n旧周期活动会保持停用，可重新迁移。')) return;
-  const r = deleteMigratedFlow(flowId);
-  if (!r.ok) {
-    if (r.code === 'FLOW_HAS_RUNS') toast('该动作流已有运行记录，无法删除', 'err');
-    else if (r.code === 'FLOW_NOT_MIGRATED') toast('只能删除由周期活动迁移生成的流', 'err');
-    else toast('删除失败：' + (r.code || '未知原因'), 'err');
-    return;
-  }
-  save();
-  renderAfterChange();
-  toast('已删除迁移动作流；旧活动保持停用，可重新迁移');
 }
 export function handleFlowSave() {
   if (!flowDraft) return fail('FLOW_NO_DRAFT', '请先打开动作流编辑器');
@@ -1100,6 +1145,26 @@ export function flowStepSplitChanged(path, value) {
 export function flowStepParamChanged(path, key, value) {
   const step = stepAt(path);
   if (!step) return;
+  // 创建事项：类型切换会改变可用字段，需要重绘参数区
+  if (step.atom === 'entity.create' && key === 'kind') {
+    if (!step.params || typeof step.params !== 'object') step.params = {};
+    step.params.kind = value;
+    if (value === 'chore') {
+      delete step.params.domainId;
+      delete step.params.amount;
+    } else {
+      if (!step.params.domainId) {
+        const d = (state.domains || []).find(function (x) { return x && x.id; });
+        if (d) step.params.domainId = d.id;
+      }
+      if (step.params.amount === undefined || String(step.params.amount).trim() === '') {
+        step.params.amount = value === 'affair' ? '1' : '0';
+      }
+      if (value === 'affair' && Number(step.params.amount) <= 0) step.params.amount = '1';
+    }
+    renderFlowSteps();
+    return;
+  }
   if (step.kind === 'branch') {
     if (!step.when || !Array.isArray(step.when.items) || !step.when.items.length) step.when = { mode: 'all', items: [defaultBranchLeaf()] };
     const leaf = step.when.items[0];

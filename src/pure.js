@@ -1,4 +1,4 @@
-import { AFFAIR_CURVES, COND_AFFAIR_METRICS, COND_CHORE_METRICS, COND_GATE_METRICS, COND_POINT_METRICS, STAGE_NAMES, WEEK_ANCHOR_NAMES } from './constants.js';
+import { AFFAIR_CURVES, ASSET_LOG_CATS, ASSET_LOG_CAT_NAMES, COND_AFFAIR_METRICS, COND_ASSET_METRICS, COND_CHORE_METRICS, COND_GATE_METRICS, COND_POINT_METRICS, STAGE_NAMES, WEEK_ANCHOR_NAMES } from './constants.js';
 import * as time from './time.js';
 // pure.js —— 纯函数底层（不读写全局 state、不调用 Ledger、import 时无副作用）
 // 由 utils/state/business/conditions/normalize/budget/render-work 抽离（第六轮循环依赖治理），实现逐字未改。
@@ -189,10 +189,24 @@ function condWindowByRange(range,act,ts,days){
   if(act&&act._periodRange)return act._periodRange;
   return prevPeriodRange(act,ts);
 }
-function cardName(c){return c==='exemption'?'断更豁免卡':(c||'卡');}
 function validRange(r){return r==='period'||r==='total'||r==='recent'||r==='today';}
 function normOp(op){return ['>','<','<=','>='].indexOf(op)>=0?op:'>=';}
 function isPointMetric(m){return COND_POINT_METRICS.indexOf(m)>=0;}
+// 资产类指标：主体是「某一份资产」；asset_hold 是事件时刻即确定的点态值
+function isAssetMetric(m){return COND_ASSET_METRICS.indexOf(m)>=0;}
+function isAssetHoldMetric(m){return m==='asset_hold';}
+function validAssetCat(c){return ASSET_LOG_CATS.indexOf(c)>=0;}
+function assetCatName(c){return ASSET_LOG_CAT_NAMES[c]||'未知';}
+// 资产流水三要素的读取口径：缺字段一律显示「未知」，不改写旧流水
+function assetLogMeta(l){
+  const rec=(l&&typeof l==='object')?l:{};
+  return {
+    cat:validAssetCat(rec.assetCat)?rec.assetCat:'',
+    catName:assetCatName(rec.assetCat),
+    from:rec.assetFrom?String(rec.assetFrom):'未知',
+    to:rec.assetTo?String(rec.assetTo):'未知'
+  };
+}
 function isAffairMetric(m){return COND_AFFAIR_METRICS.indexOf(m)>=0;}
 function isChoreMetric(m){return COND_CHORE_METRICS.indexOf(m)>=0;}
 function isStage1Metric(m){return isAffairMetric(m)||isChoreMetric(m)||m==='task_idle';}
@@ -246,7 +260,7 @@ function migrateAffair(a){
 }
 
 
-export { uid, fmt, now, daysSince, effectiveLastTs, taskCheckedToday, fmtTime, esc, escAttr, clone, splitCents, logHasType, taskScoreTypes, taskHasType, getTaskDomainIds, round2, logAmt, stageRewards, taskIsStaged, stageValues, stageSel, stageValueAt, stageCellLabel, stageNetAt, calcCheckIn, calcSkip, dayKey, weekStartKey, weekStartTs, periodKey, dayStartTs, prevPeriodRange, condWindowByRange, cardName, validRange, normOp, isPointMetric, isAffairMetric, isChoreMetric, isStage1Metric, isGateMetric, toNum, toTs, asArray, defaultWatermark, dateKeyOffset, budgetBounds, weekAnchorName, round4, affairSteps, affairTotalSteps, affairDoneSteps, affairLastAdvance, affairCurve, affairCurveType, affairTargetAt, affairIsDone, migrateAffair };
+export { uid, fmt, now, daysSince, effectiveLastTs, taskCheckedToday, fmtTime, esc, escAttr, clone, splitCents, logHasType, taskScoreTypes, taskHasType, getTaskDomainIds, round2, logAmt, stageRewards, taskIsStaged, stageValues, stageSel, stageValueAt, stageCellLabel, stageNetAt, calcCheckIn, calcSkip, dayKey, weekStartKey, weekStartTs, periodKey, dayStartTs, prevPeriodRange, condWindowByRange, validRange, normOp, isPointMetric, isAssetMetric, isAssetHoldMetric, validAssetCat, assetCatName, assetLogMeta, isAffairMetric, isChoreMetric, isStage1Metric, isGateMetric, toNum, toTs, asArray, defaultWatermark, dateKeyOffset, budgetBounds, weekAnchorName, round4, affairSteps, affairTotalSteps, affairDoneSteps, affairLastAdvance, affairCurve, affairCurveType, affairTargetAt, affairIsDone, migrateAffair };
 
 function idleDaysSince(baseTs,refTs){
   if(!baseTs)return null;

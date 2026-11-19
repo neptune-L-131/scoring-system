@@ -135,9 +135,6 @@ const NON_CHORE_IDS = [
   // budget 页
   'budgetAnchorNotice', 'bPeriod', 'bPeriodSub', 'budgetCategories',
   'budgetLedgerMeta', 'budgetLedgerList', 'budgetRuleList', 'budgetCatDefaultDomain',
-  // cycle / exempt
-  'cyCardBal', 'cyCardSub', 'cyGranted', 'cyGrantedSub', 'cyNext', 'cyNextSub',
-  'cycleActivities', 'exemptChip',
 ];
 
 function nonChoreSnapshot() {

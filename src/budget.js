@@ -3,7 +3,7 @@ import { registerPointMetricProvider } from './cond-eval.js';
 import { BUDGET_LEDGER_MAX, BUDGET_PERIOD_KEEP, BUDGET_TARGET_NAMES } from './constants.js';
 import { newExtState, defaultBudgetSettings, defaultBudgetsState } from './defaults.js';
 import { Ledger } from './ledger.js';
-import { dayKey, periodKey, fmt, now, uid, budgetBounds, round4 } from './pure.js';
+import { periodKey, fmt, now, uid, budgetBounds, round4 } from './pure.js';
 import { state } from './state.js';
 import { domainName } from './utils.js';
 // budget.js —— 现实预算规则引擎（BudgetEngine）

@@ -4,7 +4,7 @@ const R = {};
 function registerRenderer(name, fn) { R[name] = fn; }
 function getRenderer(name) { return R[name] || null; }
 // 顺序即原 render() 的调用顺序，不可随意调整
-const ORDER = ['work', 'bank', 'shop', 'budget', 'cycle', 'exempt', 'stageBars', 'affairAxes', 'flow'];
+const ORDER = ['work', 'bank', 'shop', 'budget', 'stageBars', 'affairAxes', 'flow'];
 function render() {
   for (const n of ORDER) {
     const f = R[n];

@@ -4,9 +4,10 @@ import { budgetBindingHTML, budgetBindingModeChange, readBudgetBinding } from '.
 import { gateConditionOf, normalizeCondition } from './cond-model.js';
 import { condDraft, renderCondTree, setCondDraft, setCondDraftContext } from './cond-ui.js';
 import { evalNode } from './conditions.js';
-import { COND_METRIC_KEYS, STAGE_NAMES } from './constants.js';
+import { COND_METRIC_KEYS, PRODUCT_EXEC_MAX_PER_PERIOD, STAGE_NAMES } from './constants.js';
 import { defaultProductGate } from './defaults.js';
 import { gateFailReasons, validProductTier } from './gate.js';
+import { describeFlowAtom } from './flow-atoms.js';
 import { delAch, delProd, delTask, fillShopCatSelect, pendingTaskSave, productGateContext, saveAchData, saveProdData, saveTaskData } from './library.js';
 import { normalizeProductGate } from './normalize.js';
 import { round4, round2, stageRewards, taskIsStaged, esc, escAttr, fmt, getTaskDomainIds, taskScoreTypes } from './pure.js';
@@ -491,6 +492,52 @@ function onProdAssetPriceChange(){
   onProdBudgetChange();
 }
 
+// 执行权：可选“已启用的周期/手动动作流”（事件触发流会与购买事件重复执行，不允许绑定）
+function execFlowChoices(){
+  return (state.flows||[]).filter(function(f){
+    return f&&f.id&&f.enabled!==false&&!f.invalid&&!(f.trigger&&f.trigger.type==='event');
+  });
+}
+function fillProdExecFlowSelect(selected){
+  const sel=document.getElementById('prodExecFlow');
+  if(!sel)return;
+  const list=execFlowChoices();
+  sel.innerHTML='<option value="">请选择动作流</option>'+list.map(function(f){
+    return '<option value="'+escAttr(f.id)+'"'+(f.id===selected?' selected':'')+'>'+esc(f.name||f.id)+'</option>';
+  }).join('');
+  sel.value=list.some(function(f){return f.id===selected;})?selected:'';
+}
+function execPreviewHTML(flow){
+  if(!flow)return '<div class="flow-note">选择动作流后，这里会说明「买一次会发生什么」。</div>';
+  const lines=[];
+  function walk(list){
+    (list||[]).forEach(function(s){
+      if(!s)return;
+      if(s.kind==='branch'){
+        lines.push('<div class="flow-run-step"><span class="flow-step-idx">分支</span>条件分支 · 满足/否则各走一侧</div>');
+        walk(s.then);
+        walk(s.else);
+      }else{
+        lines.push('<div class="flow-run-step"><span class="flow-step-idx">'+(lines.length+1)+'</span>'+
+          esc(describeFlowAtom(s.atom,s.params||{}))+'</div>');
+      }
+    });
+  }
+  walk(flow.steps);
+  if(!lines.length)return '<div class="flow-note">该动作流没有步骤，购买后不会产生效果。</div>';
+  return '<div class="flow-col-title">买一次会发生什么</div>'+lines.join('');
+}
+function onProdKindChange(){
+  const sel=document.getElementById('prodKind');
+  const kind=sel?sel.value:'normal';
+  const box=document.getElementById('prodExecBox');
+  if(box)box.style.display=kind==='exec'?'block':'none';
+  const flowSel=document.getElementById('prodExecFlow');
+  const flow=flowSel&&flowSel.value?(state.flows||[]).find(function(f){return f&&f.id===flowSel.value;}):null;
+  const pv=document.getElementById('prodExecPreview');
+  if(pv)pv.innerHTML=execPreviewHTML(flow);
+}
+
 function openProdModal(id,presetCatId){
   const title=document.getElementById('prodModalTitle');
   document.getElementById('prodId').value='';
@@ -536,6 +583,12 @@ function openProdModal(id,presetCatId){
     document.getElementById('prodGrantCurrencyAmt').value=0;
     fillProdAssetSelects('','');
   }
+  const curExec=id?((state.products.find(x=>x.id===id)||{}).exec||null):null;
+  fillProdExecFlowSelect(curExec?curExec.flowId:'');
+  document.getElementById('prodKind').value=curExec?'exec':'normal';
+  document.getElementById('prodExecMax').value=curExec?curExec.maxPerPeriod:1;
+  document.getElementById('prodExecPeriod').value=curExec?curExec.period:'week';
+  onProdKindChange();
   renderProdGateEditor(gate,validProductTier(document.getElementById('prodTier').value));
   onProdBudgetChange();
   onProdAssetPriceChange();
@@ -634,7 +687,25 @@ function handleProdSave(){
     toast('赠送资产不能覆盖资产定价本身（会形成自循环）','err');return;
   }
 
-  saveProdData({id:id||null,name:name,desc:desc,price:priceRaw,stock:stock,debtRate:debtRate,categoryId:categoryId,tier:tier,gate:gate,budget:budget,assetPrice:assetPrice,grants:grants});
+  // 执行权：绑定一条可用的动作流，并限定每周期购买次数
+  let exec=null;
+  const kindSel=document.getElementById('prodKind');
+  if(kindSel&&kindSel.value==='exec'){
+    const flowId=document.getElementById('prodExecFlow').value;
+    const flow=(state.flows||[]).find(function(f){return f&&f.id===flowId;});
+    if(!flow){toast('请选择要兑换的动作流','err');return}
+    if(flow.enabled===false||flow.invalid){toast('该动作流已停用或无效，请重新选择','err');return}
+    if(flow.trigger&&flow.trigger.type==='event'){toast('事件触发流不能作为执行权（会与购买事件重复执行）','err');return}
+    const max=parseInt(document.getElementById('prodExecMax').value,10);
+    if(isNaN(max)||max<1||max>PRODUCT_EXEC_MAX_PER_PERIOD){
+      toast('每周期最多购买次数需为 1–'+PRODUCT_EXEC_MAX_PER_PERIOD,'err');return;
+    }
+    const period=document.getElementById('prodExecPeriod').value;
+    if(['day','week','month'].indexOf(period)<0){toast('周期不合法','err');return}
+    if(!hasAssetPrice&&!(priceRaw>=0.1)){toast('执行权商品需要货币或资产定价','err');return}
+    exec={flowId:flowId,maxPerPeriod:max,period:period};
+  }
+  saveProdData({id:id||null,name:name,desc:desc,price:priceRaw,stock:stock,debtRate:debtRate,categoryId:categoryId,tier:tier,gate:gate,budget:budget,assetPrice:assetPrice,grants:grants,exec:exec});
   closeModal('prodModal');
   toast(id?'商品已更新':'商品已上架');
   render();
@@ -653,4 +724,4 @@ function confirmDelProd(id){
   if(p&&confirm('删除商品「'+p.name+'」？\n（可在银行流水撤销此操作）')){delProd(id);toast('商品已删除');render()}
 }
 
-export { editTypes, editStage, openTaskModal, TASK_SLIDERS, refreshTaskSliders, bindTaskSliders, updateTaskAccSummaries, setTaskAccordion, applyScoreTypePicks, toggleScoreType, onStageEnabled, onStageInput, stageRowHTML, renderStageRows, toggleStageParam, applyStagePreset, runStagePreset, generateStage, genArith, genDecr, handleTaskSave, openAchModal, handleAchSave, onProdGateModeChange, updateProdTierHint, prodGatePreviewFn, validateGateCondition, syncLegacyGateFields, renderProdGateEditor, onProdTierChange, openProdModal, fillProdBudgetSelect, onProdBudgetChange, fillProdAssetSelects, onProdAssetPriceChange, handleProdSave, confirmDelTask, confirmDelAch, confirmDelProd };
+export { editTypes, editStage, openTaskModal, TASK_SLIDERS, refreshTaskSliders, bindTaskSliders, updateTaskAccSummaries, setTaskAccordion, applyScoreTypePicks, toggleScoreType, onStageEnabled, onStageInput, stageRowHTML, renderStageRows, toggleStageParam, applyStagePreset, runStagePreset, generateStage, genArith, genDecr, handleTaskSave, openAchModal, handleAchSave, onProdGateModeChange, updateProdTierHint, prodGatePreviewFn, validateGateCondition, syncLegacyGateFields, renderProdGateEditor, onProdTierChange, openProdModal, fillProdBudgetSelect, onProdBudgetChange, fillProdAssetSelects, onProdAssetPriceChange, onProdKindChange, handleProdSave, confirmDelTask, confirmDelAch, confirmDelProd };

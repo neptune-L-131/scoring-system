@@ -1,4 +1,3 @@
-import { render } from './render.js';
 import { BudgetEngine } from './budget.js';
 import { save } from './persist.js';
 import { esc } from './pure.js';

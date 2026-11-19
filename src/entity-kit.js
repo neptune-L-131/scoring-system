@@ -177,6 +177,7 @@ function entityHistory(ref, opts) {
 
 // 今天该做什么：任务（今日可打卡 / 已打卡）+ 项目日程（今天及逾期）+ 到期杂事
 // 只读汇总，不写 state。opts.ts 仅用于测试注入“今天”。
+// 每条带 bucket 分组口径：overdue（已逾期）/ today（今天到期）/ active（无明确日期但今天该推进）。
 function todayAgenda(opts) {
   const ts = (opts && Number(opts.ts) > 0) ? Number(opts.ts) : now();
   const today = dayStart(ts);
@@ -189,7 +190,8 @@ function todayAgenda(opts) {
     out.push({
       kind: 'task', id: t.id, title: String(t.name || ''),
       subtitle: '', status: checked ? 'done' : 'todo',
-      dueAt: null, overdue: false, domainIds: getTaskDomainIds(t),
+      dueAt: null, overdue: false, bucket: 'active',
+      domainIds: getTaskDomainIds(t),
     });
   });
 
@@ -204,7 +206,7 @@ function todayAgenda(opts) {
         out.push({
           kind: 'affair', id: a.id, title: String(u.step.text || ''),
           subtitle: String(a.name || ''), status: 'todo', stepIndex: u.index,
-          dueAt: u.ts, overdue: u.ts < today,
+          dueAt: u.ts, overdue: u.ts < today, bucket: u.ts < today ? 'overdue' : 'today',
           domainIds: a.domainId ? [a.domainId] : [],
         });
       });
@@ -214,6 +216,7 @@ function todayAgenda(opts) {
       out.push({
         kind: 'affair', id: a.id, title: String(a.name || ''), subtitle: '',
         status: 'todo', stepIndex: -1, dueAt: a.plannedAt, overdue: a.plannedAt < today,
+        bucket: a.plannedAt < today ? 'overdue' : 'today',
         domainIds: a.domainId ? [a.domainId] : [],
       });
     }
@@ -226,7 +229,8 @@ function todayAgenda(opts) {
     if (!overdue && !dueToday) return;
     out.push({
       kind: 'chore', id: c.id, title: String(c.name || ''), subtitle: '',
-      status: 'todo', dueAt: c.plannedAt || null, overdue: overdue, domainIds: [],
+      status: 'todo', dueAt: c.plannedAt || null, overdue: overdue,
+      bucket: overdue ? 'overdue' : 'today', domainIds: [],
     });
   });
 

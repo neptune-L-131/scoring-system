@@ -20,6 +20,11 @@ const FLOW_ATOM_MAX_ARCHIVE=20;
 const FLOW_ATOM_MAX_NOTES=10;
 const FLOW_ATOM_NOTE_MAX_LEN=120;
 const FLOW_ATOM_IDLE_DAYS_MAX=365;
+// 按模板创建事项：单次上限（不允许无上限批量生成）
+const FLOW_ATOM_MAX_CREATE=5;
+const FLOW_ATOM_CREATE_NAME_MAX=30;
+// 执行权商品：每个周期最多可购买的次数上限
+const PRODUCT_EXEC_MAX_PER_PERIOD=10;
 // 阶段 5：事件触发（打卡/购买已在提交后接通；深度与单事件上限为硬约束，不随配置上调）
 const EVENT_KEEP=50;
 const EVENT_MAX_FLOWS_PER_EVENT=20;
@@ -52,13 +57,19 @@ const AFFAIR_CURVES={
   earlyHeavy:[20,36,50,62,72,80,86,91,95,100],
   allAtEnd:[0,0,0,0,0,0,0,0,0,100]
 };
-const AFFAIR_CURVE_NAMES={even:'平均',lateHeavy:'后重',earlyHeavy:'前重',allAtEnd:'全押后',custom:'自定义'};
 const COND_METRIC_KEYS=['checkins','vitality','progress','achievement','new_tasks','new_domains','budget_entry_amount','budget_period_spent','budget_period_overspend','budget_entry_count',
   // 阶段 1：项目 / 杂事 / 任务不活跃
   'affair_completed','affair_steps','affair_stall','affair_progress','affair_achievement',
   'chore_completed','chore_overdue','chore_decay','chore_batches','chore_idle','task_idle',
   // 阶段 3：商品门槛通用条件
-  'lifetime_achievement','domain_activity','milestone_unlocked','checkin_streak','budget_remaining'];
+  'lifetime_achievement','domain_activity','milestone_unlocked','checkin_streak','budget_remaining',
+  // 阶段 6：自定义资产（持有 / 本期发放 / 本期消耗）
+  'asset_hold','asset_issued','asset_spent'];
+// 资产指标：主体固定为「某一份资产」；asset_hold 在事件发生时刻即为确定值，
+// 因此不放进 COND_POINT_METRICS（避免被事件触发的点态指标禁用规则误伤）。
+const COND_ASSET_METRICS=['asset_hold','asset_issued','asset_spent'];
+const ASSET_LOG_CATS=['issue','spend','expire','freeze','unfreeze','adjust'];
+const ASSET_LOG_CAT_NAMES={issue:'发放',spend:'消耗',expire:'过期',freeze:'冻结',unfreeze:'解冻',adjust:'手动调整'};
 const COND_POINT_METRICS=['affair_stall','chore_overdue','chore_idle','task_idle',
   'lifetime_achievement','milestone_unlocked','checkin_streak','budget_remaining'];
 const COND_AFFAIR_METRICS=['affair_completed','affair_steps','affair_stall','affair_progress','affair_achievement'];
@@ -71,4 +82,4 @@ const COND_RANGES=[
   {v:'today',n:'今天'}
 ];
 
-export { KEY, THEME_KEY, SCHEMA_VERSION, ASSET_VERSION, FLOW_VERSION, FLOW_MAX_STEPS, FLOW_MAX_DEPTH, FLOW_RUN_KEEP, FLOW_IDEM_KEEP, FLOW_ATOM_MAX_CURRENCY, FLOW_ATOM_MAX_ASSET, FLOW_ATOM_MAX_ARCHIVE, FLOW_ATOM_MAX_NOTES, FLOW_ATOM_NOTE_MAX_LEN, FLOW_ATOM_IDLE_DAYS_MAX, EVENT_KEEP, EVENT_MAX_FLOWS_PER_EVENT, EVENT_DEPTH_MAX, PROD_TIERS, PROD_TIER_NAMES, ACTIVITY_MAX_DAYS, STATS_VERSION, STATS_KEEP_DAYS, STATS_ENTITY_MAPS, STATS_SCALARS, SHADOW_MAX, ACH_EARN_SOURCES, BUDGET_VERSION, BUDGET_RULE_KINDS, BUDGET_RULE_NAMES, BUDGET_TARGET_NAMES, BUDGET_LEDGER_MAX, BUDGET_PERIOD_KEEP, AUDIT_MAX, STAGE_NAMES, STAGE_PRESET_KEY, BACKUP_KEY, LOG_MAX, LOG_DISPLAY, WEEK_ANCHOR_NAMES, AFFAIR_CURVES, AFFAIR_CURVE_NAMES, COND_METRIC_KEYS, COND_POINT_METRICS, COND_AFFAIR_METRICS, COND_CHORE_METRICS, COND_GATE_METRICS, COND_RANGES };
+export { KEY, THEME_KEY, SCHEMA_VERSION, ASSET_VERSION, FLOW_VERSION, FLOW_MAX_STEPS, FLOW_MAX_DEPTH, FLOW_RUN_KEEP, FLOW_IDEM_KEEP, FLOW_ATOM_MAX_CURRENCY, FLOW_ATOM_MAX_ASSET, FLOW_ATOM_MAX_ARCHIVE, FLOW_ATOM_MAX_NOTES, FLOW_ATOM_NOTE_MAX_LEN, FLOW_ATOM_IDLE_DAYS_MAX, FLOW_ATOM_MAX_CREATE, FLOW_ATOM_CREATE_NAME_MAX, PRODUCT_EXEC_MAX_PER_PERIOD, EVENT_KEEP, EVENT_MAX_FLOWS_PER_EVENT, EVENT_DEPTH_MAX, PROD_TIERS, PROD_TIER_NAMES, ACTIVITY_MAX_DAYS, STATS_VERSION, STATS_KEEP_DAYS, STATS_ENTITY_MAPS, STATS_SCALARS, SHADOW_MAX, ACH_EARN_SOURCES, BUDGET_VERSION, BUDGET_RULE_KINDS, BUDGET_RULE_NAMES, BUDGET_TARGET_NAMES, BUDGET_LEDGER_MAX, BUDGET_PERIOD_KEEP, AUDIT_MAX, STAGE_NAMES, STAGE_PRESET_KEY, BACKUP_KEY, LOG_MAX, LOG_DISPLAY, WEEK_ANCHOR_NAMES, AFFAIR_CURVES, COND_METRIC_KEYS, COND_ASSET_METRICS, ASSET_LOG_CATS, ASSET_LOG_CAT_NAMES, COND_POINT_METRICS, COND_AFFAIR_METRICS, COND_CHORE_METRICS, COND_GATE_METRICS, COND_RANGES };
