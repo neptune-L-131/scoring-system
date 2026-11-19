@@ -1,4 +1,6 @@
 import { AFFAIR_CURVES } from './constants.js';
+import { choreClaimOf } from './affair-steps.js';
+import { choreOrderInsert, choreOrderRemove } from './chore-list.js';
 import { Ledger } from './ledger.js';
 import { commit } from './persist.js';
 import { affairSteps, clone, now, uid } from './pure.js';
@@ -80,6 +82,16 @@ function choreToAffair(id) {
   const c = (state.chores || []).find(function (x) { return x.id === id; });
   if (!c) return { ok: false, reason: '杂事不存在' };
   if (c.archived) return { ok: false, reason: '已归档的杂事不能转为项目' };
+  // B5 三：被项目步骤委派中的杂事不允许转换。转换会删掉这条杂事，
+  // 原项目的步骤引用随之悬空（读档时被守卫静默降级为纯步骤，委派关系无声消失）。
+  // 与项目→杂事的「有损就拒绝」一致：直接拒绝、零写入，由用户先显式解除委派。
+  const claim = choreClaimOf(c.id);
+  if (claim) {
+    return {
+      ok: false,
+      reason: '该杂事正被项目「' + (claim.affairName || '') + '」的步骤委派，请先解除委派再转为项目',
+    };
+  }
   const ts = now();
   const pdids = Array.isArray(c.progressDomainIds) ? c.progressDomainIds.map(String).filter(Boolean) : [];
   const a = {
@@ -105,6 +117,7 @@ function choreToAffair(id) {
   };
   const rec = baseRecord('chore->affair', c.id, clone(c), stashAffairUndo(c.id));
   state.chores = state.chores.filter(function (x) { return x.id !== c.id; });
+  state.choreOrder = choreOrderRemove(state.choreOrder, c.id);
   if (!Array.isArray(state.affairs)) state.affairs = [];
   state.affairs.push(a);
   const ev = writeConvertEvent('杂事「' + c.name + '」转为项目', c.id);
@@ -140,11 +153,13 @@ function affairToChore(id) {
     // 项目的产出走进度轴；转为杂事后不保留“每次完成产出”，只保留领域归属
     progressAmount: 0,
     progressDomainIds: a.domainId ? [a.domainId] : [],
+    tags: [],
   };
   const rec = baseRecord('affair->chore', a.id, clone(a), stashAffairUndo(a.id));
   state.affairs = state.affairs.filter(function (x) { return x.id !== a.id; });
   if (!Array.isArray(state.chores)) state.chores = [];
   state.chores.push(c);
+  state.choreOrder = choreOrderInsert(state.choreOrder, c.id);
   const ev = writeConvertEvent('项目「' + a.name + '」转为杂事', a.id);
   pushRecord(sealRecord(rec));
   commit('已转为杂事「' + a.name + '」');
@@ -191,8 +206,10 @@ function undoConversion() {
     state.affairs = (state.affairs || []).filter(function (x) { return x.id !== rec.entityId; });
     if (!Array.isArray(state.chores)) state.chores = [];
     state.chores.push(clone(rec.snapshot));
+    state.choreOrder = choreOrderInsert(state.choreOrder, rec.entityId);
   } else {
     state.chores = (state.chores || []).filter(function (x) { return x.id !== rec.entityId; });
+    state.choreOrder = choreOrderRemove(state.choreOrder, rec.entityId);
     if (!Array.isArray(state.affairs)) state.affairs = [];
     state.affairs.push(clone(rec.snapshot));
   }

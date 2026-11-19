@@ -110,6 +110,19 @@ function addDays(ts, n) {
   ).getTime();
 }
 
+// 按日历加减月份，保留时分秒；目标月没有该日时钳到当月最后一天（1/31 + 1 月 = 2/28 或 2/29）。
+function addMonths(ts, n) {
+  const d = new Date(asTs(ts));
+  const k = Math.round(Number(n) || 0);
+  const y = d.getFullYear();
+  const m = d.getMonth() + k;
+  const lastDay = new Date(y, m + 1, 0).getDate();
+  return new Date(
+    y, m, Math.min(d.getDate(), lastDay),
+    d.getHours(), d.getMinutes(), d.getSeconds(), d.getMilliseconds()
+  ).getTime();
+}
+
 function todayKey(cutoff) { return dayKeyOf(now(), cutoff); }
 
 function isToday(ts, cutoff) { return dayKeyOf(ts, cutoff) === todayKey(cutoff); }
@@ -183,7 +196,7 @@ function relativeDay(ts, ref) {
 function businessDayKey(ts, cutoff) { return dayKeyOf(ts, cutoff); }
 
 export {
-  now, dayStart, dayKeyOf, dayIndex, dayDiff, addDays, todayKey, isToday,
+  now, dayStart, dayKeyOf, dayIndex, dayDiff, addDays, addMonths, todayKey, isToday,
   weekStart, weekKey, periodKeyOf, rangeOf, budgetBounds, keyOffset, relativeDay, businessDayKey,
   __setClockForTest, __clockRollbacks,
 };

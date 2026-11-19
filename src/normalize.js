@@ -1,8 +1,10 @@
+import { normalizeAffairStepRefs } from './affair-steps.js';
 import { normalizeCondition } from './cond-model.js';
 import { gateConditionOf } from './cond-model.js';
 import { normalizeBudgetBinding, normalizeBudgetRef } from './budget-binding.js';
 import { ACTIVITY_MAX_DAYS, ASSET_VERSION, AUDIT_MAX, BUDGET_LEDGER_MAX, BUDGET_PERIOD_KEEP, BUDGET_RULE_KINDS, FLOW_MAX_STEPS, FLOW_RUN_KEEP, FLOW_VERSION, LOG_MAX, PROD_TIERS, PRODUCT_EXEC_MAX_PER_PERIOD, SCHEMA_VERSION, SHADOW_MAX, STATS_ENTITY_MAPS, STATS_KEEP_DAYS, STATS_SCALARS } from './constants.js';
 import { defaultAssetDefs, defaultBudgetsState, defaultProductGate, migrateChore, normalizeChoreConfig, tierCurrency, defaults } from './defaults.js';
+import { normalizeChoreOrder, reconcileChoreOrder } from './chore-list.js';
 import { normalizeExecBuys } from './exec-quota.js';
 import { budgetBounds, periodKey, migrateAffair, esc, now, uid, toNum, toTs, asArray, dateKeyOffset, round2, validAssetCat } from './pure.js';
 import { emptyAccountSums } from './stats.js';
@@ -800,6 +802,14 @@ function parseState(raw){
       c.budget=normalizeBudgetBinding(c.budget,budCtx);
       c.budgetRef=normalizeBudgetRef(c.budgetRef);
     });
+    // 步骤形状守卫：纯步骤原样通过；委派步骤的引用按「独占 + 杂事必须存在」修复，
+    // 脏引用就地降级为纯步骤（老存档没有 choreRef，等于零迁移）。
+    normalizeAffairStepRefs(affairs,chores);
+    // 容器侧排序序列：有序列时只保留仍存在的杂事 id，并把缺失实体补到末尾；
+    // 没有序列则保持为空，渲染回落到原排序（不改变任何现有可见顺序）。
+    const choreIds=chores.map(function(c){return c.id;});
+    const rawChoreOrder=normalizeChoreOrder(p.choreOrder,choreIds);
+    const choreOrder=rawChoreOrder.length?reconcileChoreOrder(rawChoreOrder,choreIds,choreIds):[];
     // 资产余额先归一，再由余额反推 v3 存档里的孤立卡定义（最小迁移）
     const cards=normalizeCards(p.cards);
     const assetDefs=normalizeAssetDefs(p.assetDefs,cards);
@@ -819,10 +829,13 @@ function parseState(raw){
       achievements:achievements,
       affairs:affairs,
       chores:chores,
+      choreOrder:choreOrder,
       choreConfig:normalizeChoreConfig(p.choreConfig),
       affairPresets:asArray(p.affairPresets).filter(Boolean).map(normalizePresetNums),
       affairCollapsed:asArray(p.affairCollapsed),
       affairUndo:(p.affairUndo&&typeof p.affairUndo==='object'&&!Array.isArray(p.affairUndo))?p.affairUndo:{},
+      // B5：删除快照原样放行（条数上限由写入侧维护）；只挡明显损坏的条目
+      affairDeleteUndo:asArray(p.affairDeleteUndo).filter(function(x){return x&&typeof x==='object'&&!Array.isArray(x)&&x.affair&&typeof x.affair==='object';}).slice(-5),
       conversions:asArray(p.conversions).filter(function(x){return x&&typeof x==='object'&&!Array.isArray(x);}),
       products:asArray(p.products).filter(Boolean).map(function(prod){return normalizeProduct(prod,prodCtx);}),
       logs:asArray(p.logs).filter(Boolean).map(normalizeLogNums),

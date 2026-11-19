@@ -1,5 +1,7 @@
 import { affairActive } from './cond-eval.js';
 import { AFFAIR_CURVES } from './constants.js';
+import { choreIsCyclic } from './chore-cycle.js';
+import { choreOrderInsert } from './chore-list.js';
 import { idleDaysSince, dayKey, affairLastAdvance, effectiveLastTs, now, uid } from './pure.js';
 import { BudgetEngine } from './budget.js';
 import { processDueFlows } from './flow-scheduler.js';
@@ -34,6 +36,8 @@ function archiveIdleEntities(entity,idleDays,ts,actName,dryRun){
   if(entity==='chore'){
     (state.chores||[]).forEach(function(c){
       if(c.archived)return;
+      // 循环杂事的生命周期由 nextDue 决定，不参与“不活跃归档”（否则复发链被永久隐藏）
+      if(choreIsCyclic(c))return;
       // 已完成但未结算的杂事不归档：否则会吞掉批量结算奖励
       if(c.done&&!c.settled)return;
       const d=idleDaysSince(c.doneAt||c.plannedAt||c.createdAt,ts);
@@ -135,10 +139,11 @@ function createEntitiesFromTemplate(kind, spec, ts) {
     } else if (kind === 'chore') {
       const c = {
         id: uid(), name: name, done: false, doneAt: null, plannedAt: null, createdAt: at,
-        settled: false, freshDays: null, decayKey: null,
+        settled: false, freshDays: null, decayKey: null, tags: [],
       };
       if (!Array.isArray(state.chores)) state.chores = [];
       state.chores.push(c);
+      state.choreOrder = choreOrderInsert(state.choreOrder, c.id);
       out.push({ kind: 'chore', id: c.id, name: c.name });
     } else {
       const t = {

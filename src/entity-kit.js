@@ -1,4 +1,5 @@
 import { affairLastAdvance, affairSteps, effectiveLastTs, getTaskDomainIds, taskCheckedToday } from './pure.js';
+import { choreCycleOf, choreDoneInCycle, choreHistoryOf, choreIsCyclic } from './chore-cycle.js';
 import { state } from './state.js';
 import { addDays, dayStart, now } from './time.js';
 import { choreOverdueDays } from './utils.js';
@@ -133,7 +134,18 @@ function entityHistory(ref, opts) {
     push({ ts: Number(e.doneAt) || 0, kind: 'entity', src: 'completed', label: '完成项目' });
   } else if (f.kind === 'chore') {
     push({ ts: Number(e.plannedAt) || 0, kind: 'entity', src: 'planned', label: '安排日期' });
-    push({ ts: Number(e.doneAt) || 0, kind: 'entity', src: 'completed', label: '完成杂事' });
+    if (choreIsCyclic(e)) {
+      // 循环杂事：完成历史按次回溯（每次完成一条），最后一次完成不再单列
+      choreHistoryOf(e).forEach(function (h) {
+        if (!h || !h.ts) return;
+        push({
+          ts: Number(h.ts) || 0, kind: 'entity', src: 'completed', label: '完成杂事',
+          due: Number(h.due) || 0, settled: h.settled === true,
+        });
+      });
+    } else {
+      push({ ts: Number(e.doneAt) || 0, kind: 'entity', src: 'completed', label: '完成杂事' });
+    }
   }
   push({ ts: Number(e.archivedAt) || 0, kind: 'entity', src: 'archived', label: '归档' });
 
@@ -223,13 +235,16 @@ function todayAgenda(opts) {
   });
 
   (state.chores || []).forEach(function (c) {
-    if (!c || c.archived || c.done) return;
+    if (!c || c.archived || choreDoneInCycle(c, ts)) return;
+    const cy = choreCycleOf(c);
+    const dueDay = cy ? dayStart(cy.nextDue) : (c.plannedAt ? dayStart(c.plannedAt) : null);
+    const dueAt = cy ? cy.nextDue : (c.plannedAt || null);
     const overdue = choreOverdueDays(c, ts) > 0;
-    const dueToday = !!c.plannedAt && dayStart(c.plannedAt) === today;
+    const dueToday = dueDay !== null && dueDay === today;
     if (!overdue && !dueToday) return;
     out.push({
       kind: 'chore', id: c.id, title: String(c.name || ''), subtitle: '',
-      status: 'todo', dueAt: c.plannedAt || null, overdue: overdue,
+      status: 'todo', dueAt: dueAt, overdue: overdue,
       bucket: overdue ? 'overdue' : 'today', domainIds: [],
     });
   });

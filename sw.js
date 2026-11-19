@@ -16,7 +16,7 @@
 // tests/sw-assets.test.js 会校验：清单与仓库实际文件一致、VERSION 与缓存名一致。
 'use strict';
 
-const VERSION = '2026-11-19.4';
+const VERSION = '2026-11-19.12';
 const CACHE = 'score-sys-' + VERSION;
 
 // 整版清单（相对 sw.js 所在目录）
@@ -38,6 +38,8 @@ const PRECACHE = [
   './src/modal-host.js',
   './src/render.js',
   './src/state.js',
+  './src/affair-steps.js',
+  './src/affair-delegate.js',
   './src/theme.js',
   './src/normalize.js',
   './src/persist-state.js',
@@ -46,6 +48,8 @@ const PRECACHE = [
   './src/utils.js',
   './src/stats.js',
   './src/ledger.js',
+  './src/chore-cycle.js',
+  './src/chore-list.js',
   './src/chore-core.js',
   './src/debt.js',
   './src/gate.js',

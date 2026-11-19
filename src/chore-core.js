@@ -3,7 +3,7 @@ import { Ledger } from './ledger.js';
 import { dayKey, dayStartTs, now, round2 } from './pure.js';
 import { state } from './state.js';
 import { addDays, dayDiff } from './time.js';
-import { choreBaseTs, choreCfg, choreFreshDays, choreOverdueDays, choreTierRate } from './utils.js';
+import { choreCfg, choreDeadlineTs, choreDoneNow, choreOverdueDays, choreTierRate } from './utils.js';
 // chore-core.js —— 杂事腐化债的纯计算与结算
 // 从 render-work.js 抽出，供渲染层与业务层共用，避免循环依赖，行为不变。
 
@@ -14,12 +14,13 @@ function computeChoreDecay(){
   if(!chores.length)return {total:0,charged:0,dueDays:0,overdue:[],today:dayStartTs(now())};
   const cfg=choreCfg();
   const today=dayStartTs(now());
-  const overdue=chores.filter(function(c){return !c.done&&!c.archived&&choreOverdueDays(c)>0;});
+  const overdue=chores.filter(function(c){return !c.archived&&!choreDoneNow(c,today)&&choreOverdueDays(c,today)>0;});
   if(!overdue.length)return {total:0,charged:0,dueDays:0,overdue:[],today:today};
   const rate=choreTierRate(overdue.length,cfg);
   let total=0,dueDays=0,charged=0;
   overdue.forEach(function(c){
-    const deadline=addDays(choreBaseTs(c),Math.round(choreFreshDays(c)));
+    // 腐化债只在到期日之后累积：循环杂事以 nextDue 为基准，一次性杂事维持 base+freshDays。
+    const deadline=choreDeadlineTs(c);
     let start=addDays(deadline,1);
     if(c.decayKey){
       const p=String(c.decayKey).split('-');

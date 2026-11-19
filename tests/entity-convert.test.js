@@ -82,6 +82,21 @@ describe('entity-convert：杂事 → 项目（同 id 换表）', () => {
     expect(r.ok).toBe(false);
     expect(JSON.stringify(api.getState())).toBe(before);
   });
+
+  it('被项目步骤委派中的杂事拒绝转换，且零写入（B5 三）', () => {
+    api.patchState(s => {
+      s.affairs.find(a => a.id === 'a1').steps.push({
+        text: '交水费', doneAt: null, plannedAt: null,
+        choreRef: { id: 'c1', origin: 'existing' },
+      });
+    });
+    const before = JSON.stringify(api.getState());
+    const r = api.choreToAffair('c1');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toContain('委派');
+    expect(r.reason).toContain('装修');
+    expect(JSON.stringify(api.getState())).toBe(before);
+  });
 });
 
 describe('entity-convert：项目 → 杂事（有损直接拒绝）', () => {

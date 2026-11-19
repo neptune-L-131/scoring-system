@@ -429,7 +429,7 @@
       <input type="datetime-local" id="affairPlannedAt">
     </div>
     <div class="fg">
-      <label>步骤列表 <span class="h">可选，逐个完成步骤；每步可单独安排时间，全部完成或手动标记完成时结算奖励</span></label>
+      <label>步骤列表 <span class="h">可选，逐个完成步骤；每步可单独安排时间，也可以把步骤委派给一条杂事；全部完成或手动标记完成时结算奖励</span></label>
       <div id="affairSteps"></div>
       <button type="button" class="btn btn-sm" style="margin-top:8px" onclick="affairAddStep()">+ 添加步骤</button>
     </div>
@@ -438,6 +438,22 @@
       <button class="btn" onclick="closeModal('affairModal')">取消</button>
       <button class="btn btn-danger" id="affairDelBtn" style="display:none" onclick="delAffair(document.getElementById('affairId').value)">删除</button>
       <button class="btn" id="affairSaveBtn">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- ===== Affair Delete Modal（未完成的委派杂事：回池 / 一起删除） ===== -->
+<div class="modal-bg" id="affairDeleteModal">
+  <div class="modal">
+    <h2 id="affairDeleteTitle">删除项目</h2>
+    <input type="hidden" id="affairDeleteId">
+    <p class="affair-del-hint" id="affairDeleteHint"></p>
+    <ul class="affair-del-list" id="affairDeleteChores"></ul>
+    <p class="affair-del-note">已完成的委派杂事不受影响，会留在杂事池的已完成区。</p>
+    <div class="modal-foot">
+      <button class="btn" onclick="cancelAffairDelete()">取消</button>
+      <button class="btn" onclick="confirmAffairDelete('pool')">回杂事池</button>
+      <button class="btn btn-danger" onclick="confirmAffairDelete('purge')">一起删除</button>
     </div>
   </div>
 </div>
@@ -514,6 +530,27 @@
     <div class="fg">
       <label>保鲜期覆盖 <span class="h">留空则使用全局默认（当前 <span id="choreFreshDefaultHint">7</span> 天）</span></label>
       <input type="number" id="choreFreshDays" min="0" step="1" placeholder="留空 = 跟随全局设置">
+    </div>
+    <div class="fg">
+      <label>循环 <span class="h">开启后按周期反复出现；关闭会清除循环与完成历史</span></label>
+      <label class="cfg-check"><input type="checkbox" id="choreCycleOn" onchange="choreCycleToggle()"> 按周期重复</label>
+      <div id="choreCycleFields" class="cfg-inline chore-cycle-row" style="display:none">
+        <span>每</span><input type="number" id="choreCycleInterval" min="1" step="1" value="1">
+        <select id="choreCycleUnit">
+          <option value="day">天</option>
+          <option value="week">周</option>
+          <option value="month">月</option>
+        </select>
+        <span>锚点</span><input type="date" id="choreCycleAnchor">
+      </div>
+    </div>
+    <div class="fg">
+      <label>标签 <span class="h">最多 6 个，每个最多 12 字</span></label>
+      <div class="chore-tag-row">
+        <input type="text" id="choreTagInput" maxlength="12" placeholder="输入标签，回车添加" autocomplete="off" onkeydown="if(event.key==='Enter'){event.preventDefault();addChoreTag();}">
+        <button class="btn btn-sm" type="button" onclick="addChoreTag()">添加</button>
+      </div>
+      <div id="choreTags" class="tag-chips"></div>
     </div>
     <div class="fg">
       <label>产出进度值 <span class="h">勾选完成时按领域分摊发放；留空 = 0（不产出）</span></label>

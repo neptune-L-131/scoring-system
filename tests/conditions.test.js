@@ -174,6 +174,24 @@ describe('evalCondItem：阶段 1 指标（项目 / 杂事 / 不活跃）', () =
     expect(api.evalCondItem(item({ range: 'recent', days: 7, metric: 'chore_batches', value: 2 }), week, T)).toBe(true);
   });
 
+  it('chore_completed 循环杂事按完成记录逐条计数（不被 doneAt 覆盖）', () => {
+    api.resetState({
+      chores: [{
+        id: 'c1', done: true, doneAt: T - 3600e3,
+        cycle: { unit: 'day', interval: 1, anchor: T - 10 * DAY, nextDue: T + DAY, lastDue: T - 8 * DAY },
+        history: [
+          { ts: T - 8 * DAY, due: T - 8 * DAY, settled: true },
+          { ts: T - 6 * DAY, due: T - 6 * DAY, settled: true },
+          { ts: T - 3600e3, due: T - 2 * DAY, settled: false },
+        ],
+      }, { id: 'c2', done: true, doneAt: T - 20 * DAY }],
+    });
+    // 最近 7 天：循环 2 条（T-8 天那条在窗口外）+ 一次性 0 条
+    expect(api.evalCondItem(item({ range: 'recent', days: 7, metric: 'chore_completed', value: 2 }), week, T)).toBe(true);
+    // 累计：循环 3 条 + 一次性 1 条
+    expect(api.evalCondItem(item({ range: 'total', metric: 'chore_completed', value: 4 }), week, T)).toBe(true);
+  });
+
   it('affair_progress 累计口径读实体字段（不受日志截断影响）', () => {
     api.resetState({
       affairs: [

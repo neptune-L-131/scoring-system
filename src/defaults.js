@@ -1,4 +1,6 @@
 import { ASSET_VERSION, BUDGET_LEDGER_MAX, BUDGET_PERIOD_KEEP, BUDGET_VERSION, FLOW_VERSION, SCHEMA_VERSION, STATS_VERSION } from './constants.js';
+import { normalizeChoreCycle, normalizeChoreHistory } from './chore-cycle.js';
+import { normalizeChoreTags } from './chore-list.js';
 import { defaultExecBuys } from './exec-quota.js';
 import { defaultWatermark, now, uid } from './pure.js';
 // defaults.js —— 默认状态与默认配置工厂
@@ -63,6 +65,18 @@ function migrateChore(c){
   c.archivedAt=c.archivedAt||null;
   if(c.freshDays===undefined||c.freshDays===null||c.freshDays===''||isNaN(Number(c.freshDays)))c.freshDays=null;
   else c.freshDays=Math.max(0,Math.round(Number(c.freshDays)));
+  // 循环设置与完成历史：只守卫形状，不补默认值、不批量迁移。
+  // 缺字段 / 非法配置一律按一次性杂事读入（删除坏字段，行为与旧版完全一致）。
+  if(c.cycle!==undefined){
+    const cy=normalizeChoreCycle(c.cycle);
+    if(cy)c.cycle=cy;else delete c.cycle;
+  }
+  if(c.history!==undefined){
+    const hist=normalizeChoreHistory(c.history);
+    if(hist)c.history=hist;else delete c.history;
+  }
+  // 标签：独立命名空间；旧存档缺省读入空数组，非法条目丢弃，不批量迁移。
+  c.tags=normalizeChoreTags(c.tags);
   return c;
 }
 
@@ -118,10 +132,14 @@ function defaults(){
     tasks:[],achievements:[],products:[],logs:[],
     affairs:[],
     chores:[],
+    // 杂事列表的容器侧 id 序列：空数组表示未设置顺序，渲染回落到原排序
+    choreOrder:[],
     choreConfig:defaultChoreConfig(),
     affairPresets:[],
     affairCollapsed:[],
     affairUndo:{},
+    // 删除项目的撤销快照（B5）：只留最近几条，整笔恢复项目与被一起删除的杂事
+    affairDeleteUndo:[],
     // 事项转换记录（P3）：只保留最近若干条，最后一条可撤销
     conversions:[],
     loans:[],

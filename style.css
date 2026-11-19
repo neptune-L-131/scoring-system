@@ -343,6 +343,15 @@ body{
 
 .modal-foot{display:flex;gap:10px;margin-top:20px}
 .modal-foot .btn{flex:1;padding:10px;font-size:14px}
+/* ===== 删除项目：委派杂事去留 ===== */
+.affair-del-hint{font-size:13px;color:var(--text-2);line-height:1.7;margin-bottom:10px}
+.affair-del-list{
+  list-style:none;margin:0 0 12px;padding:10px 12px;max-height:170px;overflow-y:auto;
+  border:1px solid var(--border);border-radius:10px;background:var(--surface-2);
+}
+.affair-del-list li{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:13px;line-height:1.9}
+.affair-del-list li i{font-style:normal;font-size:11px;color:var(--text-3);flex-shrink:0}
+.affair-del-note{font-size:11px;color:var(--text-3);line-height:1.6;margin-bottom:4px}
 /* ===== 事项 × 现实预算绑定 ===== */
 .budget-bind .bud-row{display:flex;gap:8px;flex-wrap:wrap}
 .budget-bind .bud-row select,.budget-bind .bud-row input{flex:1;min-width:110px}
@@ -890,6 +899,7 @@ body{
 .affair-view-toggle{margin-left:auto;border:1px solid var(--border);background:none;color:var(--text-2);border-radius:var(--radius);padding:3px 10px;font-size:11px;cursor:pointer;font-family:inherit}
 .affair-view-toggle:hover{background:var(--surface-2)}
 .affair-empty{padding:12px;font-size:12px;color:var(--text-3)}
+.affair-delete-undo{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;border:1px dashed var(--border-2);border-radius:var(--radius);color:var(--text-2)}
 .affair-card{cursor:pointer;transition:border-color .15s}
 .affair-card.stalled{border-color:var(--danger)}
 .affair-card.late .affair-name{color:var(--danger)}
@@ -944,6 +954,16 @@ body{
 .affair-step-time:focus{border-color:var(--text-3)}
 .affair-step-time-badge{font-size:11px;color:var(--progress);white-space:nowrap;flex-shrink:0}
 .affair-step-empty{font-size:12px;color:var(--text-3)}
+/* 步骤委派：一行下拉 + 新建按钮；已委派时换成引用徽章 + 解除 */
+.affair-step-delegate{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.affair-step-chore{
+  flex:1;background:var(--surface-2);border:1px solid var(--border-2);border-radius:7px;
+  color:var(--text-2);font-size:12px;font-family:inherit;padding:5px 8px;outline:none;min-width:120px;
+}
+.affair-step-chore:focus{border-color:var(--text-3)}
+.affair-step-chore-badge{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--progress);min-width:0}
+.affair-step-chore-badge i{font-style:normal;font-size:11px;color:var(--text-3)}
+.affair-step-chore-badge.pending{color:var(--text-2)}
 
 /* 事务：预设管理 */
 .affair-presets{margin-bottom:16px}
@@ -982,7 +1002,20 @@ body{
 .chore-card.done .chore-name{color:var(--text-3);text-decoration:line-through}
 .chore-meta{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:3px}
 .chore-date{font-size:11px;color:var(--text-3)}
+.chore-cycle{font-size:11px;color:var(--text-2)}
 .chore-overdue{font-size:11px;color:var(--danger);font-weight:600}
+.chore-drag{display:flex;align-items:center;flex-shrink:0;margin-left:auto}
+/* 杂事弹窗：循环设置 + 标签 */
+.fg label.cfg-check{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-2);margin-bottom:8px}
+.chore-cycle-row input[type=date]{width:140px}
+.fg .chore-cycle-row input[type=date]{width:140px}
+.chore-cycle-row select{width:auto;padding:6px 9px;background:var(--surface-2);border:1px solid var(--border-2);border-radius:7px;color:var(--text);font-size:13px;font-family:inherit}
+.chore-tag-row{display:flex;align-items:center;gap:8px}
+.chore-tag-row input{flex:1;min-width:0}
+.tag-chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.chore-tag{display:inline-flex;align-items:center;gap:4px;margin-right:0;padding-right:4px}
+.chore-tag-del{border:none;background:none;color:var(--text-3);cursor:pointer;font-size:13px;line-height:1;padding:0 3px}
+.chore-tag-del:hover{color:var(--danger)}
 #choreDate{width:100%;font-size:14px;border-radius:var(--radius);padding:8px 11px;background:var(--surface)}
 /* 杂事经济设置 */
 .fg .cfg-inline input,.fg .cfg-tier-row input{

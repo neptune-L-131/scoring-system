@@ -966,12 +966,14 @@ function clearDataResults(){
     if(Array.isArray(a.steps))a.steps.forEach(s=>{s.doneAt=null;});
   });
 
-  // 杂事：清空完成与腐化记录，保留杂事定义与经济配置
+  // 杂事：清空完成与腐化记录，保留杂事定义与经济配置（含循环设置）
   (state.chores||[]).forEach(c=>{
     c.done=false;
     c.doneAt=null;
     c.settled=false;
     c.decayKey=dayKey(now()); // 腐化从今天重新起算，不追溯历史
+    delete c.history;
+    if(c.cycle&&typeof c.cycle==='object')c.cycle.lastDue=0;
   });
   closeChoreDoneZone();
 

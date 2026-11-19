@@ -31,7 +31,7 @@ const EXPORT_NAMES = [
   'dayKey', 'weekStartKey', 'weekStartTs', 'periodKey', 'budgetBounds', 'dayStartTs',
   'prevPeriodRange', 'condWindowByRange', 'idleDaysSince', 'weekAnchorName',
   // 统一时间源（time.js）
-  'dayStart', 'dayKeyOf', 'dayIndex', 'dayDiff', 'addDays', 'todayKey', 'isToday',
+  'dayStart', 'dayKeyOf', 'dayIndex', 'dayDiff', 'addDays', 'addMonths', 'todayKey', 'isToday',
   'weekStart', 'weekKey', 'periodKeyOf', 'rangeOf', 'keyOffset', 'relativeDay',
   'businessDayKey', '__setClockForTest', '__clockRollbacks',
   // 只读实体聚合层（entity-kit.js）
@@ -43,6 +43,14 @@ const EXPORT_NAMES = [
   'conversionUndoState', 'lastConversion', 'canUndoConversion', 'undoConversion',
   // 杂事产出进度（utils.js）
   'choreProgressOf', 'choreProgressParts',
+  // 杂事循环重复 + 完成历史（chore-cycle.js / utils.js）
+  'normalizeChoreCycle', 'normalizeChoreHistory', 'choreCycleOf', 'choreIsCyclic',
+  'choreCycleDueAfter', 'choreDoneInCycle', 'choreMarkCompletion', 'choreUndoCompletion',
+  'choreHistoryOf', 'choreDeadlineTs', 'choreDoneNow', 'choreSettlePool', 'choreMarkSettled',
+  // 杂事标签 + 容器侧排序（chore-list.js）
+  'normalizeChoreTag', 'normalizeChoreTags', 'normalizeChoreOrder', 'reconcileChoreOrder',
+  'choreOrderInsert', 'choreOrderRemove', 'choreOrderMove', 'sortChoresByOrder',
+  'CHORE_TAG_MAX_COUNT', 'CHORE_TAG_MAX_LEN',
   // 账户差额 / 统计
   'emptyAccountSums', 'accountSumsAdd', 'statsDiffs', 'noteInvisible', 'noteEvicted',
   'shadowLabel', 'shadowPush', 'seedCalibrationShadow', 'accountLabel',
@@ -82,6 +90,16 @@ const EXPORT_NAMES = [
   'choreTierRate', 'choreDailyDecay', 'choreUnsettled', 'computeChoreDecay',
   'affairSteps', 'affairTotalSteps', 'affairDoneSteps', 'affairLastAdvance', 'affairCurve',
   'affairCurveType', 'affairTargetAt', 'affairIsDone', 'migrateAffair',
+  // 项目委派步骤（第 6 轮 B1：两种步骤形状 + 杂事引用不变式）
+  'STEP_CHORE_ORIGINS', 'stepChoreRef', 'isDelegatedStep', 'makeChoreRef', 'ensureAffairStepIds',
+  'affairStepIssues', 'normalizeAffairStepRefs', 'buildChoreClaimIndex',
+  'choreClaimsOf', 'choreClaimOf', 'isChoreClaimed', 'claimedChoreIds', 'affairDelegatedSteps',
+  // 委派步骤写入侧（第 6 轮 B2：候选 / 就地新建 / 解除；B3：删除项目时的委派杂事去留）
+  'delegationCandidates', 'resolveDelegatedSteps', 'affairDeletionChores', 'deleteAffairCore',
+  // 删除项目的撤销快照（第 6 轮 B5 二）
+  'restoreAffairDeletion', 'AFFAIR_DELETE_UNDO_LIMIT',
+  // 项目完成时自动判定委派杂事（第 6 轮 B4：只写完成态、不结算）
+  'affairAutoCompleteDelegatedChores',
   // 跨域 / 结构操作
   'archiveIdleEntities', 'assetGrantPlan', 'assetGrantCore', 'createEntitiesFromTemplate', 'schedulerTick',
   'processLoans', 'processChoreDecay', 'processDailyTaskDebts',
@@ -248,8 +266,8 @@ async function loadFromModules() {
   // 纯逻辑模块（不含 main.js：入口会跑初始化、碰 DOM）。
   const MODULES = [
     'constants.js', 'time.js', 'pure.js', 'exec-quota.js', 'entity-kit.js', 'defaults.js', 'toast.js', 'cond-model.js', 'modal-host.js',
-    'state.js', 'theme.js', 'normalize.js', 'persist-state.js', 'persist.js', 'utils.js', 'stats.js',
-    'ledger.js', 'chore-core.js', 'debt.js', 'gate.js', 'budget.js', 'budget-binding.js', 'command.js', 'post-commit.js', 'conditions.js', 'entities.js', 'business.js',
+    'state.js', 'affair-steps.js', 'affair-delegate.js', 'theme.js', 'normalize.js', 'persist-state.js', 'persist.js', 'utils.js', 'stats.js',
+    'ledger.js', 'chore-cycle.js', 'chore-list.js', 'chore-core.js', 'debt.js', 'gate.js', 'budget.js', 'budget-binding.js', 'command.js', 'post-commit.js', 'conditions.js', 'entities.js', 'business.js',
     'flow-scheduler.js',
     'flow-atoms.js',
     'flow-engine.js',

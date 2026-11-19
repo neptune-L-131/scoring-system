@@ -1,3 +1,4 @@
+import { choreCycleOf, choreDoneInCycle, choreIsCyclic } from './chore-cycle.js';
 import { normalizeChoreConfig } from './defaults.js';
 import { round2, splitCents } from './pure.js';
 import { state } from './state.js';
@@ -34,10 +35,21 @@ function choreBaseTs(c){
   const base=(c&&c.plannedAt)?c.plannedAt:((c&&c.createdAt)?c.createdAt:now());
   return dayStart(base);
 }
+// 到期日（本地零点）：循环杂事以 nextDue 为唯一基准；一次性杂事维持 base+freshDays。
+function choreDeadlineTs(c){
+  const cy=choreCycleOf(c);
+  if(cy)return dayStart(cy.nextDue);
+  return addDays(choreBaseTs(c),Math.round(choreFreshDays(c)));
+}
+// 「今天做没做」：本周期内有没有完成（一次性杂事等价于 done 标记）。
+function choreDoneNow(c,ts){
+  return choreDoneInCycle(c,ts);
+}
 function choreOverdueDays(c,ts){
-  if(!c||c.done)return 0;
+  if(!c)return 0;
   const today=dayStart(ts||now());
-  const deadline=addDays(choreBaseTs(c),Math.round(choreFreshDays(c)));
+  if(choreDoneNow(c,today))return 0;
+  const deadline=choreDeadlineTs(c);
   const d=dayDiff(today,deadline);
   return d>0?d:0;
 }
@@ -49,8 +61,52 @@ function choreTierRate(count,cfg){
   return cfg.tier3Rate;
 }
 function choreDailyDecay(count,cfg){return round2(count*choreTierRate(count,cfg));}
+// 批量结算池：每件「可结算的完成」一项。
+// 一次性杂事沿用 done && !settled；循环杂事按完成历史逐条计，同一 due 只算一件，
+// 因此同一循环杂事每个周期最多贡献一件，不会被重复计入批次。
+function choreSettlePool(){
+  const out=[];
+  (state.chores||[]).forEach(function(c){
+    if(!c||c.archived)return;
+    if(choreIsCyclic(c)){
+      const hist=Array.isArray(c.history)?c.history:[];
+      const seen=Object.create(null);
+      hist.forEach(function(e){
+        if(!e||e.settled===true)return;
+        const key=String(Number(e.due)||0);
+        if(seen[key])return;
+        seen[key]=1;
+        out.push({chore:c,entry:e,at:Number(e.ts)||0});
+      });
+      return;
+    }
+    if(c.done&&!c.settled)out.push({chore:c,entry:null,at:Number(c.doneAt)||0});
+  });
+  return out;
+}
 function choreUnsettled(){
-  return (state.chores||[]).filter(function(c){return c.done&&!c.settled&&!c.archived;});
+  const ids=Object.create(null);
+  const out=[];
+  choreSettlePool().forEach(function(it){
+    if(!it||!it.chore||ids[it.chore.id])return;
+    ids[it.chore.id]=1;
+    out.push(it.chore);
+  });
+  return out;
+}
+// 结算落账后标记：一次性写 chore.settled；循环写 history 条目的 settled，
+// 并同步 settled 镜像（全部完成记录已结算才为 true）。
+function choreMarkSettled(items){
+  (items||[]).forEach(function(it){
+    if(!it)return;
+    if(it.entry)it.entry.settled=true;
+    else if(it.chore)it.chore.settled=true;
+  });
+  (state.chores||[]).forEach(function(c){
+    if(!c||!choreIsCyclic(c))return;
+    const hist=Array.isArray(c.history)?c.history:[];
+    c.settled=hist.length>0&&hist.every(function(e){return !e||e.settled===true;});
+  });
 }
 // 杂事产出进度：未配置的实体按懒写入口径读取默认值（0 / 默认领域），不改 state
 function choreProgressOf(c){
@@ -80,4 +136,4 @@ function activityCountForDomain(did,days){
   return n;
 }
 
-export { choreCfg, choreFreshDays, choreBaseTs, choreOverdueDays, choreTierRate, choreDailyDecay, choreUnsettled, choreProgressOf, choreProgressParts, activityCountForDomain };
+export { choreCfg, choreFreshDays, choreBaseTs, choreDeadlineTs, choreDoneNow, choreOverdueDays, choreTierRate, choreDailyDecay, choreSettlePool, choreUnsettled, choreMarkSettled, choreProgressOf, choreProgressParts, activityCountForDomain };

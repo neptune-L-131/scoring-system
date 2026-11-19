@@ -1,3 +1,4 @@
+import { choreOrderMove, reconcileChoreOrder } from './chore-list.js';
 import { Persist, save } from './persist.js';
 import { getRenderer, render } from './render.js';
 import { state } from './state.js';
@@ -75,7 +76,7 @@ function toggleCollapse(type,id){
 
 // ===== Drag-and-drop (generic, long-press to reorder) =====
 let drag={active:false,type:null,id:null,groupId:null,el:null,ghost:null,indicator:null,timer:null,
-  startX:0,startY:0,originRect:null,offsetX:0,offsetY:0,pointerId:null,pending:null};
+  startX:0,startY:0,originRect:null,offsetX:0,offsetY:0,pointerId:null,pending:null,choreFallback:null};
 let dragJustEnded=false;
 // 防误触：按下后位移超过 8px 才真正进入拖拽态（与阶段条 THRESH 一致）
 const DRAG_THRESH=8;
@@ -104,6 +105,10 @@ function getDragTarget(target){
   // 1. Task card
   var taskCard=handle.closest('.card[data-task-id]');
   if(taskCard)return{el:taskCard,type:'task',id:taskCard.dataset.taskId,groupId:taskCard.dataset.collId};
+
+  // 1.5 Chore card（待办 / 已完成 / 已归档三分区各自独立排序）
+  var choreCard=handle.closest('.chore-card[data-chore-id]');
+  if(choreCard)return{el:choreCard,type:'chore',id:choreCard.dataset.choreId,groupId:choreCard.dataset.choreZone};
 
   // 2. Milestone card
   var achCard=handle.closest('.card[data-ach-id]');
@@ -152,6 +157,8 @@ function beginDrag(p,e){
   drag.pending=null;
 
   drag.active=true;
+  // 杂事：在 DOM 被拖动前记录当前显示顺序，作为首次排序的播种序列
+  drag.choreFallback=p.type==='chore'?getChoreDisplayOrder():null;
   p.el.classList.add('dragging');
   document.body.style.overflow='hidden';
 
@@ -183,6 +190,8 @@ function getDragSiblings(){
   var type=drag.type,groupId=drag.groupId;
   if(type==='task'){
     return[].slice.call(document.querySelectorAll('#taskGroups .card[data-task-id][data-coll-id="'+groupId+'"]:not(.dragging)'));
+  }else if(type==='chore'){
+    return[].slice.call(document.querySelectorAll('.chore-card[data-chore-id][data-chore-zone="'+groupId+'"]:not(.dragging)'));
   }else if(type==='milestone'){
     return[].slice.call(document.querySelectorAll('#achGroups .card[data-ach-id][data-dom-id="'+groupId+'"]:not(.dragging)'));
   }else if(type==='product'){
@@ -311,6 +320,7 @@ function onDragUp(e){
   // Persist new order only if the drop was valid
   if(validDrop){
     if(type==='task')saveTaskOrderFromDOM(groupId);
+    else if(type==='chore')saveChoreOrderFromDOM(groupId);
     else if(type==='collection')saveCollectionOrderFromDOM();
     else if(type==='milestone')saveAchOrderFromDOM(groupId);
     else if(type==='ach-domain')saveAchDomOrderFromDOM();
@@ -363,6 +373,34 @@ function onDragUp(e){
   drag.groupId=null;
   drag.originRect=null;
   drag.pointerId=null;
+  drag.choreFallback=null;
+}
+
+// 杂事当前显示顺序（待办 → 已完成 → 已归档，同一文档序）
+function getChoreDisplayOrder(){
+  return [].slice.call(document.querySelectorAll('.card.chore-card[data-chore-id]'))
+    .map(function(el){return el.dataset.choreId;})
+    .filter(Boolean);
+}
+
+// 杂事排序：先按拖动前的显示顺序 reconcile 播种全局序列，再把被拖项移动到目标邻位。
+// 三个分区共用一条序列，但落在各自分区内的相对名次，因此互不影响。
+function saveChoreOrderFromDOM(zone){
+  var cards=[].slice.call(document.querySelectorAll('.card.chore-card[data-chore-id][data-chore-zone="'+zone+'"]'));
+  var zoneIds=cards.map(function(el){return el.dataset.choreId;}).filter(Boolean);
+  var dragId=String(drag.id||'');
+  var idx=zoneIds.indexOf(dragId);
+  if(idx<0)return;
+  var targetId='',place='before';
+  if(idx>0){targetId=zoneIds[idx-1];place='after';}
+  else if(zoneIds.length>1){targetId=zoneIds[1];place='before';}
+  var allIds=(state.chores||[]).map(function(c){return c.id;});
+  var fallback=(drag.choreFallback&&drag.choreFallback.length)?drag.choreFallback:zoneIds;
+  var order=reconcileChoreOrder(state.choreOrder,allIds,fallback);
+  if(targetId)order=choreOrderMove(order,dragId,targetId,place);
+  state.choreOrder=order;
+  save();
+  toast('杂事顺序已更新');
 }
 
 function saveTaskOrderFromDOM(collId){
@@ -478,4 +516,4 @@ function saveShopCatOrderFromDOM(){
   toast('分类顺序已更新');
 }
 
-export { filterByDomain, toggleInline, toggleMajor, syncMajorCollapse, toggleCollapse, drag, dragJustEnded, initDrag, getDragTarget, onDragDown, getDragSiblings, onDragMove, onDragUp, saveTaskOrderFromDOM, saveCollectionOrderFromDOM, saveAchDomOrderFromDOM, saveAchOrderFromDOM, saveProdOrderFromDOM, saveShopCatOrderFromDOM };
+export { filterByDomain, toggleInline, toggleMajor, syncMajorCollapse, toggleCollapse, drag, dragJustEnded, initDrag, getDragTarget, onDragDown, getDragSiblings, onDragMove, onDragUp, getChoreDisplayOrder, saveChoreOrderFromDOM, saveTaskOrderFromDOM, saveCollectionOrderFromDOM, saveAchDomOrderFromDOM, saveAchOrderFromDOM, saveProdOrderFromDOM, saveShopCatOrderFromDOM };

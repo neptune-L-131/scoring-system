@@ -4,9 +4,10 @@
 // 不拼接 HTML（HTML 由 render-* + view-primitives 负责），不写 state、不触发渲染。
 // 经济模型保持原样：这里只做展示口径的派生，不改变任何数值与交互。
 
+import { choreCycleOf } from './chore-cycle.js';
 import { calcCheckIn, calcSkip, dayStart, fmt, getTaskDomainIds, logAmt, now, taskCheckedToday, taskIsStaged, taskScoreTypes } from './pure.js';
 import { state } from './state.js';
-import { choreOverdueDays, choreProgressOf, domainName } from './utils.js';
+import { choreDoneNow, choreOverdueDays, choreProgressOf, domainName } from './utils.js';
 
 // 任务卡：打卡预览、阶段条、豁免按钮、标签都从这一份口径取数
 function taskCardView(t) {
@@ -62,15 +63,17 @@ function affairCardView(a) {
   };
 }
 
-// 杂事卡：逾期天数、进度产出、计划日期
+// 杂事卡：逾期天数、进度产出、计划日期；循环杂事额外给出下次到期日
 function choreCardView(c) {
+  const cy = choreCycleOf(c);
   return {
     id: c.id,
     name: c.name,
-    done: !!c.done,
+    done: choreDoneNow(c),
     plannedAt: c.plannedAt || null,
     progressAmount: choreProgressOf(c).amount,
     overdueDays: choreOverdueDays(c),
+    cycle: cy ? { unit: cy.unit, interval: cy.interval, nextDue: cy.nextDue } : null,
   };
 }
 

@@ -2,6 +2,7 @@
 // 把「条件树 → 指标取值」中依赖全局 state 的叶子求值集中在这里；
 // 结构递归与比较在内核 cond-kernel.js，本文件不 import entities / ledger / render，
 // 也不被 conditions.js 之外的业务模块反向依赖（budget 通过 provider 注册注入）。
+import { choreIsCyclic } from './chore-cycle.js';
 import { evalNode as evalTreeNode, opSatisfied } from './cond-kernel.js';
 import { affairLastAdvance, condWindowByRange, dayKey, effectiveLastTs, getTaskDomainIds, idleDaysSince, isAffairMetric, isAssetMetric, isChoreMetric, isPointMetric, isArchivedEntity, round2, validRange } from './pure.js';
 import { state } from './state.js';
@@ -38,7 +39,8 @@ function pointMetricValue(metric,it,ts){
     return max;
   }
   if(metric==='chore_overdue'){
-    return (state.chores||[]).filter(c=>!c.done&&!c.archived&&choreOverdueDays(c,ts)>0).length;
+    // 超期件数只由“到期日 + 是否本周期已完成”决定（choreOverdueDays 内部已处理完成态）
+    return (state.chores||[]).filter(c=>!c.archived&&choreOverdueDays(c,ts)>0).length;
   }
   if(metric==='chore_idle'){
     let max=0;
@@ -318,9 +320,23 @@ function affairWindowValue(metric,it,w,range){
 }
 function choreWindowValue(metric,w,range){
   if(metric==='chore_completed'){
-    return (state.chores||[]).filter(function(c){
-      return c.doneAt&&(range==='total'?true:(c.doneAt>=w.start&&c.doneAt<w.end));
-    }).length;
+    // 循环杂事按完成记录逐条计：doneAt 会被最新一次完成覆盖，不能作为计数口径。
+    // 一次性杂事沿用 doneAt 判定。
+    let n=0;
+    (state.chores||[]).forEach(function(c){
+      const inWindow=function(ts){return range==='total'||(ts>=w.start&&ts<w.end);};
+      if(choreIsCyclic(c)){
+        const hist=Array.isArray(c.history)?c.history:[];
+        hist.forEach(function(e){
+          if(!e||!Number(e.due))return;
+          const ts=Number(e.ts)||0;
+          if(ts>0&&inWindow(ts))n++;
+        });
+        return;
+      }
+      if(c.doneAt&&inWindow(c.doneAt))n++;
+    });
+    return n;
   }
   if(metric==='chore_decay')return sumLogsInWindow(w,function(l){return l.src==='chore-decay';},true);
   if(metric==='chore_batches')return countLogsInWindow(w,function(l){return l.src==='chore-batch';});
