@@ -1,9 +1,10 @@
 // 阶段 4 基线校验（不是 vitest 用例）。
 // 用法：npm run baseline
 //
-// 运行三个 dump 脚本（两条旧账务 + 一条阶段 4 动作流），逐条比对固定 sha256；
+// 运行四个 dump 脚本（两条旧账务 + 一条阶段 4 动作流 + 一条 M3a 退款），逐条比对固定 sha256；
 // 任一不匹配则非零退出。
 // 不修改旧脚本的导出字段与计算逻辑：它们的白名单就是“旧账务未漂移”的信号源。
+// 退款场景是新增的独立基线，不改动已有三条。
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -19,6 +20,7 @@ const SCENARIOS = [
   { name: 'dump-scenario', script: path.join(HERE, 'dump-scenario.mjs') },
   { name: 'dump-scenario2', script: path.join(HERE, 'dump-scenario2.mjs') },
   { name: 'dump-stage4', script: path.join(HERE, 'dump-stage4.mjs') },
+  { name: 'dump-refund', script: path.join(HERE, 'dump-refund.mjs') },
 ];
 
 const sha256 = text => crypto.createHash('sha256').update(text).digest('hex');
@@ -183,7 +185,7 @@ function runScenario(item) {
 const results = SCENARIOS.map(runScenario);
 let failed = 0;
 
-console.log('阶段 4 基线校验（旧账务 2 + 动作流 1）');
+console.log('阶段 4 基线校验（旧账务 2 + 动作流 1 + M3a 退款 1）');
 for (const r of results) {
   if (r.ok) {
     console.log(`[PASS] ${r.name.padEnd(16)} ${r.hash}  sections ${r.sectionCount}`);

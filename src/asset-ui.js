@@ -6,6 +6,7 @@
 // - 所有资产（含默认播种的示例）在编辑权限与操作入口上完全一致。
 import { ASSET_VERSION } from './constants.js';
 import { openModal, closeModal } from './modal-host.js';
+import { markModalClean, rejectFields } from './form-contract.js';
 import { isValidAssetId } from './normalize.js';
 import { save } from './persist.js';
 import { assetLogMeta, esc, escAttr, fmt, now } from './pure.js';
@@ -281,10 +282,48 @@ function openAssetModal(assetId) {
   setFieldValue('assetCycle', def && def.issuePeriod && def.issuePeriod.cycle === 'month' ? 'month' : 'week');
   setFieldValue('assetAnchor', def && def.issuePeriod ? String(def.issuePeriod.anchor || 1) : '1');
   setFieldValue('assetUse', def && def.useRecipe && def.useRecipe.type === 'task-exempt' ? 'task-exempt' : 'none');
-  // 编辑时 ID 不可改（对所有资产一致）
+  // 编辑时 ID 不可改（对所有资产一致）；新建留空则保存时自动生成
   setReadOnly('assetId', !!def);
+  const adv = document.getElementById('accAssetAdvanced');
+  if (adv) adv.classList.remove('open');
   setHint('');
   openModal('assetModal');
+  markModalClean('assetModal');
+}
+
+// 自动生成一个满足 isValidAssetId 且未被占用的默认 ID（只用于新建）
+function nextAssetId(defs) {
+  for (let i = 0; i < 50; i++) {
+    const id = 'a_' + Math.random().toString(36).slice(2, 8);
+    if (isValidAssetId(id) && !defs.some(function (x) { return x && x.id === id; })) return id;
+  }
+  return 'a_' + String(Date.now()).slice(-8);
+}
+
+const ASSET_ERR_FIELD = {
+  ASSET_NOT_FOUND: 'assetId',
+  ASSET_ID_REQUIRED: 'assetId',
+  ASSET_ID_INVALID: 'assetId',
+  ASSET_ID_DUP: 'assetId',
+  ASSET_NAME_REQUIRED: 'assetName',
+  ASSET_NAME_TOO_LONG: 'assetName',
+  ASSET_NAME_DUP: 'assetName',
+  ASSET_MAX_BALANCE_INVALID: 'assetMaxBalance',
+  ASSET_MAX_BALANCE_BELOW_BALANCE: 'assetMaxBalance',
+  ASSET_MAX_ISSUED_INVALID: 'assetMaxIssued',
+  ASSET_MAX_ISSUED_BELOW_METER: 'assetMaxIssued',
+  ASSET_CYCLE_INVALID: 'assetCycle',
+  ASSET_ANCHOR_INVALID: 'assetAnchor',
+};
+
+function assetFieldError(code, msg) {
+  const field = ASSET_ERR_FIELD[code];
+  if (field && field === 'assetId') {
+    const adv = document.getElementById('accAssetAdvanced');
+    if (adv) adv.classList.add('open');
+  }
+  const first = field ? rejectFields('assetModal', [{ field: field, msg: msg }]) : null;
+  if (!first) toast(msg, 'err');
 }
 
 function handleAssetSave() {
@@ -294,9 +333,13 @@ function handleAssetSave() {
   if (originalId && !existing) {
     const lost = fail('ASSET_NOT_FOUND', '资产定义不存在或已被删除');
     setHint(lost.message);
-    toast(lost.message, 'err');
+    assetFieldError(lost.code, lost.message);
     return lost;
   }
+  // 新建且未填 ID：自动生成，旧资产 ID 不受影响
+  const rawId = String(fieldValue('assetId') || '').trim();
+  const draftId = originalId ? originalId : (rawId || nextAssetId(defs));
+  if (!originalId && !rawId) setFieldValue('assetId', draftId);
   const balance = originalId ? balanceOf(originalId) : 0;
   const ctx = {
     defs: defs,
@@ -305,7 +348,7 @@ function handleAssetSave() {
     originalId: originalId,
   };
   const res = validateAssetDraft({
-    id: fieldValue('assetId'),
+    id: draftId,
     name: fieldValue('assetName'),
     unit: fieldValue('assetUnit'),
     maxBalance: fieldValue('assetMaxBalance'),
@@ -317,7 +360,7 @@ function handleAssetSave() {
 
   if (!res.ok) {
     setHint(res.message);
-    toast(res.message, 'err');
+    assetFieldError(res.code, res.message);
     return res;
   }
 

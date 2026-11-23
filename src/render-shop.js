@@ -7,7 +7,7 @@ import { buyProduct, delShopCategory, renameShopCategory } from './library.js';
 import { execBoughtCount } from './exec-quota.js';
 import { confirmDelProd, openProdModal } from './modals.js';
 import { save } from './persist.js';
-import { esc, fmt, fmtTime, now } from './pure.js';
+import { esc, fmt, fmtTime, now, currencyOf, money } from './pure.js';
 import { setScoreCell } from './render-work.js';
 import { render } from './render.js';
 import { state } from './state.js';
@@ -136,6 +136,10 @@ function shopCardHTML(p,catId,prevCatId){
   const loanWarn=willLoan&&!isSoldout&&!gate.deny?' · 贷款'+fmt(p.price-balance):'';
   const soldoutCls=isSoldout?' soldout':'';
   const lockedCls=locked?' locked':'';
+  // 商品现实预算行按所属分类的币种显示；分类已删除时不显示币种符号
+  const budCat=(p.budget&&p.budget.categoryId)?BudgetEngine.category(p.budget.categoryId):null;
+  const budTxt=(p.budget&&p.budget.categoryId&&Number(p.budget.amount)>0)
+    ?'<div class="sh-budget">预算·'+esc(budCat?budCat.name:'已删除分类')+' '+(budCat?money(p.budget.amount,currencyOf(budCat)):'?'+fmt(p.budget.amount))+'</div>':'';
   const dataPrevCat=prevCatId?' data-prev-cat-id="'+prevCatId+'"':'';
   const tierTxt=' · '+(PROD_TIER_NAMES[tier]||PROD_TIER_NAMES.daily);
   const gateHTML=gate.deny?'<div class="sh-gate">'+gate.reasons.map(function(r){return '<div>'+esc(r)+'</div>';}).join('')+'</div>':'';
@@ -152,8 +156,7 @@ function shopCardHTML(p,catId,prevCatId){
     +'<div class="card-top" style="margin-bottom:0"><div class="sh-name">'+esc(p.name)+'</div>'
     +actionsRowHTML('card-actions',dragHandleHTML('拖拽排序或跨分类移动')+'<button onclick="openProdModal(\''+p.id+'\')">编辑</button><button class="del" onclick="confirmDelProd(\''+p.id+'\')">删除</button>')+'</div>'
     +(p.desc?'<div class="sh-desc">'+esc(p.desc)+'</div>':'')
-    +((p.budget&&p.budget.categoryId&&Number(p.budget.amount)>0)
-      ?'<div class="sh-budget">预算·'+esc((BudgetEngine.category(p.budget.categoryId)||{name:'已删除分类'}).name)+' '+fmt(p.budget.amount)+'</div>':'')
+    +budTxt
     +(grantTxt?'<div class="sh-budget">'+esc(grantTxt)+'</div>':'')
     +(execTxt?'<div class="sh-budget">'+esc(execTxt)+'</div>':'')
     +'<div class="sh-cost '+(isV?'v':'a')+'">'+fmt(p.price)+'<span class="unit">'+cn+tierTxt+stockTxt+debtTxt+loanWarn+assetTxt+'</span></div>'

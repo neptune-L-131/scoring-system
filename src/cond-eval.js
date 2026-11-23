@@ -364,6 +364,9 @@ function evalCondItem(it,act,ts){
   // budget_remaining 是点态指标（读分类剩余额度），不走预算规则上下文
   if(it.metric.indexOf('budget_')===0&&it.metric!=='budget_remaining'){
     const bc=(act&&act.budgetCtx)||{};
+    // 混合币种：跨分类金额不可加总，金额指标 fail-closed（条件不成立）；
+    // 笔数是纯计数，不受币种影响。
+    if(bc.mixed===true&&it.metric!=='budget_entry_count')return false;
     let val=0;
     if(it.metric==='budget_entry_amount')val=Number(bc.entryAmount)||0;
     else if(it.metric==='budget_period_spent')val=Number(bc.spent)||0;

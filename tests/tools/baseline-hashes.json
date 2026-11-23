@@ -79,5 +79,28 @@
       "segB.run3": "035785dd9ce21530b6cb6290a7487b267152a4f8fcb7bc984f6170a98a281260",
       "segB.flags": "75502f303bdc75e8dfd3bb69debcb5f280c0edbeeb67ab18f9a42d1d26ba40d9"
     }
+  },
+  "dump-refund": {
+    "hash": "35c156a2a689ba7cc4e3e76dd021c861c8126e81f5b619a74394e84317a26e23",
+    "sections": {
+      "scores": "00f2aaadb505ce2b9bcbfbe6053ad8ed82666971e2a1047811cfeeb88b387971",
+      "scores.vitality": "69f59c273b6e669ac32a6dd5e1b2cb63333d8b004f9696447aee2d422ce63763",
+      "scores.progress": "246531061da9c639f65ca07e620c225f86a74b0205ea4252ab086963dd77b3be",
+      "scores.achievement": "9537f32ec7599e1ae953af6c9f929fe747ff9dadf79a9beff1f304c550173011",
+      "activity": "d03c2bc13518a2cd49617a15fe9be014ce0a241967d5b3bad3a15447c85fb032",
+      "activity.entryAmount": "2abaca4911e68fa9bfbf3482ee797fd5b9045b841fdff7253557c5fe15de6477",
+      "activity.spent": "7b69759630f869f2723875f873935fed29d2d12b10ef763c1c33b8e0004cb405",
+      "activity.overspend": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9",
+      "activity.entryCount": "d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35",
+      "activity.currency": "8e06735c89d493d78ff5f12b2e47a5f055f1334b7a540bd6c58345195ee9c153",
+      "activity.mixed": "fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa",
+      "remaining": "c79b70922ef695480c2ece3cde3ea78d34af426d4887ca154b65d9e664d1dbce",
+      "remaining.bc1": "39fa9ec190eee7b6f4dff1100d6343e10918d044c75eac8f9e9a2596173f80c9",
+      "remaining.bc2": "624b60c58c9d8bfb6ff1886c2fd605d2adeb6ea4da576068201b6c6958ce93f4",
+      "periods": "55bec4f4bb52fb0b71153195f2426bbed97493b5ff57352276f8aeed3fffc19b",
+      "periods.bc1": "2401f50e3ce4e3b25b7c490927ed0884b650cf4cc2ab5709003074c392044648",
+      "periods.bc2": "79173d4f25cf9fdac10917414bc74de3a12df722e1a6e41e579e055773e47b7c",
+      "ledger": "be0d0bdaf7dba75d648c8f4bb9b8f31323945fa13013c5aad0a60e3ffc0e3032"
+    }
   }
 }

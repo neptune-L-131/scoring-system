@@ -73,6 +73,22 @@ function descOf(params, fallback) {
   return d ? d.slice(0, 120) : fallback;
 }
 
+// 摘要用的中性标签：原子层不读 state，UI 层可传入带名称的解析器覆盖。
+// account / asset 缺省回退原始键；kind 是纯枚举映射，可在此翻译。
+const PLAIN_LABELS = {
+  account: v => (v === undefined || v === null || v === '') ? '未选账户' : String(v),
+  asset: v => (v === undefined || v === null || v === '') ? '未选资产' : String(v),
+  task: v => (typeof v === 'string' && v) ? '任务 ' + v : '运行时指定任务',
+};
+function labelsOf(labels) {
+  const src = labels && typeof labels === 'object' ? labels : {};
+  const pick = (k) => typeof src[k] === 'function' ? src[k] : PLAIN_LABELS[k];
+  return { account: pick('account'), asset: pick('asset'), task: pick('task') };
+}
+function kindLabel(kind) {
+  return kind === 'affair' ? '项目' : kind === 'chore' ? '杂事' : '任务';
+}
+
 // 货币金额：>0、最多 2 位小数、单步 ≤ 100
 function currencyAmount(v) {
   const n = Number(v);
@@ -370,7 +386,7 @@ function entityCreate(ctx, params) {
     fail('FLOW_BAD_PARAMS', { field: 'domainId' });
   }
   const list = createEntitiesFromTemplate(kind, { name: name, count: count, domainId: domainId, amount: amount }, ctx.ts);
-  const kindName = kind === 'affair' ? '项目' : kind === 'chore' ? '杂事' : '任务';
+  const kindName = kindLabel(kind);
   list.forEach(function (e) {
     Ledger.event('按模板创建' + kindName + '「' + e.name + '」', 'entity-create', {
       kind: e.kind, entityId: e.id, flowRunId: ctx.runId || '', stepId: ctx.stepId || '',
@@ -424,46 +440,62 @@ function taskExempt(ctx, params) {
 
 const FLOW_ATOMS = {
   'currency.grant': {
-    id: 'currency.grant', params: ['account', 'amount', 'desc', 'taskId', 'split'], run: currencyGrant,
-    describe: p => '发放 ' + p.amount + ' 到 ' + (p.split === 'allDomains' ? '全部领域均分' : p.account),
+    id: 'currency.grant', name: '发放数值',
+    params: ['account', 'amount', 'desc', 'taskId', 'split'], run: currencyGrant,
+    describe: (p, L) => (p.split === 'allDomains'
+      ? '向全部领域均分发放 ' + p.amount
+      : '向「' + L.account(p.account) + '」发放 ' + p.amount) +
+      (p.taskId ? '（关联任务「' + L.task(p.taskId) + '」）' : ''),
   },
   'currency.spend': {
-    id: 'currency.spend', params: ['account', 'amount', 'desc'], run: currencySpend,
-    describe: p => '从 ' + p.account + ' 扣除 ' + p.amount,
+    id: 'currency.spend', name: '扣除数值',
+    params: ['account', 'amount', 'desc'], run: currencySpend,
+    describe: (p, L) => '从「' + L.account(p.account) + '」扣除 ' + p.amount,
   },
   'asset.grant': {
-    id: 'asset.grant', params: ['assetId', 'amount', 'desc', 'cap'], run: assetGrant,
-    describe: p => '发放资产 ' + p.assetId + ' ×' + p.amount +
-      (p.cap !== undefined && p.cap !== null && p.cap !== '' ? '（上限 ' + p.cap + '）' : ''),
+    id: 'asset.grant', name: '发放资产',
+    params: ['assetId', 'amount', 'desc', 'cap'], run: assetGrant,
+    describe: (p, L) => '发放资产「' + L.asset(p.assetId) + '」×' + p.amount +
+      (p.cap !== undefined && p.cap !== null && p.cap !== '' ? '（单次上限 ' + p.cap + '）' : ''),
   },
   'asset.spend': {
-    id: 'asset.spend', params: ['assetId', 'amount', 'desc'], run: assetSpend,
-    describe: p => '消耗资产 ' + p.assetId + ' ×' + p.amount,
+    id: 'asset.spend', name: '消耗资产',
+    params: ['assetId', 'amount', 'desc'], run: assetSpend,
+    describe: (p, L) => '消耗资产「' + L.asset(p.assetId) + '」×' + p.amount,
   },
   'entity.archiveIdle': {
-    id: 'entity.archiveIdle', params: ['kind', 'idleDays', 'desc'], run: archiveIdle,
-    describe: p => '归档不活跃 ' + p.idleDays + ' 天的 ' + p.kind,
+    id: 'entity.archiveIdle', name: '归档闲置事项',
+    params: ['kind', 'idleDays', 'desc'], run: archiveIdle,
+    describe: p => '归档 ' + p.idleDays + ' 天未活跃的' + kindLabel(p.kind),
   },
   'entity.create': {
     id: 'entity.create', name: '创建事项',
     params: ['kind', 'name', 'domainId', 'amount', 'count'], run: entityCreate,
     describe: p => '创建 ' + (Number(p.count) > 1 ? Number(p.count) + ' 个' : '') +
-      (p.kind === 'affair' ? '项目' : p.kind === 'chore' ? '杂事' : '任务') + '「' + (p.name || '') + '」',
+      kindLabel(p.kind) + '「' + (p.name || '') + '」',
   },
   'log.note': {
-    id: 'log.note', params: ['desc'], run: logNote,
-    describe: p => '记录：' + (p.desc || ''),
+    id: 'log.note', name: '写入记录',
+    params: ['desc'], run: logNote,
+    describe: p => '写入记录：' + (p.desc || ''),
   },
   'engine.recheckAchievements': {
-    id: 'engine.recheckAchievements', params: [], run: recheckAchievements,
+    id: 'engine.recheckAchievements', name: '复核成就',
+    params: [], run: recheckAchievements,
     describe: () => '复核成就解锁',
   },
   'task.exempt': {
-    id: 'task.exempt', params: ['taskId', 'desc'], run: taskExempt,
-    describe: p => '豁免任务 ' + (typeof p.taskId === 'string' ? p.taskId : '(运行时指定)'),
+    id: 'task.exempt', name: '豁免任务',
+    params: ['taskId', 'desc'], run: taskExempt,
+    describe: (p, L) => (typeof p.taskId === 'string' && p.taskId
+      ? '豁免任务「' + L.task(p.taskId) + '」'
+      : '豁免任务（运行时指定任务）'),
   },
 };
 const FLOW_ATOM_IDS = Object.keys(FLOW_ATOMS);
+// 可供用户在下拉里新增的原子：task.exempt 的 taskId 只能由资产使用配方在运行时注入，
+// 手动选择必然因参数缺失而 FLOW_BAD_PARAMS。注册与实现保留，用于旧配置和配方。
+const FLOW_ATOM_SELECTABLE_IDS = FLOW_ATOM_IDS.filter(function (id) { return id !== 'task.exempt'; });
 
 // 原子统一入口：事务断言 → 原子白名单 → 参数白名单 → 步骤数上限 → 执行
 function runFlowAtom(atomId, params, ctx) {
@@ -480,9 +512,11 @@ function runFlowAtom(atomId, params, ctx) {
   return result;
 }
 
-function describeFlowAtom(atomId, params) {
+// labels：可选的中文标签解析器 { account, asset, task }，由 UI 层按 state 提供；
+// 缺省时回退原始键，保证原子层不依赖全局 state。
+function describeFlowAtom(atomId, params, labels) {
   const atom = FLOW_ATOMS[atomId];
-  return atom ? atom.describe(params || {}) : '';
+  return atom ? atom.describe(params || {}, labelsOf(labels)) : '';
 }
 
-export { FLOW_ATOMS, FLOW_ATOM_IDS, runFlowAtom, describeFlowAtom, assetPeriodKeyOf };
+export { FLOW_ATOMS, FLOW_ATOM_IDS, FLOW_ATOM_SELECTABLE_IDS, runFlowAtom, describeFlowAtom, assetPeriodKeyOf };

@@ -122,7 +122,7 @@ function choreToAffair(id) {
   state.affairs.push(a);
   const ev = writeConvertEvent('杂事「' + c.name + '」转为项目', c.id);
   pushRecord(sealRecord(rec));
-  commit('已转为项目「' + c.name + '」');
+  commit('已转为项目「' + c.name + '」，可在项目「⋯」里撤销转换');
   return { ok: true, id: c.id, logId: ev && ev.id };
 }
 
@@ -162,7 +162,7 @@ function affairToChore(id) {
   state.choreOrder = choreOrderInsert(state.choreOrder, c.id);
   const ev = writeConvertEvent('项目「' + a.name + '」转为杂事', a.id);
   pushRecord(sealRecord(rec));
-  commit('已转为杂事「' + a.name + '」');
+  commit('已转为杂事「' + a.name + '」，打开该杂事可撤销转换');
   return { ok: true, id: a.id, logId: ev && ev.id };
 }
 

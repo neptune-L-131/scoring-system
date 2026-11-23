@@ -1,6 +1,6 @@
 import { BudgetEngine } from './budget.js';
 import { closeModal, openModal } from './modal-host.js';
-import { esc, fmt, now, round4 } from './pure.js';
+import { esc, fmt, now, round4, currencyOf, money } from './pure.js';
 import { state } from './state.js';
 import { toast } from './toast.js';
 // budget-binding.js —— 事项（任务/项目/杂事）× 现实预算的绑定、执行与联动撤销
@@ -28,7 +28,10 @@ export function normalizeBudgetBinding(b,ctx){
   const lastAmount=Math.max(0,Math.round((Number(b.lastAmount)||0)*1e4)/1e4);
   const catIds=ctx&&ctx.catIds;
   const stale=catIds?(!catIds.has(categoryId)):!!b.stale;
-  return{categoryId:categoryId,mode:mode,amount:amount,lastAmount:lastAmount,stale:stale};
+  const out={categoryId:categoryId,mode:mode,amount:amount,lastAmount:lastAmount,stale:stale};
+  // 方向是可选语义字段：合法就保留，缺失就继续缺失（读取层缺省 spend），不补默认值
+  if(b.direction==='refund'||b.direction==='spend')out.direction=b.direction;
+  return out;
 }
 export function normalizeBudgetRef(ref){
   if(!ref||typeof ref!=='object')return null;
@@ -48,6 +51,8 @@ export function budgetOf(entity){
   return{
     categoryId:categoryId,
     mode:entity.budget.mode==='prompt'?'prompt':'fixed',
+    // 旧绑定缺 direction 一律读作支出；不写回
+    direction:entity.budget.direction==='refund'?'refund':'spend',
     amount:round4(Number(entity.budget.amount)||0),
     lastAmount:round4(Number(entity.budget.lastAmount)||0),
     stale:!!entity.budget.stale
@@ -75,6 +80,12 @@ export function resolveActionBudget(entity,opts){
   }
   amount=round4(Math.max(0,Number(amount)||0));
   if(!(amount>0))return{status:'skip',reason:'预算金额无效，本次未记现实账'};
+  // 退回走独立计划：不做花前校验、不发放惩罚/反哺，只校验可退上限
+  if(bind.direction==='refund'){
+    const pv=BudgetEngine.prepareRefund(bind.categoryId,amount,opts.ts||now());
+    if(!pv.ok)return{status:'skip',reason:(pv.reason||'退回校验未通过')+'，本次未记现实账'};
+    return{status:'ok',plan:pv,bind:bind,cat:cat,amount:amount,direction:'refund'};
+  }
   const pv=BudgetEngine.preview(bind.categoryId,amount,opts.ts||now());
   if(!pv.ok)return{status:'skip',reason:(pv.reason||'预算校验未通过')+'，本次未记现实账'};
   let plan=null;
@@ -106,6 +117,12 @@ export function budgetRefOf(entry,plan,extra){
     amount:round4(Number(plan.amount)||0),periodKey:String(plan.periodKey||entry.periodKey||'')
   };
 }
+// 执行侧统一写入口：支出走 commitEntry，退回走独立的 commitRefund。
+// 两条路径互不替代——退回绝不能落进支出写入，否则会把方向语义写反。
+export function commitActionBudget(tx,plan,extra){
+  if(plan&&plan.direction==='refund')return BudgetEngine.commitRefund(tx,plan,extra);
+  return BudgetEngine.commitEntry(tx,plan,extra);
+}
 
 // ===== 撤销联动：当期硬撤 / 跨期冲正；已撤销视为幂等成功 =====
 export function reverseBoundBudget(ref){
@@ -120,6 +137,13 @@ export function reverseBoundBudget(ref){
   const rp=BudgetEngine.readPeriod(cat,now());
   const curKey=(rp&&rp.b&&rp.b.key)||'';
   const samePeriod=!!(entry&&curKey&&entry.periodKey===curKey&&rp.period&&rp.period.end>now());
+  // 退回必须分流到独立入口：绝不能落到 reverseEntry（支出撤销）或 compensateEntry（再记一笔退回）
+  if(entry&&entry.source==='refund'){
+    if(!samePeriod)throw budgetFail('BUDGET_REFUND_CROSS_PERIOD','跨期退回不可撤销');
+    const rev=BudgetEngine.reverseRefund(entry.id);
+    if(!rev.ok)throw budgetFail(rev.code||'BUDGET_REFUND_REVERSE_FAILED',rev.reason||'撤销退回失败');
+    return{ok:true,mode:'reverse-refund'};
+  }
   if(samePeriod){
     const rev=BudgetEngine.reverseEntry(entry.id);
     if(!rev.ok)throw budgetFail('BUDGET_REVERSE_FAILED','撤销现实账目失败');
@@ -145,10 +169,16 @@ export function budgetBindingHTML(prefix,entity){
     opts+='<option value="'+esc(bind.categoryId)+'" selected>已删除的分类</option>';
   }
   const mode=bind?bind.mode:'fixed';
+  // 方向缺省为支出：旧绑定读进来仍是支出，金额始终输入正数
+  const dir=bind&&bind.direction==='refund'?'refund':'spend';
   return '<div class="fg budget-bind">'
     +'<label>现实预算 <span class="h">绑定后，打卡 / 项目推进 / 杂事勾选会自动记一笔现实账</span></label>'
     +'<div class="bud-row">'
     +'<select id="'+prefix+'BudCat" onchange="budgetBindingModeChange(\''+prefix+'\')">'+opts+'</select>'
+    +'<select id="'+prefix+'BudDir" onchange="budgetBindingModeChange(\''+prefix+'\')">'
+    +'<option value="spend"'+(dir==='spend'?' selected':'')+'>支出</option>'
+    +'<option value="refund"'+(dir==='refund'?' selected':'')+'>退回</option>'
+    +'</select>'
     +'<select id="'+prefix+'BudMode" onchange="budgetBindingModeChange(\''+prefix+'\')">'
     +'<option value="fixed"'+(mode==='fixed'?' selected':'')+'>固定金额</option>'
     +'<option value="prompt"'+(mode==='prompt'?' selected':'')+'>每次输入</option>'
@@ -160,26 +190,52 @@ export function budgetBindingHTML(prefix,entity){
     +'<div class="bud-hint" id="'+prefix+'BudHint">'+bindingHint(bind)+'</div>'
     +'</div>';
 }
+// 本期可退上限 = 净花费（已花 - 本期冲正/退回）
+function refundableOf(categoryId){
+  const cat=BudgetEngine.category(categoryId);
+  if(!cat)return 0;
+  const rp=BudgetEngine.readPeriod(cat,now());
+  return rp.period?BudgetEngine.netSpentOf(rp.period):0;
+}
+function refundLimitHint(categoryId){
+  const cat=BudgetEngine.category(categoryId);
+  const rp=BudgetEngine.readPeriod(cat,now());
+  if(rp.period&&(rp.period.rewardSettled||rp.period.closedAt))
+    return '本期账期已结算，不能再登记退回；下个账期开始后按新的净花费计算可退上限。';
+  return '本期最多可退 '+money(refundableOf(categoryId),currencyOf(cat))+'；已结算账期不能退回。';
+}
 function bindingHint(bind){
-  if(!bind)return '未绑定：执行事项不会产生现实账目。';
+  if(!bind)return '未绑定：执行时不会产生现实账目。';
   if(bind.stale)return '绑定的预算分类已失效：执行时不会记账，请重新选择。';
+  const cat=BudgetEngine.category(bind.categoryId);
+  if(bind.direction==='refund'){
+    if(bind.mode==='prompt')return '每次执行时弹窗输入退回金额；'+refundLimitHint(bind.categoryId);
+    return '每次执行按固定金额 '+money(bind.amount,currencyOf(cat))+' 登记退回；'+refundLimitHint(bind.categoryId);
+  }
   if(bind.mode==='prompt')return '每次执行时弹窗输入金额；取消则整个动作不执行。';
-  return '每次执行按固定金额 '+fmt(bind.amount)+' 记一笔现实账。';
+  return '每次执行按固定金额 '+money(bind.amount,currencyOf(cat))+' 记一笔现实账。';
 }
 export function budgetBindingModeChange(prefix){
   const cat=document.getElementById(prefix+'BudCat');
+  const dir=document.getElementById(prefix+'BudDir');
   const mode=document.getElementById(prefix+'BudMode');
   const amt=document.getElementById(prefix+'BudAmount');
   const hint=document.getElementById(prefix+'BudHint');
   if(amt)amt.disabled=!!(mode&&mode.value==='prompt')||!(cat&&cat.value);
   if(hint){
-    if(!cat||!cat.value)hint.textContent='未绑定：执行事项不会产生现实账目。';
-    else if(mode&&mode.value==='prompt')hint.textContent='每次执行时弹窗输入金额；取消则整个动作不执行。';
-    else hint.textContent='每次执行按固定金额记一笔现实账。';
+    if(!cat||!cat.value)hint.textContent='未绑定：执行时不会产生现实账目。';
+    else hint.textContent=bindingHint({
+      categoryId:String(cat.value||''),
+      mode:(mode&&mode.value==='prompt')?'prompt':'fixed',
+      direction:(dir&&dir.value==='refund')?'refund':'spend',
+      amount:round4(Math.max(0,Number(amt&&amt.value)||0)),
+      stale:false
+    });
   }
 }
 export function readBudgetBinding(prefix){
   const cat=document.getElementById(prefix+'BudCat');
+  const dir=document.getElementById(prefix+'BudDir');
   const mode=document.getElementById(prefix+'BudMode');
   const amt=document.getElementById(prefix+'BudAmount');
   const last=document.getElementById(prefix+'BudLast');
@@ -187,6 +243,7 @@ export function readBudgetBinding(prefix){
   if(!categoryId)return null;
   return{
     categoryId:categoryId,
+    direction:(dir&&dir.value==='refund')?'refund':'spend',
     mode:(mode&&mode.value==='prompt')?'prompt':'fixed',
     amount:round4(Math.max(0,Number(amt&&amt.value)||0)),
     lastAmount:round4(Math.max(0,Number(last&&last.value)||0)),
@@ -199,8 +256,11 @@ export function budgetBadgeHTML(entity){
   const cat=BudgetEngine.category(b.categoryId);
   const name=cat?cat.name:'预算分类已失效';
   const stale=!cat||b.stale||!!cat.archived||cat.enabled===false;
-  const amt=b.mode==='prompt'?'待填':('¥'+fmt(b.amount));
-  return '<span class="bud-badge'+(stale?' stale':'')+'" title="现实预算">'+amt+' · '+esc(name)+'</span>';
+  // 分类已删除/失效时不显示币种符号，避免把未知币种误标成 ¥
+  const amt=b.mode==='prompt'?'待填':stale?('?'+fmt(b.amount)):money(b.amount,currencyOf(cat));
+  // 退回徽标带方向前缀；支出徽标保持今天的形式，减少无谓的视觉差异
+  const dir=b.direction==='refund'?'退回 ':'';
+  return '<span class="bud-badge'+(stale?' stale':'')+'" title="现实预算">'+dir+amt+' · '+esc(name)+'</span>';
 }
 
 // ===== 金额弹窗（事务之前完成）=====
@@ -215,16 +275,19 @@ export function openBudgetAmountDialog(opts){
   const bind=budgetOf(opts.entity);
   if(!bind)return;
   const cat=BudgetEngine.category(bind.categoryId);
+  const isRefund=bind.direction==='refund';
   amountDialog=opts;
   const title=document.getElementById('budgetAmountTitle');
   const catEl=document.getElementById('budgetAmountCat');
   const input=document.getElementById('budgetAmountInput');
   const hint=document.getElementById('budgetAmountHint');
-  if(title)title.textContent=opts.title||'记录现实花费';
-  if(catEl)catEl.textContent=cat?cat.name:'';
+  if(title)title.textContent=(opts.title||(isRefund?'登记现实退回':'记录现实花费'));
+  if(catEl)catEl.textContent=cat?cat.name+' · '+currencyOf(cat)+(isRefund?' · 退回':''):'';
   const draft=budgetDrafts.has(draftKey(opts.kind,opts.id))?budgetDrafts.get(draftKey(opts.kind,opts.id)):bind.lastAmount;
   if(input)input.value=draft>0?draft:'';
-  if(hint)hint.textContent='取消则本次动作不执行；金额只在确认后写入。';
+  if(hint)hint.textContent=isRefund
+    ?'取消则本次动作不执行；退回只增加可用额度，不递减已花、不计入结余奖励。已结算账期不能退回。'
+    :'取消则本次动作不执行；金额只在确认后写入。';
   renderAmountPreview();
   openModal('budgetAmountModal');
   if(input)setTimeout(function(){input.focus();input.select();},40);
@@ -235,10 +298,22 @@ function renderAmountPreview(){
   if(!box||!amountDialog)return;
   const v=round4(Number(document.getElementById('budgetAmountInput').value)||0);
   if(!(v>0)){box.innerHTML='<span class="dim">输入金额后显示本期预算与惩罚预估</span>';return;}
+  const bind=budgetOf(amountDialog.entity);
+  // 退回走独立预览：只显示净花费与可退上限，不展示惩罚/反哺
+  if(bind&&bind.direction==='refund'){
+    const rp=BudgetEngine.prepareRefund(bind.categoryId,v,now());
+    if(!rp.ok){box.innerHTML='<span class="neg">'+esc(rp.reason||'退回校验未通过')+'</span>';return;}
+    const rcur=currencyOf(rp.cat);
+    box.innerHTML='本期净花费 <b>'+money(rp.netBefore,rcur)+'</b> · 可退上限 <b>'+money(rp.netBefore,rcur)+'</b>'
+      +' · 退回后 <b>'+money(rp.netAfter,rcur)+'</b>'
+      +' · <span class="dim">退回不递减已花，也不计入结余奖励</span>';
+    return;
+  }
   const pv=BudgetEngine.preview(amountDialog.entity.budget.categoryId,v,now());
   if(!pv.ok){box.innerHTML='<span class="neg">'+esc(pv.reason||'预算校验未通过')+'</span>';return;}
-  let html='本期已花 <b>'+fmt(pv.netBefore)+'</b> / 限额 <b>'+fmt(pv.limitAfter)+'</b>'
-    +' · 本笔后 <b>'+fmt(pv.netAfter)+'</b>';
+  const cur=currencyOf(pv.cat);
+  let html='本期已花 <b>'+money(pv.netBefore,cur)+'</b> / 限额 <b>'+money(pv.limitAfter,cur)+'</b>'
+    +' · 本笔后 <b>'+money(pv.netAfter,cur)+'</b>';
   const pen=pv.effects.filter(function(e){return e.kind==='penalty';});
   if(pen.length)html+=' · 预计惩罚 <b class="neg">'+pen.map(function(e){return fmt(e.amount);}).join(' + ')+'</b>';
   const fb=pv.effects.filter(function(e){return e.kind==='feedback';});

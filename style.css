@@ -26,6 +26,8 @@
   --toast-fg:#fff;
   /* 允许 height:auto 与 0 之间过渡（兼容旧浏览器时退化为瞬间切换） */
   interpolate-size:allow-keywords;
+  /* 原生控件基础配色随主题走 */
+  color-scheme:light;
 }
 
 [data-theme="dark"]{
@@ -51,11 +53,23 @@
   --modal-overlay:rgba(0,0,0,.45);
   --toast-bg:#c8c8cc;
   --toast-fg:#2a2a2a;
+  color-scheme:dark;
 }
 
 [data-theme="dark"] .modal-bg{background:var(--modal-overlay)}
 
-html{background:var(--bg);overflow-x:clip}
+html{
+  background:var(--bg);overflow-x:clip;
+  /* 滚动条窄一些，且始终预留槽位：内容宽度不随滚动条出现/消失而跳动 */
+  scrollbar-width:thin;
+  scrollbar-color:var(--border-2) transparent;
+  scrollbar-gutter:stable;
+}
+/* 不支持标准滚动条属性的 Chromium 回退：同样用主题变量取色 */
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border-2);border-radius:5px}
+::-webkit-scrollbar-thumb:hover{background:var(--text-3)}
 
 body{
   font-family:-apple-system,BlinkMacSystemFont,'PingFang SC','Microsoft YaHei','Segoe UI',sans-serif;
@@ -70,27 +84,36 @@ body{
 }
 
 /* ===== Header ===== */
+/* 顶栏与标签栏共用一个吸附容器：标签栏的落点由顶栏实际高度决定，
+   不再写死 top 值，窄屏顶栏变高时也不会被遮住 */
+.app-top{position:sticky;top:0;z-index:100;background:var(--surface)}
 .app-header{
   background:var(--surface);
   border-bottom:1px solid var(--border);
   padding:14px 20px;
-  display:flex;align-items:center;justify-content:space-between;
-  position:sticky;top:0;z-index:100;
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
 }
 .app-title{font-size:17px;font-weight:600;letter-spacing:-.3px}
 .app-date{font-size:12px;color:var(--text-3);margin-top:2px}
-.header-btns{display:flex;gap:6px}
+.header-btns{display:flex;gap:6px;flex-wrap:nowrap;flex-shrink:0}
 .hbtn{
   background:none;border:1px solid var(--border);color:var(--text-2);
   border-radius:var(--radius);padding:5px 11px;font-size:12px;cursor:pointer;
-  transition:all .15s;font-family:inherit;
+  transition:all .15s;font-family:inherit;white-space:nowrap;
 }
 .hbtn:hover{background:var(--surface-2);border-color:var(--border-2)}
+/* 窄屏：收紧内边距与字号，四个按钮保持单排，顶栏高度不因换行上涨 */
+@media(max-width:420px){
+  .app-header{padding:14px 12px;gap:8px}
+  .app-title{font-size:16px}
+  .app-date{font-size:11px;white-space:nowrap}
+  .header-btns{gap:4px}
+  .hbtn{padding:5px 7px;font-size:11px}
+}
 
 /* ===== Tabs ===== */
 .tab-bar{
   display:flex;background:var(--surface);border-bottom:1px solid var(--border);
-  position:sticky;top:52px;z-index:99;
 }
 .tab{
   flex:1;text-align:center;padding:12px 0;font-size:14px;font-weight:500;
@@ -196,13 +219,14 @@ body{
 .shop-card[data-prod-id]{
   touch-action:auto;
 }
-/* touch-action:pan-y 让把手上的纵向滑动仍交给页面滚动，只有横向手势留给拖拽；
-   不要把整页设成 none，否则页面会被一起锁死 */
+/* touch-action:none 只作用在把手上：触屏按住把手即可纵向拖拽排序，
+   不再要求先横向位移；页面其它区域仍可正常滚动 */
 .drag-handle{
   display:inline-flex;align-items:center;justify-content:center;
   width:24px;height:24px;cursor:grab;user-select:none;
   color:var(--text-3);border-radius:4px;flex-shrink:0;
-  font-size:16px;line-height:1;touch-action:pan-y;
+  font-size:16px;line-height:1;touch-action:none;
+  -webkit-touch-callout:none;
   transition:background .15s,color .15s;
 }
 .drag-handle:hover{background:var(--surface-2);color:var(--text-2)}
@@ -211,7 +235,8 @@ body{
   display:flex;align-items:center;justify-content:center;
   width:100%;height:20px;cursor:grab;user-select:none;
   color:var(--text-3);border-radius:4px;
-  font-size:16px;line-height:1;touch-action:pan-y;
+  font-size:16px;line-height:1;touch-action:none;
+  -webkit-touch-callout:none;
   transition:background .15s,color .15s;
 }
 .drag-handle-h:hover{background:var(--surface-2);color:var(--text-2)}
@@ -307,11 +332,15 @@ body{
 .modal-bg{
   position:fixed;inset:0;background:var(--modal-overlay);
   display:none;align-items:center;justify-content:center;z-index:1000;padding:16px;
+  overscroll-behavior:contain;
 }
 .modal-bg.show{display:flex}
+/* 弹窗打开期间锁背景滚动（由 modal-host.js 同步 class），关闭后恢复原滚动位置 */
+html.modal-lock{overflow:hidden}
 .modal{
   background:var(--surface);border:1px solid var(--border);border-radius:12px;
   padding:22px;width:100%;max-width:380px;max-height:90vh;overflow-y:auto;
+  overscroll-behavior:contain;
 }
 .modal h2{font-size:16px;font-weight:600;margin-bottom:18px}
 .fg{margin-bottom:14px}
@@ -341,8 +370,32 @@ body{
 .type-opt.sel.p{border-color:var(--progress);color:var(--progress);background:var(--tag-p-bg)}
 .type-opt.sel.a{border-color:var(--achievement);color:var(--achievement);background:var(--tag-a-bg)}
 
-.modal-foot{display:flex;gap:10px;margin-top:20px}
-.modal-foot .btn{flex:1;padding:10px;font-size:14px}
+/* 所有编辑弹窗共用：footer 固定在底部，取消靠左、保存靠右，长表单滚动时始终可见 */
+.modal-foot{
+  display:flex;gap:10px;align-items:center;
+  position:sticky;bottom:-22px;z-index:2;
+  margin:20px -22px -22px;padding:12px 22px;
+  background:var(--surface);border-top:1px solid var(--border);
+  box-shadow:0 -6px 14px -10px rgba(0,0,0,.25);
+}
+.modal-foot .btn{flex:0 0 auto;padding:9px 16px;font-size:14px}
+/* 第一个按钮（取消）靠左，其余次级操作与主按钮靠右 */
+.modal-foot .btn:first-child{margin-right:auto}
+/* 杂事 footer 的“更多”菜单：把低频/危险操作收起来，窄屏不挤压 */
+.foot-more{position:relative;flex:0 0 auto}
+.foot-more>summary{list-style:none;cursor:pointer;display:inline-flex;align-items:center;gap:4px}
+.foot-more>summary::-webkit-details-marker{display:none}
+.foot-more[open]>summary{background:var(--surface-2);border-color:var(--border-2)}
+.foot-menu{
+  position:absolute;right:0;bottom:calc(100% + 6px);min-width:148px;
+  display:flex;flex-direction:column;gap:6px;padding:8px;
+  background:var(--surface);border:1px solid var(--border-2);border-radius:var(--radius);
+  box-shadow:0 8px 24px rgba(0,0,0,.18);z-index:3;
+}
+.foot-menu .btn{width:100%;justify-content:center}
+/* 字段级校验：错误紧贴字段，输入框同步标红 */
+.field-err{font-size:11px;color:var(--danger);margin-top:5px;line-height:1.5}
+.fg input.invalid,.fg select.invalid,.fg textarea.invalid{border-color:var(--danger)}
 /* ===== 删除项目：委派杂事去留 ===== */
 .affair-del-hint{font-size:13px;color:var(--text-2);line-height:1.7;margin-bottom:10px}
 .affair-del-list{
@@ -483,6 +536,10 @@ body{
 
 /* ===== Log ===== */
 .log-list{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden}
+.ledger-undo-note{font-size:11px;color:var(--text-3);line-height:1.6;margin:-2px 0 8px}
+.conv-notice{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 12px;padding:8px 10px;border:1px dashed var(--border-2);border-radius:var(--radius);font-size:12px;color:var(--text-2)}
+.conv-notice-hint{color:var(--text-3);font-size:11px}
+.conv-notice .btn{margin-left:auto}
 .log-item{display:flex;align-items:center;gap:10px;padding:9px 13px;border-bottom:1px solid var(--border);font-size:12px}
 .log-item:last-child{border-bottom:none}
 .log-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
@@ -708,6 +765,9 @@ body{
   .score-bar{gap:8px}.score-cell{padding:10px 6px}
   .bank-grid{grid-template-columns:1fr}.shop-grid{grid-template-columns:1fr}
   .tab{font-size:13px}.page{padding:14px 12px 60px}
+  /* 窄屏表单：多列并排会压扁控件，统一改为单列 */
+  .fg-row{flex-direction:column;gap:0}
+  .fg-row .fg:last-child{margin-bottom:0}
 }
 
 /* ===== 条件芯片编辑器（周期活动前提条件）===== */
@@ -803,10 +863,19 @@ body{
 .slide-row:last-child{margin-bottom:0}
 .slide-label{width:76px;font-size:12px;color:var(--text-2);flex-shrink:0}
 .slide-track{
-  flex:1;height:16px;background:var(--surface-2);border:1px solid var(--border-2);
+  flex:1;height:18px;background:var(--surface-2);border:1px solid var(--border-2);
   border-radius:9px;overflow:hidden;cursor:pointer;touch-action:none;position:relative;
 }
-.slide-fill{height:100%;background:var(--progress);border-radius:9px;width:0;transition:width .08s linear}
+.slide-fill{height:100%;background:var(--progress);border-radius:9px;width:0}
+/* 拖动时去掉过渡，滑块即时跟手；只在不拖动时保留轻微的数值过渡 */
+.slide-track:not(.dragging) .slide-fill{transition:width .08s linear}
+/* 可见、可抓的滑块：位置由 JS 写入 --slide-p，两端用 clamp 保证不被 overflow 裁掉 */
+.slide-track::after{
+  content:'';position:absolute;top:50%;left:clamp(8px,var(--slide-p,0%),calc(100% - 8px));
+  width:14px;height:14px;border-radius:50%;background:var(--surface);
+  border:1.5px solid var(--progress);box-shadow:0 1px 3px rgba(0,0,0,.18);
+  transform:translate(-50%,-50%);pointer-events:none;
+}
 /* ===== 通用数字 / 日期输入控件（外观共用，尺寸就近覆盖）===== */
 .slide-row input[type=number],
 #choreDate,
@@ -824,7 +893,7 @@ body{
 /* 任务弹窗手风琴分区着色 */
 #accTaskType .acc-head{border-left-color:var(--progress)}
 #accTaskNum .acc-head{border-left-color:var(--achievement)}
-#accTaskMeta .acc-head{border-left-color:var(--text-3)}
+#accTaskBasic .acc-head{border-left-color:var(--text-3)}
 #accTaskStage .acc-head{border-left-color:var(--vitality)}
 
 /* ===== 阶段奖励：编辑界面 ===== */
@@ -899,7 +968,10 @@ body{
 .affair-view-toggle{margin-left:auto;border:1px solid var(--border);background:none;color:var(--text-2);border-radius:var(--radius);padding:3px 10px;font-size:11px;cursor:pointer;font-family:inherit}
 .affair-view-toggle:hover{background:var(--surface-2)}
 .affair-empty{padding:12px;font-size:12px;color:var(--text-3)}
-.affair-delete-undo{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px;border:1px dashed var(--border-2);border-radius:var(--radius);color:var(--text-2)}
+.affair-delete-undo{display:block;margin-bottom:8px;border:1px dashed var(--border-2);border-radius:var(--radius);color:var(--text-2)}
+.affair-delete-undo-head{font-size:11px;color:var(--text-3);margin-bottom:4px}
+.affair-delete-undo-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:3px 0}
+.affair-delete-undo-name{flex:1;min-width:0;overflow-wrap:anywhere}
 .affair-card{cursor:pointer;transition:border-color .15s}
 .affair-card.stalled{border-color:var(--danger)}
 .affair-card.late .affair-name{color:var(--danger)}
@@ -939,8 +1011,19 @@ body{
 .fg .ach-check input{width:auto;margin:0;accent-color:var(--achievement)}
 #affairAchAmountRow input{width:100%;font-size:13px;padding:7px 10px}
 
-/* 事务：步骤列表 */
-.affair-step-row{display:flex;flex-direction:column;gap:5px;margin-bottom:10px}
+/* 事务：步骤列表（每步两行：序号/文本/操作 + 时间/委派） */
+.affair-step-row{display:flex;flex-direction:column;gap:6px;margin-bottom:10px;padding-bottom:10px;border-bottom:1px dashed var(--border)}
+.affair-step-row:last-child{margin-bottom:0;padding-bottom:0;border-bottom:none}
+.affair-step-main{display:flex;align-items:center;gap:6px}
+.affair-step-move{
+  flex-shrink:0;width:26px;height:26px;padding:0;line-height:1;
+  background:var(--surface-2);border:1px solid var(--border-2);border-radius:6px;
+  color:var(--text-2);font-size:12px;font-family:inherit;cursor:pointer;
+}
+.affair-step-move:hover:not(:disabled){border-color:var(--text-3);color:var(--text)}
+.affair-step-move:disabled{opacity:.35;cursor:default}
+.affair-step-del{flex-shrink:0;width:26px;height:26px;padding:0;line-height:1}
+.affair-step-sub{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding-left:58px}
 .affair-step-line{display:flex;align-items:center;gap:8px}
 .affair-step-input{
   flex:1;background:var(--surface-2);border:1px solid var(--border-2);border-radius:7px;
@@ -948,17 +1031,18 @@ body{
 }
 .affair-step-input:focus{border-color:var(--text-3)}
 .affair-step-time{
-  flex:1;background:var(--surface-2);border:1px solid var(--border-2);border-radius:7px;
+  flex:0 0 150px;width:150px;background:var(--surface-2);border:1px solid var(--border-2);border-radius:7px;
   color:var(--text-2);font-size:12px;font-family:inherit;padding:5px 8px;outline:none;min-width:0;
 }
 .affair-step-time:focus{border-color:var(--text-3)}
 .affair-step-time-badge{font-size:11px;color:var(--progress);white-space:nowrap;flex-shrink:0}
 .affair-step-empty{font-size:12px;color:var(--text-3)}
 /* 步骤委派：一行下拉 + 新建按钮；已委派时换成引用徽章 + 解除 */
-.affair-step-delegate{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.affair-step-delegate{display:flex;align-items:center;gap:8px;flex-wrap:nowrap;flex:1;min-width:0}
+.affair-step-delegate .btn{flex-shrink:0}
 .affair-step-chore{
   flex:1;background:var(--surface-2);border:1px solid var(--border-2);border-radius:7px;
-  color:var(--text-2);font-size:12px;font-family:inherit;padding:5px 8px;outline:none;min-width:120px;
+  color:var(--text-2);font-size:12px;font-family:inherit;padding:5px 8px;outline:none;min-width:0;
 }
 .affair-step-chore:focus{border-color:var(--text-3)}
 .affair-step-chore-badge{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--progress);min-width:0}
@@ -978,7 +1062,8 @@ body{
 /* 事务卡片：⋯ 更多按钮与菜单 */
 .affair-more{border:none;background:none;color:var(--text-3);font-size:16px;padding:2px 6px;line-height:1;cursor:pointer}
 .affair-more:hover{color:var(--text)}
-.affair-menu{position:fixed;z-index:9999;background:var(--surface);border:1px solid var(--border-2);border-radius:var(--radius);box-shadow:0 6px 20px rgba(0,0,0,.16);padding:4px;min-width:120px;display:none}
+/* 层级低于弹窗遮罩（1000），弹窗打开时菜单不会浮在其上；滚动时由 JS 关闭 */
+.affair-menu{position:fixed;z-index:950;background:var(--surface);border:1px solid var(--border-2);border-radius:var(--radius);box-shadow:0 6px 20px rgba(0,0,0,.16);padding:4px;min-width:120px;display:none}
 .affair-menu button{display:block;width:100%;text-align:left;background:none;border:none;color:var(--text);font-size:13px;padding:8px 10px;border-radius:6px;cursor:pointer;font-family:inherit}
 .affair-menu button:hover{background:var(--surface-2)}
 .affair-menu button:disabled{color:var(--text-3);cursor:default;background:none}
@@ -1127,7 +1212,7 @@ body{
 .agenda-panel-head{display:flex;align-items:baseline;gap:8px}
 .agenda-title{font-size:14px;font-weight:600;color:var(--text)}
 .agenda-summary{margin-left:auto;font-size:11px;color:var(--text-3)}
-.agenda-scroll{margin-top:4px;max-height:228px;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}
+.agenda-scroll{margin-top:4px;max-height:228px;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;scrollbar-width:thin;scrollbar-color:var(--border-2) transparent}
 .agenda-group{padding-top:4px}
 .agenda-group+.agenda-group{border-top:1px solid var(--border);margin-top:4px}
 .agenda-group-head{display:flex;align-items:center;gap:6px;padding:2px 2px;font-size:11px;font-weight:600;color:var(--text-2)}
@@ -1170,7 +1255,7 @@ body{
 .asset-form-hint.ok{color:var(--vitality)}
 
 /* ===== S9：动作流编辑器 / 干跑 / 运行历史 ===== */
-.btn-primary{color:var(--vitality);border-color:var(--vitality)}
+.btn-primary{color:var(--vitality);border-color:var(--vitality);background:var(--tag-p-bg)}
 .btn-primary:hover{background:var(--tag-p-bg);border-color:var(--vitality);color:var(--vitality)}
 .flow-check{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text);cursor:pointer}
 .flow-check input{width:auto;flex-shrink:0}
@@ -1220,3 +1305,11 @@ body{
 .flow-run-acc{color:var(--text-2)}
 .flow-run-step{font-size:12px;line-height:1.8;color:var(--text-2)}
 @media (max-width:560px){.flow-branch-cols{grid-template-columns:1fr}}
+
+/* 项目弹窗窄屏收尾：放在步骤样式之后，覆盖桌面尺寸 */
+@media (max-width:560px){
+  .affair-step-sub{padding-left:0}
+  /* 时间选择器与“新建”文案收紧，保证每步仍是两行且委派下拉可读 */
+  .affair-step-time{flex-basis:128px;width:128px}
+  .affair-delegate-new-label{display:none}
+}

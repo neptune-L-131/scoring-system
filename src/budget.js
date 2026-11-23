@@ -3,7 +3,7 @@ import { registerPointMetricProvider } from './cond-eval.js';
 import { BUDGET_LEDGER_MAX, BUDGET_PERIOD_KEEP, BUDGET_TARGET_NAMES } from './constants.js';
 import { newExtState, defaultBudgetSettings, defaultBudgetsState } from './defaults.js';
 import { Ledger } from './ledger.js';
-import { periodKey, fmt, now, uid, budgetBounds, round4 } from './pure.js';
+import { periodKey, fmt, now, uid, budgetBounds, round4, currencyOf, money } from './pure.js';
 import { state } from './state.js';
 import { domainName } from './utils.js';
 // budget.js —— 现实预算规则引擎（BudgetEngine）
@@ -60,9 +60,15 @@ const BudgetEngine=(function(){
   // 因此按启用分类的当前周期做全局聚合；entryAmount 取当前周期最近一条有效账目金额。
   function activityContext(ts){
     ts=Number(ts)||now();
-    const out={entryAmount:0,spent:0,overspend:0,entryCount:0};
+    // 币种守门：跨分类求和只在「所有启用分类同一币种」时有金额含义。
+    // 单一币种时 currency=<该币种>、mixed=false（旧存档全是 CNY，行为与之前一致）；
+    // 多币种时 currency=null、mixed=true，由条件求值层对金额指标 fail-closed。
+    const out={entryAmount:0,spent:0,overspend:0,entryCount:0,currency:null,mixed:false};
+    const codes=[];
     categories().forEach(function(cat){
       if(!cat||cat.archived||cat.enabled===false)return;
+      const cur=currencyOf(cat);
+      if(codes.indexOf(cur)<0)codes.push(cur);
       const got=readPeriod(cat,ts);
       const p=got&&got.period;
       if(!p)return;
@@ -70,9 +76,14 @@ const BudgetEngine=(function(){
       out.overspend=round4(out.overspend+overspendOf(cat,p));
       out.entryCount+=Math.max(0,Math.round(Number(p.entryCount)||0));
     });
+    out.currency=codes.length===1?codes[0]:null;
+    out.mixed=codes.length>1;
     let latestTs=-1;
     (budgets().ledger||[]).forEach(function(e){
       if(!e||e.status!=='active')return;
+      // 退回与跨期冲正都不是“一笔消费”：退回把金额放在 refundAmount 里、amount=0；
+      // 冲正同样 amount=0。若参与“最近一笔”选择会把 entryAmount 误置为 0，导致条件判断误判。
+      if(e.source==='refund'||e.source==='reversal')return;
       const cat=category(e.categoryId);
       if(!cat||cat.archived||cat.enabled===false)return;
       if(e.periodKey!==budgetBounds(cat.cycle,ts,cat.anchor).key)return;
@@ -89,6 +100,8 @@ const BudgetEngine=(function(){
     let p=map[b.key];
     if(!p&&create){
       p=blankPeriod(b);
+      // 新周期写入币种快照；旧周期不补（读取层缺省 CNY，避免改写历史）
+      p.currency=currencyOf(cat);
       map[b.key]=p;
     }
     if(p&&create)bd.current[cat.id]=b.key;
@@ -102,7 +115,8 @@ const BudgetEngine=(function(){
   function recomputeWater(cat,p){
     if(!cat||!p)return;
     const active=budgets().ledger.filter(function(e){
-      return e&&e.categoryId===cat.id&&e.periodKey===p.key&&e.status==='active';
+      // 退回不改变已惩罚水位：它的快照不参与水位重算
+      return e&&e.categoryId===cat.id&&e.periodKey===p.key&&e.status==='active'&&e.source!=='refund';
     });
     if(active.some(function(e){return !e.snapshot||!isFinite(Number(e.snapshot.overspendAfter));}))return;
     const calc=Math.max(0,round4(Math.max.apply(null,[0].concat(active.map(function(e){return round4(Number(e.snapshot.overspendAfter)||0);})))));
@@ -307,6 +321,8 @@ const BudgetEngine=(function(){
   function commitEntry(tx,plan,extra){
     extra=extra||{};
     if(!plan||!plan.ok)failB('BUDGET_INVALID_PLAN',{reason:'预算计划无效'});
+    // 退回与支出是两条独立写入路径：退款计划混进这里会把方向语义写反
+    if(plan.direction==='refund')failB('BUDGET_REFUND_WRONG_PATH',{reason:'退回必须通过 commitRefund 写入'});
     if(!Ledger.inTxn())failB('BUDGET_NO_TXN',{reason:'预算写入必须在事务内执行'});
     const cat=category(plan.catId);
     if(!cat)failB('BUDGET_CATEGORY_MISSING',{reason:'预算分类不存在'});
@@ -360,6 +376,7 @@ const BudgetEngine=(function(){
     p.closedAt=null;
     const entry={
       id:entryId,ts:plan.ts,txnId:(tx&&tx.label)||'',categoryId:cat.id,amount:plan.amount,
+      currency:currencyOf(cat),
       source:plan.source||'manual',productId:plan.productId||'',note:plan.note||'',
       periodKey:p.key,status:'active',reversedAt:null,
       topupAdded:plan.topup.amount,topupCost:plan.topup.cost,
@@ -382,6 +399,100 @@ const BudgetEngine=(function(){
     prunePeriods(cat);
     return{entry:entry,topupLogId:topupLogId,penaltyLogIds:penaltyLogIds,feedbackLogIds:feedbackLogIds};
   }
+  // ===== 主动退回（独立路径）=====
+  // 退回是“新增一笔反向的钱”，不是撤销：不递减 spent、不计入结余奖励、不返还已扣惩罚/反哺。
+  // 与 reverseEntry（当期撤销整笔支出）和 compensateEntry（跨期冲正）互不替代。
+  function prepareRefund(catId,amount,ts,opts){
+    opts=opts||{};
+    ts=Number(ts)||now();
+    amount=round4(Number(amount)||0);
+    if(!(amount>0))return{ok:false,code:'BUDGET_INVALID_AMOUNT',reason:'金额必须大于 0'};
+    const cat=category(catId);
+    if(!cat)return{ok:false,code:'BUDGET_CATEGORY_MISSING',reason:'预算分类不存在'};
+    if(cat.archived)return{ok:false,code:'BUDGET_CATEGORY_ARCHIVED',reason:'预算分类已归档'};
+    if(!cat.enabled)return{ok:false,code:'BUDGET_CATEGORY_DISABLED',reason:'预算分类已停用'};
+    const b=budgetBounds(cat.cycle,ts,cat.anchor);
+    const live=(budgets().periods[cat.id]||{})[b.key]||null;
+    if(live&&(live.rewardSettled||live.closedAt))
+      return{ok:false,code:'BUDGET_PERIOD_SETTLED',reason:'该账期已结算，不能登记退回'};
+    const p=live||blankPeriod(b);
+    const net=netSpentOf(p);
+    // 超额直接报错，不夹紧、不部分退款
+    if(amount>net+1e-9)
+      return{ok:false,code:'BUDGET_REFUND_EXCEEDS_SPENT',reason:'本期最多可退 '+money(net,currencyOf(cat)),maxRefundable:net};
+    return{
+      ok:true,direction:'refund',catId:cat.id,cat:cat,ts:ts,amount:amount,bounds:b,periodKey:b.key,
+      period:p,periodLive:live,note:String(opts.note||'').slice(0,80),
+      netBefore:net,netAfter:Math.max(0,round4(net-amount)),
+      refundBefore:round4(Number(p.refund)||0),refundAfter:round4((Number(p.refund)||0)+amount),
+      limitAfter:effectiveLimit(cat,p)
+    };
+  }
+  // 退回写入：只把金额记进 refundAmount 与 p.refund；spent / entryCount / 水位 / 奖惩全部不动
+  function commitRefund(tx,plan,extra){
+    extra=extra||{};
+    if(!plan||!plan.ok||plan.direction!=='refund')failB('BUDGET_INVALID_PLAN',{reason:'退回计划无效'});
+    if(!Ledger.inTxn())failB('BUDGET_NO_TXN',{reason:'预算写入必须在事务内执行'});
+    const cat=category(plan.catId);
+    if(!cat)failB('BUDGET_CATEGORY_MISSING',{reason:'预算分类不存在'});
+    const got=getPeriod(cat,plan.ts,true);
+    const p=got.period;
+    if(p.rewardSettled||p.closedAt)failB('BUDGET_PERIOD_SETTLED',{reason:'该账期已结算，不能登记退回'});
+    const amt=round4(Number(plan.amount)||0);
+    const net=netSpentOf(p);
+    // 事务内二次校验：计划生成后 spent 可能已变化，超额仍必须整笔拒绝
+    if(!(amt>0))failB('BUDGET_INVALID_AMOUNT',{reason:'金额必须大于 0'});
+    if(amt>net+1e-9)failB('BUDGET_REFUND_EXCEEDS_SPENT',{reason:'本期最多可退 '+money(net,currencyOf(cat)),maxRefundable:net});
+    p.refund=round4((Number(p.refund)||0)+amt);
+    p.closedAt=null;
+    const entry={
+      id:uid(),ts:plan.ts,txnId:(tx&&tx.label)||'',categoryId:cat.id,
+      amount:0,refundAmount:amt,currency:currencyOf(cat),source:'refund',productId:'',note:plan.note||'',
+      periodKey:p.key,status:'active',reversedAt:null,topupAdded:0,topupCost:0,penaltyOverspendDelta:0,
+      links:{
+        purchaseLogId:String(extra.purchaseLogId||''),topupLogId:'',penaltyLogIds:[],feedbackLogIds:[],
+        checkinLogId:String(extra.checkinLogId||''),affairId:String(extra.affairId||''),
+        affairAdvanceId:String(extra.affairAdvanceId||''),choreId:String(extra.choreId||''),reversalOf:''
+      },
+      snapshot:{
+        limit:round4(cat.limit),topupAmount:round4(p.topupAmount),
+        overspendAfter:overspendOf(cat,p),penaltyAfter:round4(Number(p.penalizedOverspend)||0)
+      }
+    };
+    budgets().ledger.push(entry);
+    budgets().current[cat.id]=p.key;
+    pruneLedger();
+    prunePeriods(cat);
+    return{entry:entry};
+  }
+  // 撤销一笔当期退回：只回退 p.refund，不动 spent / 水位 / 已发奖惩；跨期退回不可撤销
+  function reverseRefund(entryId){
+    const r=Ledger.txn(function(){
+      const bd=budgets();
+      const e=bd.ledger.find(function(x){return x.id===entryId;});
+      if(!e)return failB('BUDGET_ENTRY_MISSING',{reason:'账目不存在'});
+      if(e.status&&e.status!=='active')return failB('BUDGET_ENTRY_REVERSED',{reason:'该账目已撤销或已冲正'});
+      if(e.source!=='refund')return failB('BUDGET_ENTRY_NOT_REFUND',{reason:'该账目不是退回'});
+      const cat=category(e.categoryId);
+      if(!cat)return failB('BUDGET_CATEGORY_MISSING',{reason:'预算分类不存在'});
+      const map=bd.periods[cat.id];
+      const p=map&&map[e.periodKey];
+      if(!p)return failB('BUDGET_PERIOD_MISSING',{reason:'周期实例不存在'});
+      const nowKey=budgetBounds(cat.cycle,now(),cat.anchor).key;
+      if(e.periodKey!==nowKey||p.end<=now())
+        return failB('BUDGET_CROSS_PERIOD',{reason:'跨期退回不可撤销'});
+      const amt=round4(Number(e.refundAmount)||0);
+      p.refund=Math.max(0,round4((Number(p.refund)||0)-amt));
+      e.status='reversed';
+      e.reversedAt=now();
+      return e;
+    },{label:'budget-refund-reverse',save:'none',render:false});
+    if(!r.ok){
+      const info=(r.error&&r.error.info)||{};
+      return{ok:false,code:(r.error&&r.error.code)||'BUDGET_REFUND_REVERSE_FAILED',reason:info.reason||'撤销退回失败'};
+    }
+    return{ok:true,entry:r.value||null};
+  }
   function settlePeriod(cat,p,ts){
     if(!p)return false;
     if(p.rewardSettled){
@@ -391,8 +502,11 @@ const BudgetEngine=(function(){
     // 周期实例自带边界：结期只认它自己的 start/end，不受之后 anchor 变更影响
     const b={key:p.key,start:p.start,end:p.end};
     const spent=round4(Number(p.spent)||0);
+    const net=netSpentOf(p);
     const eff=effectiveLimit(cat,p);
-    const overspend=Math.max(0,round4(spent-eff));
+    // 超支口径统一为净额（与 overspendOf / budget_remaining 一致）；
+    // 结余奖励仍按 gross spent，退回不计入结余。
+    const overspend=Math.max(0,round4(net-eff));
     const surplus=Math.max(0,round4(cat.limit-spent));
     const ctx={
       settlement:true,entryAmount:0,spentBefore:spent,spentAfter:spent,
@@ -423,7 +537,7 @@ const BudgetEngine=(function(){
     p.closedAt=p.end;
     p.settlementSnapshot={
       limit:round4(cat.limit),topupAmount:round4(p.topupAmount),spent:spent,overspend:overspend,
-      surplus:surplus,rewardAmount:total,settledAt:p.settledAt,
+      surplus:surplus,rewardAmount:total,settledAt:p.settledAt,currency:currencyOf(cat),
       rules:effects.map(function(e){return{ruleId:e.ruleId,amount:e.amount};})
     };
     return true;
@@ -562,6 +676,8 @@ const BudgetEngine=(function(){
       const origId=String(ref.entryId||'');
       const orig=origId?bd.ledger.find(function(e){return e.id===origId;})||null:null;
       if(orig&&orig.status&&orig.status!=='active')return orig;
+      // 退回不能走冲正：冲正会再记一笔 refund，等于把同一次退回算两遍
+      if(orig&&orig.source==='refund')return failB('BUDGET_ENTRY_IS_REFUND',{reason:'退回不能冲正，请使用撤销退回'});
       const dup=bd.ledger.find(function(e){
         return e&&e.source==='reversal'&&e.links&&e.links.reversalOf===origId&&origId;
       });
@@ -576,7 +692,7 @@ const BudgetEngine=(function(){
       }
       const entry={
         id:uid(),ts:now(),txnId:'',categoryId:cat.id,
-        amount:0,refundAmount:amt,source:'reversal',productId:'',note:'跨期冲正',
+        amount:0,refundAmount:amt,currency:currencyOf(cat),source:'reversal',productId:'',note:'跨期冲正',
         periodKey:p.key,status:'active',reversedAt:null,topupAdded:0,topupCost:0,penaltyOverspendDelta:0,
         links:{
           purchaseLogId:'',topupLogId:'',penaltyLogIds:[],feedbackLogIds:[],
@@ -618,6 +734,8 @@ const BudgetEngine=(function(){
       const nowKey=budgetBounds(cat.cycle,now(),cat.anchor).key;
       if(e.periodKey!==nowKey||p.end<=now())
         return failB('BUDGET_CROSS_PERIOD',{reason:'跨期账目不可撤销'});
+      // 退回不是支出：走这里会把 refundAmount 当 amount 撤销，必须分流到 reverseRefund
+      if(e.source==='refund')return failB('BUDGET_ENTRY_IS_REFUND',{reason:'退回不能按支出撤销，请使用撤销退回'});
       tryRefundTopup(cat,p,e);
       const linked=(e.links.penaltyLogIds||[]).concat(e.links.feedbackLogIds||[]);
       linked.forEach(function(id){
@@ -669,6 +787,7 @@ const BudgetEngine=(function(){
     bounds:budgetBounds,categories:categories,category:category,settings:settings,
     readPeriod:readPeriod,activityContext:activityContext,effectiveLimit:effectiveLimit,overspendOf:overspendOf,
     preview:preview,prepareEntry:prepareEntry,commitEntry:commitEntry,
+    prepareRefund:prepareRefund,commitRefund:commitRefund,reverseRefund:reverseRefund,
     settlePeriod:settlePeriod,reconcileDue:reconcileDue,reconcileAll:reconcileAll,
     reverseEntry:reverseEntry,compensateEntry:compensateEntry,noteEffectReversed:noteEffectReversed,validateRule:validateRule,
     netSpentOf:netSpentOf,recomputeWater:recomputeWater,
@@ -697,8 +816,9 @@ registerPointMetricProvider('budget_remaining',function(it,ts){
   const cat=BudgetEngine.category(target);
   if(!cat||!cat.enabled||cat.archived)return 0;
   const p=BudgetEngine.readPeriod(cat,ts).period;
-  // 剩余额度按“基础限额 + 本期扩容”计算，与超支惩罚同一口径
-  return round4(BudgetEngine.effectiveLimit(cat,p)-(Number(p&&p.spent)||0));
+  // 剩余额度按“基础限额 + 本期扩容”计算，与超支惩罚同一口径；
+  // 退回增加可用额度，因此这里必须用净花费，不能直接用 gross spent。
+  return round4(BudgetEngine.effectiveLimit(cat,p)-BudgetEngine.netSpentOf(p));
 });
 
 export { BudgetEngine };

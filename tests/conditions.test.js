@@ -120,6 +120,18 @@ describe('evalCondItem：预算指标走 BudgetEngine 注入的上下文', () =>
   it('没有上下文时预算指标按 0 处理', () => {
     expect(api.evalCondItem(item({ range: 'period', metric: 'budget_entry_amount', value: 1 }), week, T)).toBe(false);
   });
+
+  it('混合币种：金额指标 fail-closed，笔数照常可用', () => {
+    const mixed = {
+      period: 'week', anchor: 1,
+      budgetCtx: { entryAmount: 30, spent: 120, overspend: 20, entryCount: 3, currency: null, mixed: true },
+    };
+    const q = (metric, value) => api.evalCondItem(item({ range: 'period', metric, value }), mixed, T);
+    expect(q('budget_entry_amount', 0)).toBe(false);
+    expect(q('budget_period_spent', 0)).toBe(false);
+    expect(q('budget_period_overspend', 0)).toBe(false);
+    expect(q('budget_entry_count', 3)).toBe(true);
+  });
 });
 
 describe('evalCondItem：阶段 1 指标（项目 / 杂事 / 不活跃）', () => {

@@ -2,7 +2,7 @@
 //
 // 边界：
 // 1. 只做 UI：配置编辑、试跑展示、历史展示、显式执行与撤销入口；
-// 2. 编辑器只开放 FLOW_ATOMS 的 7 个原子，参数按原子白名单复制，不提供任意字段写入；
+// 2. 编辑器只开放 8 个可选原子；task.exempt 仅保留注册，用于旧配置与资产使用配方；参数按原子白名单复制，不提供任意字段写入；
 // 3. 保存只落配置，绝不执行；执行必须由用户显式点击并二次确认；
 // 4. 试跑复用 FlowEngine.dryRun，撤销复用 FlowEngine.undoFlowRun，不另造账务语义。
 import {
@@ -10,13 +10,14 @@ import {
   FLOW_ATOM_MAX_CURRENCY, FLOW_ATOM_NOTE_MAX_LEN, FLOW_MAX_DEPTH, FLOW_MAX_STEPS, FLOW_RUN_KEEP,
   FLOW_VERSION, LOG_MAX,
 } from './constants.js';
-import { FLOW_ATOMS, FLOW_ATOM_IDS, assetPeriodKeyOf, describeFlowAtom } from './flow-atoms.js';
+import { FLOW_ATOMS, FLOW_ATOM_SELECTABLE_IDS, assetPeriodKeyOf, describeFlowAtom } from './flow-atoms.js';
 import { FlowEngine, FLOW_REVERSERS } from './flow-engine.js';
 import { normalizeCondition } from './cond-model.js';
 import { condNodeLabel, metricLabel } from './cycle.js';
 import { isCondEventMode, refreshCondPanel, renderCondTree, resetCondDraftUI, setCondDraftContext, setCondEventMode } from './cond-ui.js';
 import { EVENT_KINDS } from './events.js';
 import { closeModal, openModal } from './modal-host.js';
+import { markModalClean, registerModalCloseHook, rejectFields, requestModalClose } from './form-contract.js';
 import { normalizeFlow } from './normalize.js';
 import { save } from './persist.js';
 import { esc, escAttr, fmt, isPointMetric, now, uid } from './pure.js';
@@ -113,6 +114,22 @@ function firstUsableAssetId() {
 function atomName(atom) {
   const a = FLOW_ATOMS[atom];
   return a && a.name ? a.name : atom;
+}
+// 摘要用的中文标签：只有 UI 层知道账户/资产/任务叫什么，原子层保持无状态。
+export function flowAtomLabels() {
+  return {
+    account: accountLabel,
+    asset: function (id) {
+      if (!id) return '未选资产';
+      const d = findDef(id);
+      return d ? (d.name || d.id) : '资产 ' + id + '（已不存在）';
+    },
+    task: function (id) {
+      if (typeof id !== 'string' || !id) return '运行时指定任务';
+      const t = (state.tasks || []).find(function (x) { return x && x.id === id; });
+      return t ? (t.name || id) : '未知任务 ' + id;
+    },
+  };
 }
 function fail(code, message) {
   return { ok: false, code: code, message: message };
@@ -585,8 +602,8 @@ function paramsHTML(atom, params, path) {
       optionsHTML(accts, p.account || 'vitality', true) + '</select></label>' +
       '<label>金额<input type="number" min="0.01" max="' + FLOW_ATOM_MAX_CURRENCY + '" step="0.01" value="' + escAttr(p.amount === undefined ? '1' : p.amount) + '" onchange="flowStepParamChanged(\'' + path + '\',\'amount\',this.value)"></label>' +
       (atom === 'currency.grant'
-        ? '<label>领域<select onchange="flowStepSplitChanged(\'' + path + '\',this.value)"><option value=""' + (p.split === 'allDomains' ? '' : ' selected') + '>跟随账户</option><option value="allDomains"' + (p.split === 'allDomains' ? ' selected' : '') + '>全部领域均分</option></select></label>' +
-          '<label>任务 ID（可选）<input type="text" maxlength="64" value="' + escAttr(p.taskId || '') + '" onchange="flowStepParamChanged(\'' + path + '\',\'taskId\',this.value)"></label>'
+        ? '<label>分配方式<select onchange="flowStepSplitChanged(\'' + path + '\',this.value)"><option value=""' + (p.split === 'allDomains' ? '' : ' selected') + '>跟随账户</option><option value="allDomains"' + (p.split === 'allDomains' ? ' selected' : '') + '>全部领域均分</option></select></label>' +
+          '<label>关联任务（可选）<span class="h">填任务 ID，仅用于把这次发放记到该任务名下；留空则不关联。仅活力点账户可用</span><input type="text" maxlength="64" value="' + escAttr(p.taskId || '') + '" onchange="flowStepParamChanged(\'' + path + '\',\'taskId\',this.value)"></label>'
         : '') +
       '<label>备注<input type="text" maxlength="120" value="' + escAttr(p.desc || '') + '" onchange="flowStepParamChanged(\'' + path + '\',\'desc\',this.value)"></label>';
   }
@@ -626,6 +643,9 @@ function paramsHTML(atom, params, path) {
         : '<div class="flow-step-none">杂事只创建名称，不带进度与领域</div>') +
       '<label>数量<input type="number" min="1" max="' + FLOW_ATOM_MAX_CREATE + '" step="1" value="' + escAttr(p.count === undefined ? '1' : p.count) + '" onchange="flowStepParamChanged(\'' + path + '\',\'count\',this.value)"></label>';
   }
+  if (atom === 'task.exempt') {
+    return '<div class="flow-step-none">豁免任务由资产使用配方在运行时指定任务，不能手动填写；此步骤仅用于兼容既有配置。</div>';
+  }
   return '<div class="flow-step-none">此原子无需参数</div>';
 }
 function stepHeadHTML(label, path, extra) {
@@ -636,9 +656,13 @@ function stepHeadHTML(label, path, extra) {
 }
 function stepRowHTML(s, path, depth) {
   if (s && s.kind === 'branch') return branchRowHTML(s, path, depth);
-  const atom = s && FLOW_ATOMS[s.atom] ? s.atom : FLOW_ATOM_IDS[0];
+  const atom = s && FLOW_ATOMS[s.atom] ? s.atom : FLOW_ATOM_SELECTABLE_IDS[0];
+  // 旧存档里的 task.exempt 步骤仍要能显示与保存：仅当当前步骤就是它时补进选项，不供新增。
+  const optionIds = FLOW_ATOM_SELECTABLE_IDS.indexOf(atom) >= 0
+    ? FLOW_ATOM_SELECTABLE_IDS
+    : FLOW_ATOM_SELECTABLE_IDS.concat([atom]);
   const select = '<select onchange="flowStepAtomChanged(\'' + path + '\',this.value)">' +
-    FLOW_ATOM_IDS.map(function (id) {
+    optionIds.map(function (id) {
       return '<option value="' + attrId(id) + '"' + (id === atom ? ' selected' : '') + '>' + esc(atomName(id)) + '</option>';
     }).join('') + '</select>';
   return '<div class="flow-step">' + stepHeadHTML('原子步骤', path, select) +
@@ -701,7 +725,7 @@ function stepSummary(s) {
     const range = BRANCH_RANGES.find(function (r) { return r.id === leaf.range; });
     return '条件分支：' + (range ? range.name : leaf.range) + (metric ? metric.name : leaf.metric) + ' ' + leaf.op + ' ' + leaf.value;
   }
-  return describeFlowAtom(s.atom, s.params || {});
+  return describeFlowAtom(s.atom, s.params || {}, flowAtomLabels());
 }
 function flowCardHTML(flow) {
   const enabled = flow.enabled !== false && !flow.invalid;
@@ -795,7 +819,7 @@ function runStepLine(s) {
     return '<div class="flow-run-step"><span class="flow-step-idx">' + esc(s.stepId || '') + '</span>条件分支 · ' +
       (s.pass ? '走「满足」分支' : '走「否则」分支') + '</div>';
   }
-  const detail = s.pass ? describeFlowAtom(s.atom, s.input || {}) : '条件不成立，未执行';
+  const detail = s.pass ? describeFlowAtom(s.atom, s.input || {}, flowAtomLabels()) : '条件不成立，未执行';
   return '<div class="flow-run-step"><span class="flow-step-idx">' + esc(s.stepId || '') + '</span>' +
     esc(atomName(s.atom)) + ' · ' + esc(detail) + (s.pass ? '' : ' <span class="flow-tag off">跳过</span>') + '</div>';
 }
@@ -1034,16 +1058,21 @@ export function openFlowModal(flowId) {
   renderFlowEditorMode();
   flowTriggerChanged();
   openModal('flowModal');
+  markModalClean('flowModal');
   return flowDraft;
 }
-export function closeFlowModal() {
+export function closeFlowModal(force) {
+  return requestModalClose('flowModal', force);
+}
+// 关闭时清理内存草稿；requestModalClose 已做脏检查，这里只负责收尾
+registerModalCloseHook('flowModal', function () {
   flowModalOpen = false;
   flowDraft = null;
   flowEditingId = '';
   setCondEventMode(false);
   resetCondDraftUI();
   closeModal('flowModal');
-}
+});
 function renderFlowEditorMode() {
   if (!flowDraft) return;
   const simple = flowDraft.editorMode === 'simple';
@@ -1079,7 +1108,11 @@ export function handleFlowSave() {
   const built = buildCandidate();
   if (!built.ok) {
     setFlowHint(built.message, false);
-    toast(built.message, 'err');
+    if (built.code === 'FLOW_NAME_REQUIRED' || built.code === 'FLOW_NAME_TOO_LONG') {
+      rejectFields('flowModal', [{ field: 'flowName', msg: built.message }]);
+    } else {
+      toast(built.message, 'err');
+    }
     return built;
   }
   const flows = flowsOf();

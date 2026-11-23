@@ -10,8 +10,13 @@ import { state } from './state.js';
 function goTab(name){
   // 打开预算页是惰性结算触发点之一：先把已结束周期结清再展示
   if(name==='budget'&&BudgetEngine.reconcileAll())save();
+  // 只有真正切到另一个标签页才复位滚动；重复点当前标签不打断阅读位置
+  const prev=document.querySelector('.tab.active');
+  const changed=!prev||prev.dataset.tab!==name;
   document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===name));
   document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active',p.id==='panel-'+name));
+  // 页面滚动发生在 window 上（不是某个容器），新页面一律从顶部开始
+  if(changed&&typeof window.scrollTo==='function')window.scrollTo(0,0);
   if(name==='budget')renderBudget();
 }
 

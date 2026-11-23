@@ -248,6 +248,163 @@ describe('跨期保护', () => {
   });
 });
 
+describe('主动退回（M3a）', () => {
+  function doRefund(amount, ts) {
+    let out = null;
+    const r = api.Ledger.txn(tx => {
+      const plan = api.BudgetEngine.prepareRefund('bc1', amount, ts);
+      out = { plan };
+      if (!plan.ok) return;
+      out.res = api.BudgetEngine.commitRefund(tx, plan);
+    }, { save: 'none', render: false });
+    return { ok: r.ok, error: r.error, plan: out && out.plan, entry: out && out.res && out.res.entry };
+  }
+  const period = s => s.ext.budgets.periods.bc1[Object.keys(s.ext.budgets.periods.bc1)[0]];
+
+  it('退回只增加 refund：spent / 笔数不变，金额始终存正数', () => {
+    seed();
+    const ts = at(2024, 3, 6);
+    expect(commit(60, ts).ok).toBe(true);
+    const r = doRefund(20, ts + 1000);
+    expect(r.ok).toBe(true);
+    const s = api.getState();
+    expect(period(s)).toMatchObject({ spent: 60, refund: 20, entryCount: 1 });
+    expect(r.entry).toMatchObject({
+      amount: 0, refundAmount: 20, source: 'refund', status: 'active', currency: 'CNY',
+    });
+    expect(api.BudgetEngine.netSpentOf(period(s))).toBe(40);
+  });
+
+  it('退回不计入结余奖励：结余与奖励仍按 gross spent', () => {
+    seed({ cycle: 'month', rules: [{ kind: 'reward', params: { mode: 'ratio', rate: 0.2 }, target: { account: 'achievement' } }] });
+    const jan = at(2024, 1, 15, 12);
+    expect(commit(60, jan).ok).toBe(true);
+    expect(doRefund(20, at(2024, 1, 20, 12)).ok).toBe(true);
+    expect(api.BudgetEngine.reconcileDue('bc1', at(2024, 2, 2))).toBe(true);
+    const p = api.getState().ext.budgets.periods.bc1['M:2024-01'];
+    // 若退回被算进结余，surplus 会变成 60、奖励 12；正确口径是 40 / 8
+    expect(p.settlementSnapshot).toMatchObject({ spent: 60, overspend: 0, surplus: 40, rewardAmount: 8 });
+    expect(api.getState().scores.achievement).toBe(108);
+  });
+
+  it('结算超支用净额；已罚水位不因退回回退', () => {
+    seed({
+      cycle: 'month', limit: 100,
+      rules: [{ kind: 'penalty', params: { mode: 'ratio', rate: 0.5, per: 'entry' }, target: { account: 'vitality' } }],
+    });
+    const jan = at(2024, 1, 15, 12);
+    expect(commit(120, jan).ok).toBe(true); // 超支 20 → 罚 10
+    expect(api.getState().scores.vitality).toBe(90);
+    expect(doRefund(50, at(2024, 1, 20, 12)).ok).toBe(true);
+    expect(period(api.getState())).toMatchObject({ spent: 120, refund: 50, penalizedOverspend: 20, penaltyCharged: 10 });
+    expect(api.BudgetEngine.overspendOf(api.getState().ext.budgets.categories[0], period(api.getState()))).toBe(0);
+
+    expect(api.BudgetEngine.reconcileDue('bc1', at(2024, 2, 2))).toBe(true);
+    const s = api.getState();
+    expect(s.ext.budgets.periods.bc1['M:2024-01'].settlementSnapshot.overspend).toBe(0);
+    expect(s.scores.vitality).toBe(90); // 已罚不返还
+  });
+
+  it('超额 / 0 / 负数直接报错，不夹紧、无部分写入', () => {
+    seed();
+    const ts = at(2024, 3, 6);
+    expect(commit(60, ts).ok).toBe(true);
+    expect(api.BudgetEngine.prepareRefund('bc1', 61, ts)).toMatchObject({
+      ok: false, code: 'BUDGET_REFUND_EXCEEDS_SPENT', maxRefundable: 60,
+    });
+    expect(api.BudgetEngine.prepareRefund('bc1', 0, ts).code).toBe('BUDGET_INVALID_AMOUNT');
+    expect(api.BudgetEngine.prepareRefund('bc1', -5, ts).code).toBe('BUDGET_INVALID_AMOUNT');
+    expect(period(api.getState()).refund).toBe(0);
+    expect(api.getState().ext.budgets.ledger.some(e => e.source === 'refund')).toBe(false);
+
+    // 事务内二次校验：即使伪造一份超额计划，也必须整笔拒绝
+    const forged = { ok: true, direction: 'refund', catId: 'bc1', amount: 61, ts };
+    const r = api.Ledger.txn(tx => api.BudgetEngine.commitRefund(tx, forged), { save: 'none', render: false });
+    expect(r.ok).toBe(false);
+    expect(r.error.code).toBe('BUDGET_REFUND_EXCEEDS_SPENT');
+    expect(period(api.getState()).refund).toBe(0);
+  });
+
+  it('撤销 / 冲正 / 退回互不替代', () => {
+    seed();
+    const ts = Date.now();
+    expect(commit(60, ts).ok).toBe(true);
+    expect(doRefund(20, ts).ok).toBe(true);
+    const s = api.getState();
+    const refundId = s.ext.budgets.ledger.find(e => e.source === 'refund').id;
+    const spendId = s.ext.budgets.ledger.find(e => e.source === 'manual').id;
+
+    expect(api.BudgetEngine.reverseEntry(refundId)).toMatchObject({ ok: false, code: 'BUDGET_ENTRY_IS_REFUND' });
+    expect(api.BudgetEngine.compensateEntry({ catId: 'bc1', entryId: refundId, amount: 20 })).toMatchObject({
+      ok: false, code: 'BUDGET_ENTRY_IS_REFUND',
+    });
+    expect(api.BudgetEngine.reverseRefund(spendId)).toMatchObject({ ok: false, code: 'BUDGET_ENTRY_NOT_REFUND' });
+
+    expect(api.BudgetEngine.reverseRefund(refundId).ok).toBe(true);
+    const after = api.getState();
+    expect(period(after)).toMatchObject({ spent: 60, refund: 0, entryCount: 1 });
+    expect(after.ext.budgets.ledger.find(e => e.id === refundId).status).toBe('reversed');
+    // 没有多出一条冲正记录
+    expect(after.ext.budgets.ledger.some(e => e.source === 'reversal')).toBe(false);
+  });
+
+  it('退回不污染 activityContext.entryAmount', () => {
+    seed();
+    const ts = at(2024, 3, 6);
+    expect(commit(30, ts).ok).toBe(true);
+    expect(doRefund(10, ts + 5000).ok).toBe(true); // 更晚的一笔退回
+    const act = api.BudgetEngine.activityContext(ts);
+    expect(act).toMatchObject({ entryAmount: 30, spent: 30, entryCount: 1 });
+  });
+
+  it('跨期冲正的零金额条目不污染 activityContext.entryAmount', () => {
+    seed();
+    const prev = at(2024, 2, 28);
+    const cur = at(2024, 3, 6);
+    expect(commit(30, prev).ok).toBe(true);
+    expect(commit(40, cur).ok).toBe(true);
+    const orig = api.getState().ext.budgets.ledger.find(e => e.amount === 30);
+    api.__setClockForTest(() => cur + 5000);
+    try {
+      expect(api.BudgetEngine.compensateEntry({ catId: 'bc1', entryId: orig.id, amount: 30 }).ok).toBe(true);
+    } finally {
+      api.__setClockForTest(null);
+    }
+    const act = api.BudgetEngine.activityContext(cur);
+    // 只统计当前周期：本期真实消费 40；更晚的零金额冲正不能把 entryAmount 置 0
+    expect(act).toMatchObject({ entryAmount: 40, spent: 40, entryCount: 1 });
+  });
+
+  it('budget_remaining 与 overspendOf 同口径（净额）', () => {
+    seed();
+    const ts = at(2024, 3, 6);
+    expect(commit(30, ts).ok).toBe(true);
+    expect(doRefund(20, ts).ok).toBe(true);
+    expect(api.pointMetricValue('budget_remaining', { target: 'bc1' }, ts)).toBe(90);
+  });
+
+  it('退回条目重载后 source 与币种仍在', () => {
+    seed({ currency: 'USD' });
+    const ts = at(2024, 3, 6);
+    expect(commit(60, ts).ok).toBe(true);
+    expect(doRefund(20, ts).ok).toBe(true);
+    const re = api.parseState(JSON.stringify(api.getState()));
+    const e = re.ext.budgets.ledger.find(x => x.source === 'refund');
+    expect(e).toMatchObject({ source: 'refund', amount: 0, refundAmount: 20, currency: 'USD' });
+    expect(period(re).refund).toBe(20);
+  });
+
+  it('commitEntry 拒绝退款计划（方向不可混用）', () => {
+    seed();
+    const ts = at(2024, 3, 6);
+    expect(commit(60, ts).ok).toBe(true);
+    const plan = api.BudgetEngine.prepareRefund('bc1', 10, ts);
+    const r = api.Ledger.txn(tx => api.BudgetEngine.commitEntry(tx, plan, {}), { save: 'none', render: false });
+    expect(r.ok).toBe(false);
+    expect(r.error.code).toBe('BUDGET_REFUND_WRONG_PATH');
+  });
+});
+
 describe('budget_remaining 点态指标', () => {
   it('剩余额度 = 基础限额 + 本期扩容 - 已花', () => {
     seed();
@@ -256,6 +413,86 @@ describe('budget_remaining 点态指标', () => {
     expect(api.pointMetricValue('budget_remaining', { target: 'bc1' }, ts)).toBe(70);
     api.patchState(s => { s.ext.budgets.categories[0].limit = 50; });
     expect(api.pointMetricValue('budget_remaining', { target: 'bc1' }, ts)).toBe(20);
+  });
+});
+
+describe('币种基座（M1）', () => {
+  const ctx = { domainIds: new Set(['d_default', 'd2']) };
+  const catWith = over => api.normalizeBudgetCategory(Object.assign({}, CAT, over), ctx);
+
+  it('旧分类不补 currency 键；读取层缺省 CNY', () => {
+    seed();
+    const cat = api.getState().ext.budgets.categories[0];
+    expect('currency' in cat).toBe(false);
+    expect(api.currencyOf(cat)).toBe('CNY');
+    expect(api.currencyOf({ currency: 'usd' })).toBe('CNY');
+    expect(api.historicalCurrencyOf({})).toBe('CNY');
+    expect(api.historicalCurrencyOf({ currency: 'USD' })).toBe('USD');
+  });
+
+  it('normalize 只保留合法币种：非法删除、表外合法代码保留', () => {
+    expect(catWith({ currency: 'USD' }).currency).toBe('USD');
+    expect(catWith({ currency: 'XYZ' }).currency).toBe('XYZ');
+    expect('currency' in catWith({ currency: 'usd' })).toBe(false);
+    expect('currency' in catWith({ currency: 123 })).toBe(false);
+    expect('currency' in catWith({})).toBe(false);
+  });
+
+  it('分类/周期/条目币种经存档往返仍在（normalize 不丢字段）', () => {
+    seed({ currency: 'USD' });
+    expect(commit(30, at(2024, 3, 6)).ok).toBe(true);
+    const s = api.getState();
+    const key = Object.keys(s.ext.budgets.periods.bc1)[0];
+    const re = api.parseState(JSON.stringify(s));
+    expect(re.ext.budgets.categories[0].currency).toBe('USD');
+    expect(re.ext.budgets.periods.bc1[key].currency).toBe('USD');
+    expect(re.ext.budgets.ledger[0].currency).toBe('USD');
+  });
+
+  it('新周期写入币种快照；引擎的金额公式不受影响', () => {
+    seed({ currency: 'USD' });
+    const ts = at(2024, 3, 6);
+    expect(commit(30, ts).ok).toBe(true);
+    const s = api.getState();
+    const key = Object.keys(s.ext.budgets.periods.bc1)[0];
+    expect(s.ext.budgets.periods.bc1[key]).toMatchObject({ spent: 30, entryCount: 1, currency: 'USD' });
+    expect(s.ext.budgets.ledger[0]).toMatchObject({ amount: 30, currency: 'USD' });
+  });
+
+  it('结算快照写入币种快照', () => {
+    seed({
+      cycle: 'month', currency: 'USD',
+      rules: [{ kind: 'reward', params: { mode: 'ratio', rate: 0.2 }, target: { account: 'achievement' } }],
+    });
+    expect(commit(40, at(2024, 1, 15, 12)).ok).toBe(true);
+    expect(api.BudgetEngine.reconcileDue('bc1', at(2024, 2, 2))).toBe(true);
+    const p = api.getState().ext.budgets.periods.bc1['M:2024-01'];
+    expect(p.settlementSnapshot).toMatchObject({ spent: 40, surplus: 60, currency: 'USD' });
+  });
+
+  it('跨期冲正的新条目也带币种快照', () => {
+    seed({ currency: 'USD' });
+    expect(commit(40, at(2024, 1, 15, 12)).ok).toBe(true);
+    const entryId = api.getState().ext.budgets.ledger[0].id;
+    const r = api.BudgetEngine.compensateEntry({ catId: 'bc1', entryId: entryId, amount: 40 });
+    expect(r.ok).toBe(true);
+    const rev = api.getState().ext.budgets.ledger.find(e => e.source === 'reversal');
+    expect(rev).toMatchObject({ amount: 0, refundAmount: 40, currency: 'USD' });
+  });
+
+  it('activityContext：单币种与今天一致，混合币种只保留计数', () => {
+    seed();
+    const ts = at(2024, 3, 6);
+    expect(commit(30, ts).ok).toBe(true);
+    expect(api.BudgetEngine.activityContext(ts)).toMatchObject({
+      currency: 'CNY', mixed: false, spent: 30, overspend: 0, entryCount: 1, entryAmount: 30,
+    });
+
+    api.patchState(s => {
+      s.ext.budgets.categories.push(catWith({ id: 'bc2', name: '订阅', currency: 'USD' }));
+    });
+    const mixed = api.BudgetEngine.activityContext(ts);
+    expect(mixed).toMatchObject({ currency: null, mixed: true, spent: 30, entryCount: 1, entryAmount: 30 });
   });
 });
 

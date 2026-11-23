@@ -76,17 +76,23 @@ function toggleCollapse(type,id){
 
 // ===== Drag-and-drop (generic, long-press to reorder) =====
 let drag={active:false,type:null,id:null,groupId:null,el:null,ghost:null,indicator:null,timer:null,
-  startX:0,startY:0,originRect:null,offsetX:0,offsetY:0,pointerId:null,pending:null,choreFallback:null};
+  startX:0,startY:0,originRect:null,offsetX:0,offsetY:0,pointerId:null,pending:null,choreFallback:null,
+  lastX:0,lastY:0,rafId:0};
 let dragJustEnded=false;
 // 防误触：按下后位移超过 8px 才真正进入拖拽态（与阶段条 THRESH 一致）
 const DRAG_THRESH=8;
+// 触屏长按启动阈值：按住不动也能开始排序，不必先横向“蹭”出位移
+const LONG_PRESS_MS=380;
+// 拖到视口上下边缘时的自动滚屏范围与每帧最大步长
+const EDGE_SCROLL=72;
+const EDGE_SCROLL_MAX=18;
 
 function initDrag(){
   document.addEventListener('pointerdown',onDragDown);
   document.addEventListener('pointermove',onDragMove);
   document.addEventListener('pointerup',onDragUp);
   document.addEventListener('pointercancel',onDragUp);
-  // 兜底：窗口失焦（系统手势切走、切标签页等）时结束拖拽，避免 body 残留 overflow:hidden
+  // 兜底：窗口失焦（系统手势切走、切标签页等）时结束拖拽，清理 ghost 与自动滚屏
   window.addEventListener('blur',onDragUp);
   // Suppress click events that fire right after a drag (e.g. on collapsible headers)
   document.addEventListener('click',function(e){
@@ -142,8 +148,19 @@ function onDragDown(e){
   // 位移超过阈值后才由 onDragMove → beginDrag 真正激活。
   drag.pending={
     type:target.type,id:target.id,groupId:target.groupId,el:target.el,
-    startX:e.clientX,startY:e.clientY,pointerId:e.pointerId
+    startX:e.clientX,startY:e.clientY,pointerId:e.pointerId,
+    pointerType:e.pointerType||''
   };
+  clearTimeout(drag.timer);
+  drag.timer=null;
+  // 触屏/手写笔：按住不动也能进入排序 —— 这里才是真正的“长按”判定。
+  if(e.pointerType==='touch'||e.pointerType==='pen'){
+    drag.timer=setTimeout(function(){
+      const p=drag.pending;
+      if(!p||drag.active)return;
+      beginDrag(p,{pointerId:p.pointerId,clientX:p.startX,clientY:p.startY});
+    },LONG_PRESS_MS);
+  }
 }
 
 function beginDrag(p,e){
@@ -153,14 +170,20 @@ function beginDrag(p,e){
   drag.el=p.el;
   drag.startX=p.startX;
   drag.startY=p.startY;
+  drag.lastX=p.startX;
+  drag.lastY=p.startY;
   drag.pointerId=p.pointerId;
   drag.pending=null;
+
+  clearTimeout(drag.timer);
+  drag.timer=null;
 
   drag.active=true;
   // 杂事：在 DOM 被拖动前记录当前显示顺序，作为首次排序的播种序列
   drag.choreFallback=p.type==='chore'?getChoreDisplayOrder():null;
   p.el.classList.add('dragging');
-  document.body.style.overflow='hidden';
+  // 不再锁 body 滚动：拖动期间要靠窗口自身滚动做边缘自动滚屏。
+  // 触屏的页面滚动由把手上的 touch-action:none + 指针捕获拦截。
 
   // Cache the element's position ONCE at drag start
   drag.originRect=p.el.getBoundingClientRect();
@@ -183,7 +206,31 @@ function beginDrag(p,e){
     try{p.el.setPointerCapture(e.pointerId);}catch(err){}
   }
 
+  startEdgeScroll();
   toast('拖拽中…松手放置','warn');
+}
+
+// 拖动到视口上下边缘时持续滚屏；滚动后按当前指针高度重算落点指示
+function startEdgeScroll(){
+  if(drag.rafId)return;
+  const step=function(){
+    drag.rafId=0;
+    if(!drag.active)return;
+    const h=window.innerHeight||0;
+    const y=drag.lastY;
+    let dy=0;
+    if(h&&y<EDGE_SCROLL)dy=-Math.ceil((EDGE_SCROLL-y)/EDGE_SCROLL*EDGE_SCROLL_MAX);
+    else if(h&&y>h-EDGE_SCROLL)dy=Math.ceil((y-(h-EDGE_SCROLL))/EDGE_SCROLL*EDGE_SCROLL_MAX);
+    if(dy&&typeof window.scrollBy==='function'){
+      window.scrollBy(0,dy);
+      updateDragIndicator(drag.lastY);
+    }
+    drag.rafId=requestAnimationFrame(step);
+  };
+  drag.rafId=requestAnimationFrame(step);
+}
+function stopEdgeScroll(){
+  if(drag.rafId){cancelAnimationFrame(drag.rafId);drag.rafId=0;}
 }
 
 function getDragSiblings(){
@@ -213,22 +260,25 @@ function onDragMove(e){
     if(!p||e.pointerId!==p.pointerId)return;
     var dx=e.clientX-p.startX,dy=e.clientY-p.startY;
     if(Math.abs(dx)<DRAG_THRESH&&Math.abs(dy)<DRAG_THRESH)return;
-    // 触屏/手写笔：纵向位移占优视为滚动，放弃拖拽（页面不锁死）；
-    // 鼠标不受此限制，保证桌面端纵向列表拖拽排序不退化。
-    if((e.pointerType==='touch'||e.pointerType==='pen')&&Math.abs(dy)>Math.abs(dx)){
-      drag.pending=null;
-      return;
-    }
+    // 触屏/手写笔从把手开始拖：不再要求先横向位移。
+    // 把手已设 touch-action:none，纵向手势不会交给页面滚动，直接进入排序。
     beginDrag(p,e);
   }
   e.preventDefault();
 
+  drag.lastX=e.clientX;
+  drag.lastY=e.clientY;
   // Position ghost using cached offset — ghost follows the finger precisely
   drag.ghost.style.left=(e.clientX-drag.offsetX)+'px';
   drag.ghost.style.top=(e.clientY-drag.offsetY)+'px';
+  updateDragIndicator(e.clientY);
+}
 
+// 依据指针纵坐标把落点指示器插到目标兄弟节点之间
+function updateDragIndicator(clientY){
+  if(!drag.active||!drag.indicator)return;
   var siblings=getDragSiblings();
-  if(drag.indicator&&drag.indicator.parentNode)drag.indicator.parentNode.removeChild(drag.indicator);
+  if(drag.indicator.parentNode)drag.indicator.parentNode.removeChild(drag.indicator);
 
   // Only place indicator among siblings that share the same parent as the dragged element
   var validSiblings=siblings.filter(function(s){
@@ -242,7 +292,7 @@ function onDragMove(e){
   for(var i=0;i<validSiblings.length;i++){
     var r=validSiblings[i].getBoundingClientRect();
     var mid=r.top+r.height/2;
-    if(e.clientY<mid){
+    if(clientY<mid){
       validSiblings[i].parentNode.insertBefore(drag.indicator,validSiblings[i]);
       indicatorPlaced=true;
       break;
@@ -256,8 +306,9 @@ function onDragMove(e){
 
 function onDragUp(e){
   drag.pending=null;
-  // 幂等兜底：无论是否处于拖拽状态，都先恢复页面滚动（可被 pointerup/pointercancel/blur 重复调用）
-  document.body.style.overflow='';
+  clearTimeout(drag.timer);
+  drag.timer=null;
+  stopEdgeScroll();
   if(!drag.active)return;
 
   // Release pointer capture
@@ -308,8 +359,6 @@ function onDragUp(e){
   // If invalid drop (indicator in wrong container), don't move the element
 
   drag.el.classList.remove('dragging');
-  // Restore scrolling
-  document.body.style.overflow='';
   if(drag.ghost){drag.ghost.remove();drag.ghost=null;}
   if(drag.indicator){drag.indicator.remove();drag.indicator=null;}
 
@@ -374,6 +423,8 @@ function onDragUp(e){
   drag.originRect=null;
   drag.pointerId=null;
   drag.choreFallback=null;
+  drag.lastX=0;
+  drag.lastY=0;
 }
 
 // 杂事当前显示顺序（待办 → 已完成 → 已归档，同一文档序）

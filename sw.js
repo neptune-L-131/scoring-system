@@ -16,7 +16,7 @@
 // tests/sw-assets.test.js 会校验：清单与仓库实际文件一致、VERSION 与缓存名一致。
 'use strict';
 
-const VERSION = '2026-11-19.12';
+const VERSION = '2026-11-22.12';
 const CACHE = 'score-sys-' + VERSION;
 
 // 整版清单（相对 sw.js 所在目录）
@@ -36,6 +36,7 @@ const PRECACHE = [
   './src/cond-kernel.js',
   './src/cond-eval.js',
   './src/modal-host.js',
+  './src/form-contract.js',
   './src/render.js',
   './src/state.js',
   './src/affair-steps.js',

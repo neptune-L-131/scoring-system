@@ -1,6 +1,5 @@
 import { noteCheckinActivity } from './gate.js';
-import { BudgetEngine } from './budget.js';
-import { budgetOf, budgetRefOf, openBudgetAmountDialog, rememberBudgetDraft, resolveActionBudget } from './budget-binding.js';
+import { budgetOf, budgetRefOf, commitActionBudget, openBudgetAmountDialog, rememberBudgetDraft, resolveActionBudget } from './budget-binding.js';
 import { runCommand } from './command.js';
 import { Ledger } from './ledger.js';
 import { processDailyTaskDebts, processLoansWithDecayReserve } from './debt.js';
@@ -109,7 +108,7 @@ function checkIn(taskId,stageIdx,resolved){
     // 现实预算：惩罚先于本笔收益入账（先扣后收），避免用本笔收入支付本笔超支惩罚
     let budgetRef=null;
     if(plan){
-      const got=BudgetEngine.commitEntry(tx,plan,{checkinLogId:checkinLogId});
+      const got=commitActionBudget(tx,plan,{checkinLogId:checkinLogId});
       budgetRef=budgetRefOf(got.entry,plan);
       if(bind&&bind.mode==='prompt')t.budget.lastAmount=plan.amount;
     }

@@ -1,4 +1,4 @@
-import { AFFAIR_CURVES, ASSET_LOG_CATS, ASSET_LOG_CAT_NAMES, COND_AFFAIR_METRICS, COND_ASSET_METRICS, COND_CHORE_METRICS, COND_GATE_METRICS, COND_POINT_METRICS, STAGE_NAMES, WEEK_ANCHOR_NAMES } from './constants.js';
+import { AFFAIR_CURVES, ASSET_LOG_CATS, ASSET_LOG_CAT_NAMES, COND_AFFAIR_METRICS, COND_ASSET_METRICS, COND_CHORE_METRICS, COND_GATE_METRICS, COND_POINT_METRICS, CURRENCIES, STAGE_NAMES, WEEK_ANCHOR_NAMES } from './constants.js';
 import * as time from './time.js';
 // pure.js —— 纯函数底层（不读写全局 state、不调用 Ledger、import 时无副作用）
 // 由 utils/state/business/conditions/normalize/budget/render-work 抽离（第六轮循环依赖治理），实现逐字未改。
@@ -223,6 +223,19 @@ function budgetBounds(cycle,ts,anchor){
 }
 function weekAnchorName(a){return WEEK_ANCHOR_NAMES[Math.min(7,Math.max(1,Math.round(Number(a)||1)))];}
 function round4(v){return Math.round((Number(v)||0)*10000)/10000;}
+// ===== 现实钱币种：只服务预算分类/现实账目，与虚拟积分无关 =====
+// 形状守卫：ISO 4217 为 3 位，留出自定义扩展空间到 8 位；不白名单化具体代码。
+function isCurrencyCode(v){return typeof v==='string'&&/^[A-Z]{3,8}$/.test(v);}
+// 分类币种：缺失/非法一律读作 CNY。只解释，不写回（懒补齐）。
+function currencyOf(cat){return isCurrencyCode(cat&&cat.currency)?cat.currency:'CNY';}
+// 历史记录（账目/周期/结算快照）币种：缺省固定 CNY。
+// 绝不回落到分类当前币种，否则改分类币种会追认改写旧账。
+function historicalCurrencyOf(rec){return isCurrencyCode(rec&&rec.currency)?rec.currency:'CNY';}
+// 显示金额：表中代码用符号；表外合法代码用「代码 金额」，避免把未知币种误标成 ¥。
+function money(amount,code){
+  const meta=CURRENCIES[code];
+  return meta?meta.symbol+fmt(amount):String(code||'CNY')+' '+fmt(amount);
+}
 function affairSteps(a){return Array.isArray(a.steps)?a.steps.filter(function(s){return s&&s.text;}):[];}
 function affairTotalSteps(a){return affairSteps(a).length;}
 function affairDoneSteps(a){return affairSteps(a).filter(function(s){return s.doneAt;}).length;}
@@ -260,7 +273,7 @@ function migrateAffair(a){
 }
 
 
-export { uid, fmt, now, daysSince, effectiveLastTs, taskCheckedToday, fmtTime, esc, escAttr, clone, splitCents, logHasType, taskScoreTypes, taskHasType, getTaskDomainIds, round2, logAmt, stageRewards, taskIsStaged, stageValues, stageSel, stageValueAt, stageCellLabel, stageNetAt, calcCheckIn, calcSkip, dayKey, weekStartKey, weekStartTs, periodKey, dayStartTs, prevPeriodRange, condWindowByRange, validRange, normOp, isPointMetric, isAssetMetric, isAssetHoldMetric, validAssetCat, assetCatName, assetLogMeta, isAffairMetric, isChoreMetric, isStage1Metric, isGateMetric, toNum, toTs, asArray, defaultWatermark, dateKeyOffset, budgetBounds, weekAnchorName, round4, affairSteps, affairTotalSteps, affairDoneSteps, affairLastAdvance, affairCurve, affairCurveType, affairTargetAt, affairIsDone, migrateAffair };
+export { uid, fmt, now, daysSince, effectiveLastTs, taskCheckedToday, fmtTime, esc, escAttr, clone, splitCents, logHasType, taskScoreTypes, taskHasType, getTaskDomainIds, round2, logAmt, stageRewards, taskIsStaged, stageValues, stageSel, stageValueAt, stageCellLabel, stageNetAt, calcCheckIn, calcSkip, dayKey, weekStartKey, weekStartTs, periodKey, dayStartTs, prevPeriodRange, condWindowByRange, validRange, normOp, isPointMetric, isAssetMetric, isAssetHoldMetric, validAssetCat, assetCatName, assetLogMeta, isAffairMetric, isChoreMetric, isStage1Metric, isGateMetric, toNum, toTs, asArray, defaultWatermark, dateKeyOffset, budgetBounds, weekAnchorName, round4, isCurrencyCode, currencyOf, historicalCurrencyOf, money, affairSteps, affairTotalSteps, affairDoneSteps, affairLastAdvance, affairCurve, affairCurveType, affairTargetAt, affairIsDone, migrateAffair };
 
 function idleDaysSince(baseTs,refTs){
   if(!baseTs)return null;

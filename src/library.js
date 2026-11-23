@@ -8,6 +8,7 @@ import { assetGrantCore, setLastTickDay } from './entities.js';
 import { noteCheckinActivity, validProductTier } from './gate.js';
 import { Ledger, applyCheckinGain } from './ledger.js';
 import { closeModal, openModal } from './modal-host.js';
+import { markModalClean, rejectFields } from './form-contract.js';
 import { normalizeAssetPrice, normalizeProductBudget, normalizeProductExec, normalizeProductGate, normalizeProductGrants, setLoadIssue, setPersistBlocked } from './normalize.js';
 import { commit, save } from './persist.js';
 import { dayKey, logAmt, round2, clone, fmt, getTaskDomainIds, now, splitCents, taskHasType, taskScoreTypes, uid } from './pure.js';
@@ -508,6 +509,7 @@ function openMetricModal(id){
   document.getElementById('metricName').value=m?m.name:'';
   fillDomainChecklist(document.getElementById('metricDomainList'),m?(m.domainIds||[]):['d_default']);
   openModal('metricModal');
+  markModalClean('metricModal');
   setTimeout(()=>document.getElementById('metricName').focus(),50);
 }
 function getCheckedMetricDomains(){
@@ -519,8 +521,10 @@ function handleMetricSave(){
   const id=document.getElementById('metricId').value;
   const name=document.getElementById('metricName').value.trim();
   const domainIds=getCheckedMetricDomains();
-  if(!name){toast('请输入指标名称','err');return}
-  if(!domainIds.length){toast('请至少选择一个领域','err');return}
+  const errs=[];
+  if(!name)errs.push({field:'metricName',msg:'请输入指标名称'});
+  if(!domainIds.length)errs.push({field:'metricDomainList',msg:'请至少选择一个领域'});
+  if(errs.length){const first=rejectFields('metricModal',errs);if(!first)toast(errs[0].msg,'err');return}
   if(id){
     const m=state.metrics.find(x=>x.id===id);
     if(!m)return;
@@ -652,7 +656,7 @@ function execErrorText(err){
   if(code==='FLOW_ASSET_CAP')return '执行时资产会超出余额上限';
   if(code==='FLOW_RUN_LIMIT'||code==='FLOW_AMOUNT_LIMIT'||code==='FLOW_AMOUNT_TOO_MANY')return '执行时超出动作流的单次上限';
   if(code==='FLOW_CREATE_LIMIT')return '执行时创建数量超出单次上限';
-  if(code==='FLOW_NAME_TOO_LONG')return '执行时事项名称过长';
+  if(code==='FLOW_NAME_TOO_LONG')return '执行时创建的事项名称过长';
   if(code==='FLOW_INVALID_ACCOUNT'||code==='FLOW_INVALID_ENTITY')return '执行时引用的事项或账户无效';
   if(code==='FLOW_CONDITION_ERROR')return '执行时条件求值失败';
   if(info.reason)return String(info.reason);

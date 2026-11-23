@@ -6,7 +6,7 @@ import { ACTIVITY_MAX_DAYS, ASSET_VERSION, AUDIT_MAX, BUDGET_LEDGER_MAX, BUDGET_
 import { defaultAssetDefs, defaultBudgetsState, defaultProductGate, migrateChore, normalizeChoreConfig, tierCurrency, defaults } from './defaults.js';
 import { normalizeChoreOrder, reconcileChoreOrder } from './chore-list.js';
 import { normalizeExecBuys } from './exec-quota.js';
-import { budgetBounds, periodKey, migrateAffair, esc, now, uid, toNum, toTs, asArray, dateKeyOffset, round2, validAssetCat } from './pure.js';
+import { budgetBounds, periodKey, migrateAffair, esc, now, uid, toNum, toTs, asArray, dateKeyOffset, round2, validAssetCat, isCurrencyCode } from './pure.js';
 import { emptyAccountSums } from './stats.js';
 import { normalizeEventStore, EVENT_KINDS } from './events.js';
 import { totalProgress } from './utils.js';
@@ -528,7 +528,7 @@ function normalizeBudgetCategory(c,ctx){
   const od=(c.overdraft&&typeof c.overdraft==='object'&&!Array.isArray(c.overdraft))?c.overdraft:{};
   const rules=asArray(c.rules).map(function(r){return normalizeBudgetRule(r,ctx);}).filter(Boolean);
   rules.sort(function(a,b){return a.priority-b.priority;});
-  return{
+  const out={
     id:String(c.id||uid()),
     name:String(c.name||'未命名分类').slice(0,40),
     enabled:c.enabled!==false,
@@ -548,6 +548,9 @@ function normalizeBudgetCategory(c,ctx){
     createdAt:toTs(c.createdAt)||now(),
     updatedAt:toTs(c.updatedAt)||null
   };
+  // 现实钱币种是可选语义字段：合法就保留，非法就删除，缺失就继续缺失（读取层缺省 CNY）
+  if(isCurrencyCode(c.currency))out.currency=c.currency;
+  return out;
 }
 function normalizeBudgetPeriod(p,key,cycle,anchor){
   if(!p||typeof p!=='object'||Array.isArray(p))return null;
@@ -556,7 +559,7 @@ function normalizeBudgetPeriod(p,key,cycle,anchor){
   if(p.ruleTotals&&typeof p.ruleTotals==='object'&&!Array.isArray(p.ruleTotals)){
     Object.keys(p.ruleTotals).forEach(function(k){totals[k]=Math.max(0,toNum(p.ruleTotals[k],0));});
   }
-  return{
+  const out={
     key:String(p.key||key),
     start:toNum(p.start,0)||b.start,
     end:toNum(p.end,0)||b.end,
@@ -575,6 +578,9 @@ function normalizeBudgetPeriod(p,key,cycle,anchor){
     closedAt:toTs(p.closedAt),
     settledAt:toTs(p.settledAt)
   };
+  // 周期币种是写入时的快照：合法保留、非法删除、缺失不补（读取层缺省 CNY）
+  if(isCurrencyCode(p.currency))out.currency=p.currency;
+  return out;
 }
 function normalizeBudgetLedgerEntry(e,ctx){
   if(!e||typeof e!=='object'||Array.isArray(e))return null;
@@ -582,14 +588,14 @@ function normalizeBudgetLedgerEntry(e,ctx){
   if(ctx&&ctx.catIds&&!ctx.catIds.has(catId))return null;
   const links=(e.links&&typeof e.links==='object'&&!Array.isArray(e.links))?e.links:{};
   const snap=(e.snapshot&&typeof e.snapshot==='object'&&!Array.isArray(e.snapshot))?e.snapshot:{};
-  return{
+  const out={
     id:String(e.id||uid()),
     ts:toTs(e.ts)||now(),
     txnId:String(e.txnId||''),
     categoryId:catId,
     amount:Math.max(0,toNum(e.amount,0)),
     refundAmount:Math.max(0,toNum(e.refundAmount,0)),
-    source:['manual','product','task','affair','chore','reversal'].indexOf(e.source)>=0?e.source:'manual',
+    source:['manual','product','task','affair','chore','reversal','refund'].indexOf(e.source)>=0?e.source:'manual',
     productId:String(e.productId||''),
     note:String(e.note||'').slice(0,80),
     periodKey:String(e.periodKey||''),
@@ -618,6 +624,9 @@ function normalizeBudgetLedgerEntry(e,ctx){
       penaltyAfter:Math.max(0,toNum(snap.penaltyAfter,0))
     }
   };
+  // 条目币种是写入时的快照：合法保留、非法删除、缺失不补（旧账读取层缺省 CNY）
+  if(isCurrencyCode(e.currency))out.currency=e.currency;
+  return out;
 }
 function normalizeBudgets(x,ctx){
   const out=defaultBudgetsState();

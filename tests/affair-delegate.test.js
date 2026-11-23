@@ -185,3 +185,60 @@ describe('解除入口', () => {
     expect(s.chores.map(c => c.id)).toEqual(['c1', 'c2']);
   });
 });
+
+describe('步骤排序与未保存保护（批次 3）', () => {
+  it('上下移动整体交换步骤对象：文本、完成态与委派引用一起走', () => {
+    seed({
+      affairs: [affair('a1', [
+        step({ text: '甲', choreRef: { id: 'c1', origin: 'existing' } }),
+        step({ text: '乙', doneAt: at(3) }),
+      ])],
+    });
+    api.openAffairModal('a1');
+    api.affairMoveStep(0, 1);
+    api.handleAffairSave();
+
+    const s = api.getState();
+    expect(s.affairs[0].steps.map(x => x.text)).toEqual(['乙', '甲']);
+    expect(s.affairs[0].steps[0].doneAt).toBe(at(3));
+    expect(s.affairs[0].steps[1].choreRef).toEqual({ id: 'c1', origin: 'existing' });
+    expect(api.affairStepIssues(s.affairs, s.chores)).toEqual([]);
+  });
+
+  it('首尾越界移动是空操作', () => {
+    seed({ affairs: [affair('a1', [step({ text: '甲' }), step({ text: '乙' })])] });
+    api.openAffairModal('a1');
+    api.affairMoveStep(0, -1);
+    api.affairMoveStep(1, 1);
+    api.handleAffairSave();
+    expect(api.getState().affairs[0].steps.map(x => x.text)).toEqual(['甲', '乙']);
+  });
+
+  it('打开时无改动不脏；改过字段才脏；确认放弃前不关闭', () => {
+    seed({ affairs: [affair('a1', [step({ text: '原步骤' })])] });
+    api.openAffairModal('a1');
+    expect(api.affairIsDirty()).toBe(false);
+
+    document.getElementById('affairName').value = '改了名字';
+    expect(api.affairIsDirty()).toBe(true);
+
+    const realConfirm = globalThis.confirm;
+    let asked = 0;
+    globalThis.confirm = () => { asked += 1; return false; };
+    try {
+      expect(api.closeAffairModal()).toBe(false);
+    } finally {
+      globalThis.confirm = realConfirm;
+    }
+    expect(asked).toBe(1);
+    expect(document.getElementById('affairName').value).toBe('改了名字');
+  });
+
+  it('保存成功后清空快照，不会把已保存内容当成脏改动', () => {
+    seed({ affairs: [affair('a1', [step({ text: '原步骤' })])] });
+    api.openAffairModal('a1');
+    document.getElementById('affairName').value = '新名字';
+    api.handleAffairSave();
+    expect(api.affairIsDirty()).toBe(false);
+  });
+});

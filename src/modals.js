@@ -8,10 +8,12 @@ import { COND_METRIC_KEYS, PRODUCT_EXEC_MAX_PER_PERIOD, STAGE_NAMES } from './co
 import { defaultProductGate } from './defaults.js';
 import { gateFailReasons, validProductTier } from './gate.js';
 import { describeFlowAtom } from './flow-atoms.js';
+import { flowAtomLabels } from './flow-ui.js';
 import { delAch, delProd, delTask, fillShopCatSelect, pendingTaskSave, productGateContext, saveAchData, saveProdData, saveTaskData } from './library.js';
 import { normalizeProductGate } from './normalize.js';
-import { round4, round2, stageRewards, taskIsStaged, esc, escAttr, fmt, getTaskDomainIds, taskScoreTypes } from './pure.js';
+import { round4, round2, stageRewards, taskIsStaged, esc, escAttr, fmt, getTaskDomainIds, taskScoreTypes, currencyOf } from './pure.js';
 import { fillCollectionSelect, fillDomainChecklist, fillDomainSelect, getCheckedDomainIds } from './shell.js';
+import { markModalClean, rejectFields } from './form-contract.js';
 import { render } from './render.js';
 import { saveStagePresets, stagePresets, state } from './state.js';
 import { toast } from './toast.js';
@@ -69,36 +71,44 @@ function openTaskModal(id,presetCollId){
   if(editStage.enabled){const rf=document.getElementById('recalcFG');if(rf)rf.style.display='none';}
   renderStageRows();
   refreshTaskSliders();
+  setTaskAccordion('accTaskBasic',true);
   setTaskAccordion('accTaskType',true);
   setTaskAccordion('accTaskNum',false);
-  setTaskAccordion('accTaskMeta',false);
   setTaskAccordion('accTaskStage',false);
   updateTaskAccSummaries();
   const budBox=document.getElementById('taskBudgetBind');
   if(budBox)budBox.innerHTML=budgetBindingHTML('task',taskForStage);
   if(budBox)budgetBindingModeChange('task');
   openModal('taskModal');
+  markModalClean('taskModal');
   setTimeout(()=>document.getElementById('taskName').focus(),50);
 }
 
 // ===== 任务弹窗：数值滑动条 + 分区摘要 =====
 const TASK_SLIDERS={taskInitial:{min:0,max:100},taskInterest:{min:0,max:50},taskDebt:{min:0,max:50},taskCost:{min:0,max:100}};
+// 填充条与滑块共用同一个比例：--slide-p 驱动 CSS 里的可见 thumb
+function applySliderVisual(track,ratio){
+  const pct=(Math.max(0,Math.min(1,ratio))*100)+'%';
+  const fill=track.querySelector('.slide-fill');
+  if(fill)fill.style.width=pct;
+  track.style.setProperty('--slide-p',pct);
+}
 function refreshTaskSliders(){
   document.querySelectorAll('.slide-track').forEach(function(track){
     const input=document.getElementById(track.dataset.for);
     if(!input)return;
     const r=TASK_SLIDERS[track.dataset.for]||{min:0,max:100};
     const v=Math.max(r.min,Math.min(r.max,Number(input.value)||0));
-    const fill=track.querySelector('.slide-fill');
-    if(fill)fill.style.width=(((v-r.min)/(r.max-r.min))*100)+'%';
+    applySliderVisual(track,(v-r.min)/(r.max-r.min));
   });
 }
 function bindTaskSliders(){
-  let cur=null;
+  let cur=null,curPid=null;
   function setFromX(track,clientX){
     const input=document.getElementById(track.dataset.for);
     if(!input)return;
     const rect=track.getBoundingClientRect();
+    if(!rect.width)return;
     const r=TASK_SLIDERS[track.dataset.for]||{min:0,max:100};
     let ratio=(clientX-rect.left)/rect.width;
     ratio=Math.max(0,Math.min(1,ratio));
@@ -106,20 +116,26 @@ function bindTaskSliders(){
     v=Math.round(v*10)/10;
     v=Math.max(r.min,Math.min(r.max,v));
     input.value=v;
-    const fill=track.querySelector('.slide-fill');
-    if(fill)fill.style.width=(ratio*100)+'%';
+    applySliderVisual(track,ratio);
   }
   document.querySelectorAll('.slide-track').forEach(function(track){
     track.addEventListener('pointerdown',function(e){
-      cur=track;
+      cur=track;curPid=e.pointerId;
+      track.classList.add('dragging');
       if(track.setPointerCapture){try{track.setPointerCapture(e.pointerId);}catch(err){}}
       setFromX(track,e.clientX);
     });
     track.addEventListener('pointermove',function(e){
-      if(cur===track)setFromX(track,e.clientX);
+      if(cur!==track||e.pointerId!==curPid)return;
+      setFromX(track,e.clientX);
     });
-    track.addEventListener('pointerup',function(){cur=null;});
-    track.addEventListener('pointercancel',function(){cur=null;});
+    function end(e){
+      if(cur!==track||e.pointerId!==curPid)return;
+      cur=null;curPid=null;
+      track.classList.remove('dragging');
+    }
+    track.addEventListener('pointerup',end);
+    track.addEventListener('pointercancel',end);
   });
   document.addEventListener('input',function(e){
     const id=e.target&&e.target.id;
@@ -143,7 +159,7 @@ function updateTaskAccSummaries(){
     const g=function(id){const el=document.getElementById(id);return el?el.value:'';};
     numEl.textContent='初始'+g('taskInitial')+' · 利率'+g('taskInterest')+'% · 债率'+g('taskDebt')+'% · 花'+g('taskCost');
   }
-  const metaEl=document.getElementById('accTaskMetaSum');
+  const metaEl=document.getElementById('accTaskBasicSum');
   if(metaEl){
     const sel=document.getElementById('taskCollection');
     metaEl.textContent=(sel&&sel.selectedOptions&&sel.selectedOptions.length)?sel.selectedOptions[0].text:'';
@@ -289,11 +305,19 @@ function handleTaskSave(){
   const collectionId=document.getElementById('taskCollection').value;
   const domainIds=getCheckedDomainIds();
 
-  if(!name){toast('请输入任务名称','err');return}
-  if(isNaN(initialValue)||initialValue<0){toast('初始数值需 ≥ 0','err');return}
-  if(isNaN(interestRate)||interestRate<0){toast('利率需 ≥ 0','err');return}
-  if(isNaN(debtRate)||debtRate<0){toast('债率需 ≥ 0','err');return}
-  if(isNaN(vitalityCost)||vitalityCost<0){toast('活力点花费需 ≥ 0','err');return}
+  const errs=[];
+  if(!name)errs.push({field:'taskName',msg:'请输入任务名称'});
+  if(isNaN(initialValue)||initialValue<0)errs.push({field:'taskInitial',msg:'初始数值需 ≥ 0'});
+  if(isNaN(interestRate)||interestRate<0)errs.push({field:'taskInterest',msg:'利率需 ≥ 0'});
+  if(isNaN(debtRate)||debtRate<0)errs.push({field:'taskDebt',msg:'债率需 ≥ 0'});
+  if(isNaN(vitalityCost)||vitalityCost<0)errs.push({field:'taskCost',msg:'活力点花费需 ≥ 0'});
+  if(errs.length){
+    // 数值错误在收起的「数值规则」里：先展开，错误才可见
+    if(errs.some(e=>e.field!=='taskName'))setTaskAccordion('accTaskNum',true);
+    const first=rejectFields('taskModal',errs);
+    if(!first)toast(errs[0].msg,'err');
+    return;
+  }
 
   // 阶段奖励
   let stageRewards=null;
@@ -349,6 +373,7 @@ function openAchModal(id,presetDomId){
     document.getElementById('achPoints').value=1;
   }
   openModal('achModal');
+  markModalClean('achModal');
   setTimeout(()=>document.getElementById('achName').focus(),50);
 }
 
@@ -359,9 +384,11 @@ function handleAchSave(){
   const points=parseFloat(document.getElementById('achPoints').value);
   const domainId=document.getElementById('achDomain').value;
 
-  if(!name){toast('请输入里程碑名称','err');return}
-  if(isNaN(threshold)||threshold<0){toast('门槛需 ≥ 0','err');return}
-  if(isNaN(points)||points<=0){toast('成果点需 > 0','err');return}
+  const errs=[];
+  if(!name)errs.push({field:'achName',msg:'请输入里程碑名称'});
+  if(isNaN(threshold)||threshold<0)errs.push({field:'achThreshold',msg:'门槛需 ≥ 0'});
+  if(isNaN(points)||points<=0)errs.push({field:'achPoints',msg:'成果点需 > 0'});
+  if(errs.length){const first=rejectFields('achModal',errs);if(!first)toast(errs[0].msg,'err');return}
 
   saveAchData({id:id||null,name:name,domainId:domainId,threshold:threshold,points:points});
   closeModal('achModal');
@@ -519,7 +546,7 @@ function execPreviewHTML(flow){
         walk(s.else);
       }else{
         lines.push('<div class="flow-run-step"><span class="flow-step-idx">'+(lines.length+1)+'</span>'+
-          esc(describeFlowAtom(s.atom,s.params||{}))+'</div>');
+          esc(describeFlowAtom(s.atom,s.params||{},flowAtomLabels()))+'</div>');
       }
     });
   }
@@ -594,6 +621,7 @@ function openProdModal(id,presetCatId){
   onProdAssetPriceChange();
   onProdTierChange();
   openModal('prodModal');
+  markModalClean('prodModal');
   setTimeout(()=>document.getElementById('prodName').focus(),50);
 }
 
@@ -615,6 +643,8 @@ function onProdBudgetChange(){
   if(fg)fg.style.display=cat?'':'none';
   const amt=document.getElementById('prodBudgetAmount');
   if(!cat&&amt)amt.value=0;
+  const hint=document.getElementById('prodBudgetHint');
+  if(hint)hint.textContent='仅支出 · 按该分类的币种（'+currencyOf(cat)+'）计入本期已花';
 }
 
 function handleProdSave(){
@@ -634,14 +664,16 @@ function handleProdSave(){
   const grantCurrencyAmt=parseFloat(document.getElementById('prodGrantCurrencyAmt').value);
   const hasAssetPrice=!!assetPriceId;
 
-  if(!name){toast('请输入商品名称','err');return}
+  const errs=[];
+  if(!name)errs.push({field:'prodName',msg:'请输入商品名称'});
   if(hasAssetPrice){
-    if(isNaN(priceRaw)||priceRaw<0){toast('价格需 ≥ 0（有资产定价时可填 0）','err');return}
-  }else if(isNaN(priceRaw)||priceRaw<0.1){toast('价格需 ≥ 0.1','err');return}
-  if(hasAssetPrice&&(isNaN(assetPriceAmt)||assetPriceAmt<1)){toast('资产定价数量需 ≥ 1','err');return}
-  if(isNaN(stock)||stock<-1){toast('库存需 ≥ -1','err');return}
+    if(isNaN(priceRaw)||priceRaw<0)errs.push({field:'prodPrice',msg:'价格需 ≥ 0（有资产定价时可填 0）'});
+  }else if(isNaN(priceRaw)||priceRaw<0.1)errs.push({field:'prodPrice',msg:'价格需 ≥ 0.1'});
+  if(hasAssetPrice&&(isNaN(assetPriceAmt)||assetPriceAmt<1))errs.push({field:'prodAssetPriceAmt',msg:'资产定价数量需 ≥ 1'});
+  if(isNaN(stock)||stock<-1)errs.push({field:'prodStock',msg:'库存需 ≥ -1'});
   if(hasAssetPrice){debtRate=0;}
-  if(isNaN(debtRate)||debtRate<0){toast('债率需 ≥ 0','err');return}
+  if(isNaN(debtRate)||debtRate<0)errs.push({field:'prodDebtRate',msg:'债率需 ≥ 0'});
+  if(errs.length){const first=rejectFields('prodModal',errs);if(!first)toast(errs[0].msg,'err');return}
 
   let gate=defaultProductGate();
   if(tier!=='daily'){

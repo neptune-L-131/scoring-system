@@ -105,7 +105,7 @@ const EXPORT_NAMES = [
   'processLoans', 'processChoreDecay', 'processDailyTaskDebts',
   'settleChoreBatches', 'checkAchievements', 'runConsistencyChecks',
   // 动作原子（阶段 4 S3）
-  'FLOW_ATOMS', 'FLOW_ATOM_IDS', 'runFlowAtom', 'describeFlowAtom',
+  'FLOW_ATOMS', 'FLOW_ATOM_IDS', 'FLOW_ATOM_SELECTABLE_IDS', 'runFlowAtom', 'describeFlowAtom',
   'FLOW_ATOM_MAX_CURRENCY', 'FLOW_ATOM_MAX_ASSET', 'FLOW_ATOM_MAX_ARCHIVE',
   'FLOW_ATOM_MAX_NOTES', 'FLOW_ATOM_NOTE_MAX_LEN', 'FLOW_ATOM_IDLE_DAYS_MAX',
   'FLOW_ATOM_MAX_CREATE', 'FLOW_ATOM_CREATE_NAME_MAX', 'PRODUCT_EXEC_MAX_PER_PERIOD',
@@ -265,7 +265,7 @@ function installBrowserGlobals() {
 async function loadFromModules() {
   // 纯逻辑模块（不含 main.js：入口会跑初始化、碰 DOM）。
   const MODULES = [
-    'constants.js', 'time.js', 'pure.js', 'exec-quota.js', 'entity-kit.js', 'defaults.js', 'toast.js', 'cond-model.js', 'modal-host.js',
+    'constants.js', 'time.js', 'pure.js', 'exec-quota.js', 'entity-kit.js', 'defaults.js', 'toast.js', 'cond-model.js', 'modal-host.js', 'form-contract.js',
     'state.js', 'affair-steps.js', 'affair-delegate.js', 'theme.js', 'normalize.js', 'persist-state.js', 'persist.js', 'utils.js', 'stats.js',
     'ledger.js', 'chore-cycle.js', 'chore-list.js', 'chore-core.js', 'debt.js', 'gate.js', 'budget.js', 'budget-binding.js', 'command.js', 'post-commit.js', 'conditions.js', 'entities.js', 'business.js',
     'flow-scheduler.js',

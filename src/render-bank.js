@@ -12,6 +12,8 @@ import { accountLabel, shadowLabel } from './stats.js';
 import { addDays, dayDiff, dayStart as dayStartOf, weekStart } from './time.js';
 import { toggleCollapse } from './ui-events.js';
 import { UNDO_ADAPTERS, undoLog } from './undo.js';
+import { toast } from './toast.js';
+import { undoFlowRunUI } from './flow-ui.js';
 import { domainName, domainProgress, metricValue, totalProgress } from './utils.js';
 import { logRowView, shadowRowView } from './view-models.js';
 import { collBodyHTML, collGroupHTML, collHeaderHTML, dragHandleHTML, logItemHTML } from './view-primitives.js';
@@ -139,7 +141,7 @@ function ledgerSrcGroup(l){
   if(s.indexOf('checkin')===0)return{key:'checkin',name:'打卡'};
   if(s.indexOf('purchase')===0)return{key:'purchase',name:'购买'};
   if(s==='cost')return{key:'task',name:'任务'};
-  if(s.indexOf('affair')===0)return{key:'affair',name:'事项'};
+  if(s.indexOf('affair')===0)return{key:'affair',name:'项目'};
   if(s.indexOf('chore')===0)return{key:'chore',name:'杂事'};
   if(s.indexOf('budget')===0)return{key:'budget',name:'预算'};
   if(s.indexOf('flow')===0)return{key:'flow',name:'动作流'};
@@ -464,7 +466,13 @@ function ledgerRunBlockHTML(runId,l){
   const orderId=ledgerRunOrderId(runId);
   let h='<div class="ld-sec">本次执行 · '+esc(ledgerRunLabel(runId))
     +' <span class="ld-sub">'+esc(ledgerRunTriggerLabel(run,runId))+' · '+esc(fmtTime(ledgerRunTime(runId)))+'</span>'
-    +' <button class="ledger-link" onclick="focusLedgerLink(\'run\',\''+escAttr(runId)+'\')">只看这次执行</button></div>';
+    +' <button class="ledger-link" onclick="focusLedgerLink(\'run\',\''+escAttr(runId)+'\')">只看这次执行</button>'
+    +(!run
+      ?' <span class="ld-sub">运行记录已过期（只保留最近 50 次），无法整单撤销</span>'
+      :run.status==='reversed'
+        ?' <span class="ld-sub">已整单撤销'+(run.reversedAt?' · '+esc(fmtTime(run.reversedAt)):'')+'</span>'
+        :' <button class="ledger-link" onclick="bankUndoRun(\''+escAttr(runId)+'\')">整单撤销</button>')
+    +'</div>';
   if(orderId)h+='<div class="ld-line"><span class="ld-k">来源订单</span><span class="ld-v">'+esc(orderId)+'</span></div>';
   const ids=ledgerRunChildIds(run,l);
   h+='<div class="ld-sec">产生的变动 · '+ids.length+' 笔</div><div class="ld-list">';
@@ -507,6 +515,16 @@ function ledgerRunBlockHTML(runId,l){
   }
   if(!run)h+='<div class="ld-note">运行记录已裁剪：只能看到流水与执行标识，无法还原账户前后值。</div>';
   return h;
+}
+// 银行流水的「本次执行」里就地撤销：先确认再回滚，成功后给出明确反馈，避免流水静默消失。
+function bankUndoRun(runId){
+  const run=ledgerRunOf(runId);
+  const name=ledgerRunLabel(runId);
+  if(!run){toast('运行记录已过期，无法整单撤销','warn');return;}
+  if(run.status==='reversed'){toast('这次运行已经整单撤销过了','warn');return;}
+  if(!confirm('整单撤销「'+name+'」这次运行？\n将按执行日志逆序回滚本次产生的所有变动。撤销后，这条运行流水会从列表消失，其他流水不受影响。'))return;
+  const r=undoFlowRunUI(runId);
+  if(r&&r.ok)toast('已整单撤销「'+name+'」，本次产生的流水已回滚','ok');
 }
 function ledgerRowHTML(row,undoableSrc){
   if(row.shadow)return ledgerShadowRowHTML(row.log);
@@ -1130,7 +1148,7 @@ function renderMetricChips(){
   mc.innerHTML=html;
 }
 
-export { renderBank, toggleShadowList, renderShadowList, chartState, toggleChartSeries, toggleTrendMode, showChartTip, hideChartTip, drawChart, drawVitalityFlowChart, drawWeekCompareChart, renderRadar, renderMetricChips, setLedgerFilter, clearLedgerFilter, toggleLedgerShadowFilter, toggleLedgerDay, toggleLedgerDetail, focusLedgerLink };
+export { renderBank, toggleShadowList, renderShadowList, chartState, toggleChartSeries, toggleTrendMode, showChartTip, hideChartTip, drawChart, drawVitalityFlowChart, drawWeekCompareChart, renderRadar, renderMetricChips, setLedgerFilter, clearLedgerFilter, toggleLedgerShadowFilter, toggleLedgerDay, toggleLedgerDetail, focusLedgerLink, bankUndoRun };
 
 registerRenderer('bank', renderBank);
 

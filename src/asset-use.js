@@ -67,7 +67,7 @@ function previewText(def, taskId) {
     + '消耗：' + (def.name || def.id) + ' ' + (def.useRecipe.cost || 1) + ' 个（余额 ' + before + ' → ' + after + '）\n'
     + '待扣债：' + (Number(t.pendingDebt) || 0) + ' → 0\n'
     + '今日不再计入断更（可继续维持连胜利率）\n\n'
-    + '确认后会留下一条运行记录，可在「周期 → 动作流 → 运行记录」整单撤销。';
+    + '确认后会留下一条运行记录，可在「周期 → 试跑与运行历史 → 整单撤销」回滚。';
 }
 
 // 对外入口：任务卡按钮

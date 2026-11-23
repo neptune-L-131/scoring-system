@@ -317,6 +317,119 @@ describe('重算历史不清空 budgetRef', () => {
   });
 });
 
+describe('绑定方向与退回路径（M3a）', () => {
+  function commitSpend(amount, ts) {
+    let out = null;
+    const r = api.Ledger.txn(tx => {
+      const plan = api.BudgetEngine.prepareEntry('bc1', amount, { ts, source: 'task' });
+      out = api.BudgetEngine.commitEntry(tx, plan, {});
+    }, { save: 'none', render: false });
+    expect(r.ok).toBe(true);
+    return out.entry;
+  }
+  function commitRefund(amount, ts) {
+    let out = null;
+    const r = api.Ledger.txn(tx => {
+      const plan = api.BudgetEngine.prepareRefund('bc1', amount, ts);
+      expect(plan.ok).toBe(true);
+      out = api.BudgetEngine.commitRefund(tx, plan);
+    }, { save: 'none', render: false });
+    expect(r.ok).toBe(true);
+    return out.entry;
+  }
+
+  it('normalize 保留合法 direction；非法或缺失不写回', () => {
+    expect(api.normalizeBudgetBinding({ categoryId: 'bc1', direction: 'refund' }).direction).toBe('refund');
+    expect(api.normalizeBudgetBinding({ categoryId: 'bc1', direction: 'spend' }).direction).toBe('spend');
+    expect('direction' in api.normalizeBudgetBinding({ categoryId: 'bc1', direction: 'refunds' })).toBe(false);
+    expect('direction' in api.normalizeBudgetBinding({ categoryId: 'bc1' })).toBe(false);
+    expect(api.budgetOf({ budget: { categoryId: 'bc1' } }).direction).toBe('spend');
+  });
+
+  it('退回绑定解析出独立计划；无可退金额时降级为 skip', () => {
+    seed({}, { budget: { categoryId: 'bc1', mode: 'fixed', amount: 30, direction: 'refund' } });
+    const t = api.getLive().tasks[0];
+    const skipped = api.resolveActionBudget(t, { kind: 'task', id: 't1', source: 'task', ts: Date.now() });
+    expect(skipped.status).toBe('skip');
+    expect(skipped.reason).toContain('最多可退');
+
+    commitSpend(50, Date.now());
+    const ok = api.resolveActionBudget(t, { kind: 'task', id: 't1', source: 'task', ts: Date.now() });
+    expect(ok).toMatchObject({ status: 'ok', direction: 'refund' });
+    expect(ok.plan).toMatchObject({ ok: true, direction: 'refund', amount: 30 });
+    // 只是解析，未写任何账
+    expect(api.getState().ext.budgets.ledger.filter(e => e.source === 'refund')).toHaveLength(0);
+  });
+
+  it('同期退回：reverseBoundBudget 走 reverseRefund，不产生冲正条目', () => {
+    seed();
+    const ts = Date.now();
+    commitSpend(50, ts);
+    const re = commitRefund(20, ts);
+    expect(api.reverseBoundBudget({ entryId: re.id, catId: 'bc1', amount: 20, periodKey: re.periodKey }))
+      .toMatchObject({ ok: true, mode: 'reverse-refund' });
+    const s = api.getState();
+    expect(currentPeriod(s).refund).toBe(0);
+    expect(currentPeriod(s).spent).toBe(50);
+    expect(budgetEntry(s, re.id).status).toBe('reversed');
+    expect(s.ext.budgets.ledger.some(e => e.source === 'reversal')).toBe(false);
+  });
+
+  it('跨期退回：直接报不可撤销，绝不降级到 compensateEntry', () => {
+    seed({ cycle: 'month' });
+    commitSpend(40, at(2024, 1, 15));
+    const re = commitRefund(10, at(2024, 1, 20));
+    let err = null;
+    try {
+      api.reverseBoundBudget({ entryId: re.id, catId: 'bc1', amount: 10, periodKey: re.periodKey });
+    } catch (e) {
+      err = e;
+    }
+    expect(err && err.code).toBe('BUDGET_REFUND_CROSS_PERIOD');
+    const s = api.getState();
+    expect(s.ext.budgets.ledger.some(e => e.source === 'reversal')).toBe(false);
+    expect(s.ext.budgets.periods.bc1['M:2024-01']).toMatchObject({ spent: 40, refund: 10 });
+  });
+});
+
+describe('执行侧接线（M3b）', () => {
+  it('打卡绑定退回：走 commitRefund，落一条退回而不是 0 元支出；撤销同步回退', () => {
+    seed();
+    const ts = Date.now();
+    api.Ledger.txn(tx => {
+      const p = api.BudgetEngine.prepareEntry('bc1', 50, { ts, source: 'task' });
+      api.BudgetEngine.commitEntry(tx, p, {});
+    }, { save: 'none', render: false });
+    api.patchState(s => { s.tasks[0].budget = { categoryId: 'bc1', mode: 'fixed', amount: 20, direction: 'refund' }; });
+
+    api.checkIn('t1');
+    let s = api.getState();
+    const log = s.logs.find(l => l.src === 'checkin');
+    const entry = s.ext.budgets.ledger.find(e => e.source === 'refund');
+    expect(entry).toMatchObject({
+      amount: 0, refundAmount: 20, status: 'active',
+      links: { checkinLogId: log.id },
+    });
+    expect(currentPeriod(s)).toMatchObject({ spent: 50, refund: 20 });
+    expect(log.budgetRef).toMatchObject({ catId: 'bc1', amount: 20 });
+
+    api.undoLog(log.id);
+    s = api.getState();
+    expect(budgetEntry(s, entry.id).status).toBe('reversed');
+    expect(currentPeriod(s).refund).toBe(0);
+    expect(currentPeriod(s).spent).toBe(50);
+  });
+
+  it('退回超过本期净花费：事项照常执行，现实账静默跳过', () => {
+    seed({}, { budget: { categoryId: 'bc1', mode: 'fixed', amount: 30, direction: 'refund' } });
+    const before = api.getLive().tasks[0].checkInCount;
+    api.checkIn('t1');
+    const s = api.getState();
+    expect(s.tasks[0].checkInCount).toBe(before + 1);
+    expect(s.ext.budgets.ledger).toHaveLength(0);
+  });
+});
+
 describe('现实账目的 txnId 落库', () => {
   it('打卡：预算账目 txnId = 事务 label（checkin）', () => {
     seed({}, { budget: { categoryId: 'bc1', mode: 'fixed', amount: 30 } });

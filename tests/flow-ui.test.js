@@ -70,6 +70,10 @@ describe('S9 流编辑器：保存只落配置', () => {
     const html = document.getElementById('flowStepList').innerHTML;
     expect(api.FLOW_ATOM_IDS).toHaveLength(9);
     expect(api.FLOW_ATOM_IDS).toContain('task.exempt');
+    expect(api.FLOW_ATOM_SELECTABLE_IDS).toHaveLength(8);
+    expect(api.FLOW_ATOM_SELECTABLE_IDS).not.toContain('task.exempt');
+    const atomSel = html.split('<select onchange="flowStepAtomChanged')[1].split('</select>')[0];
+    expect((atomSel.match(/<option /g) || []).length).toBe(8);
     expect((html.match(/flowStepAtomChanged\(/g) || []).length).toBe(1);
     api.flowStepAtomChanged('0', 'evil.arbitrary');
     api.flowStepAtomChanged('0', 'asset.grant');
@@ -77,6 +81,29 @@ describe('S9 流编辑器：保存只落配置', () => {
     const r = api.handleFlowSave();
     expect(r.ok).toBe(true);
     expect(api.FLOW_ATOM_IDS).toContain(api.getState().flows[0].steps[0].atom);
+  });
+
+  it('旧存档里的 task.exempt 步骤仍能显示与保存，但下拉不再新增', () => {
+    seed({
+      flows: [{
+        v: 1, id: 'f_legacy', name: '旧豁免流', enabled: false,
+        trigger: { type: 'manual' }, condition: { mode: 'all', items: [] },
+        settleWhenConditionFalse: false, editorMode: 'advanced', limits: {},
+        steps: [{ id: 's1', atom: 'task.exempt', params: { taskId: 't1', desc: '旧配置' } }],
+      }],
+    });
+    expect(api.openFlowModal('f_legacy')).toBeTruthy();
+    const html = document.getElementById('flowStepList').innerHTML;
+    // 测试环境的 esc 是空实现，不能断言 option 的 value；用选项数量与提示文案验证：
+    // 旧步骤把当前原子补进下拉（8 + 1），并显示兼容提示。
+    const atomSel = html.split('<select onchange="flowStepAtomChanged')[1].split('</select>')[0];
+    expect((atomSel.match(/<option /g) || []).length).toBe(9);
+    expect(html).toContain('仅用于兼容既有配置');
+    const r = api.handleFlowSave();
+    expect(r.ok).toBe(true);
+    expect(api.getState().flows[0].steps[0]).toMatchObject({
+      atom: 'task.exempt', params: { taskId: 't1' },
+    });
   });
 
   it('非法金额被拒绝并显示原因，state 不变', () => {

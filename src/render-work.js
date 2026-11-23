@@ -6,16 +6,17 @@ import { choreCycleDueAfter, choreCycleOf, choreMarkCompletion, choreUndoComplet
 import { choreOrderInsert, choreOrderRemove, normalizeChoreTags, sortChoresByOrder } from './chore-list.js';
 import { checkAchievements, checkIn } from './business.js';
 import { BudgetEngine } from './budget.js';
-import { budgetBadgeHTML, budgetBindingHTML, budgetOf, budgetRefOf, openBudgetAmountDialog, readBudgetBinding, rememberBudgetDraft, resolveActionBudget, reverseBoundBudget } from './budget-binding.js';
+import { budgetBadgeHTML, budgetBindingHTML, budgetOf, budgetRefOf, commitActionBudget, openBudgetAmountDialog, readBudgetBinding, rememberBudgetDraft, resolveActionBudget, reverseBoundBudget } from './budget-binding.js';
 import { computeChoreDecay, processChoreDecay } from './chore-core.js';
 import { STAGE_NAMES, AFFAIR_CURVES, CHORE_TAG_MAX_COUNT, CHORE_TAG_MAX_LEN } from './constants.js';
 import { defaultChoreConfig, normalizeChoreConfig } from './defaults.js';
 import { todayAgenda } from './entity-kit.js';
-import { affairToChore, canUndoConversion, choreToAffair, lastConversion, undoConversion } from './entity-convert.js';
+import { affairToChore, choreToAffair, conversionUndoState, lastConversion, undoConversion } from './entity-convert.js';
 import { Ledger } from './ledger.js';
 import { addDomain, delCollection, delDomain, renameCollection, renameDomain, unlockTask } from './library.js';
 import { confirmDelAch, confirmDelTask, openAchModal, openTaskModal } from './modals.js';
 import { closeModal, openModal } from './modal-host.js';
+import { markModalClean, rejectFields } from './form-contract.js';
 import { commit, save } from './persist.js';
 import { runCommand } from './command.js';
 import { calcCheckIn, dayKey, round2, stageCellLabel, stageNetAt, stageSel, taskIsStaged, clone, daysSince, esc, escAttr, fmt, fmtTime, getTaskDomainIds, now, taskHasType, uid, affairSteps, affairTotalSteps, affairDoneSteps, affairLastAdvance, affairCurve, affairCurveType, affairTargetAt, affairIsDone } from './pure.js';
@@ -41,6 +42,15 @@ let choreDoneOpen=false;
 let choreArchivedOpen=false;
 let choreDraftTags=[];
 let editAffairSteps=[];
+// 项目弹窗三组折叠的展开状态：会话内记住，不落盘。
+// 默认展开「基本信息」「步骤与预算」，收起「奖励与成果」——日常最常改的是步骤，
+// 奖励/曲线是一次性设定，收起后用标题行摘要兜底。
+const AFFAIR_ACC_DEFAULT={basic:true,reward:false,steps:true};
+let affairAccState=Object.assign({},AFFAIR_ACC_DEFAULT);
+// 打开弹窗时的表单快照，用于 Esc 关闭前的脏检查（空串 = 当前不应触发脏检查）
+let affairOpenSnapshot='';
+// 任务卡展开状态：只存 id（不存 DOM 引用），供整块重渲染后按 id 还原
+let revealedTaskId=null;
 // ===== Render: Work =====
 // 三处分数栏（打工/银行/商店）共用的刷新逻辑
 function setScoreCell(id,val){
@@ -217,6 +227,7 @@ function openPresetModal(id){
     if(del)del.style.display='none';
   }
   openModal('presetModal');
+  markModalClean('presetModal');
   setTimeout(function(){document.getElementById('presetName').focus();},50);
 }
 function presetCurvePreview(){
@@ -261,9 +272,13 @@ function togglePresetAch(){
 function savePreset(){
   const id=document.getElementById('presetId').value;
   const name=document.getElementById('presetName').value.trim();
-  if(!name){toast('请输入预设名称','err');return;}
-  let totalReward=Number(document.getElementById('presetReward').value);
-  if(isNaN(totalReward)||totalReward<0)totalReward=0;
+  const rewardRaw=Number(document.getElementById('presetReward').value);
+  const rewardInvalid=!isNaN(rewardRaw)&&rewardRaw<0;
+  const errs=[];
+  if(!name)errs.push({field:'presetName',msg:'请输入预设名称'});
+  if(rewardInvalid)errs.push({field:'presetReward',msg:'总奖励需 ≥ 0'});
+  if(errs.length){const first=rejectFields('presetModal',errs);if(!first)toast(errs[0].msg,'err');return;}
+  let totalReward=isNaN(rewardRaw)||rewardRaw<0?0:rewardRaw;
   const curve=getPresetCurve();
   const achEnabled=document.getElementById('presetAchEnabled').checked;
   const achAmount=Math.max(0,Number(document.getElementById('presetAchAmount').value)||0);
@@ -381,6 +396,11 @@ function toggleAffairZone(key){
 function affairMoreBtn(a){
   return '<button class="btn btn-sm affair-more" onclick="toggleAffairMenu(event,\''+a.id+'\')">⋯</button>';
 }
+// 只在确实可撤销时出现；不可撤销时整颗按钮不渲染，避免每张卡挂一个灰按钮。
+function affairUndoBtnHTML(a){
+  if(!affairCanUndo(a))return '';
+  return '<button class="btn btn-sm affair-undo" title="撤销最近一次推进（最多保留最近 5 步）" onclick="event.stopPropagation();affairUndoAction(\''+a.id+'\')">↺ 撤销</button>';
+}
 let affairMenuTarget=null;
 function toggleAffairMenu(e,id){
   e.stopPropagation();
@@ -391,14 +411,21 @@ function toggleAffairMenu(e,id){
   let menu=document.getElementById('affairMenu');
   if(!menu){menu=document.createElement('div');menu.id='affairMenu';menu.className='affair-menu';document.body.appendChild(menu);}
   const canUndo=affairCanUndo(a);
-  const convUndo=canUndoConversion()&&lastConversion()&&lastConversion().entityId===id;
+  const lastConv=lastConversion();
+  const convState=(lastConv&&lastConv.entityId===id)?conversionUndoState():null;
+  let convItem='';
+  if(convState){
+    convItem=convState.ok
+      ?'<button onclick="undoConversion();closeAffairMenu()">撤销转换</button>'
+      :'<button disabled title="'+escAttr(convState.reason)+'">撤销转换（不可用）</button>';
+  }
   menu.innerHTML=
     '<button onclick="openAffairModal(\''+id+'\');closeAffairMenu()">编辑</button>'
     +'<button onclick="affairConvertToChore(\''+id+'\');closeAffairMenu()">转为杂事</button>'
-    +(convUndo?'<button onclick="undoConversion();closeAffairMenu()">撤销转换</button>':'')
+    +convItem
     +(canUndo
       ?'<button onclick="affairUndoAction(\''+id+'\');closeAffairMenu()">撤销上一步</button>'
-      :'<button disabled>撤销上一步</button>')
+      :'<button disabled title="没有可撤销的推进记录（最多保留最近 5 步）">撤销上一步</button>')
     +'<button class="danger" onclick="delAffair(\''+id+'\');closeAffairMenu()">删除</button>';
   const r=e.currentTarget.getBoundingClientRect();
   menu.style.display='block';
@@ -410,13 +437,19 @@ function closeAffairMenu(){
   const m=document.getElementById('affairMenu');
   if(m)m.style.display='none';
 }
-export function initAffairMenuDismiss(){document.addEventListener('click',function(e){
-  if(!affairMenuTarget)return;
-  const menu=document.getElementById('affairMenu');
-  const path=(e.composedPath&&e.composedPath())||[];
-  if(path.indexOf(menu)>=0)return;
-  closeAffairMenu();
-});}
+export function initAffairMenuDismiss(){
+  document.addEventListener('click',function(e){
+    if(!affairMenuTarget)return;
+    const menu=document.getElementById('affairMenu');
+    const path=(e.composedPath&&e.composedPath())||[];
+    if(path.indexOf(menu)>=0)return;
+    closeAffairMenu();
+  });
+  // 菜单位置按打开时的 rect 写死，滚动后会与按钮脱位：滚动/缩放时直接收起。
+  // capture:true 也能收到内层滚动容器的 scroll 事件（scroll 不冒泡）。
+  window.addEventListener('scroll',function(){if(affairMenuTarget)closeAffairMenu();},{capture:true,passive:true});
+  window.addEventListener('resize',function(){if(affairMenuTarget)closeAffairMenu();});
+}
 
 function affairInProgressCardHTML(a){
   const stall=a.startedAt&&daysSince(a.startedAt)>3;
@@ -424,6 +457,7 @@ function affairInProgressCardHTML(a){
     +'<div class="affair-row">'
     +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+budgetBadgeHTML(a)+'</div>'
     +actionsRowHTML('affair-actions',affairMoreBtn(a)
+    +affairUndoBtnHTML(a)
     +'<button class="btn btn-sm btn-checkin" onclick="advanceAffairStep(\''+a.id+'\')">完成下一步</button>',true)
     +'</div>'
     +affairAxisHTML(a)
@@ -438,6 +472,7 @@ function affairScheduleCardHTML(a,opts){
     +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+budgetBadgeHTML(a)+'</div>'
     +actionsRowHTML('affair-actions',affairMoreBtn(a)
     +'<span class="affair-time">'+(opts&&opts.time?opts.time:fmtPlan(a.plannedAt))+'</span>'
+    +affairUndoBtnHTML(a)
     +'<button class="btn btn-sm btn-checkin" onclick="completeAffair(\''+a.id+'\')">完成</button>',true)
     +'</div>'
     +'</div>';
@@ -448,6 +483,7 @@ function affairDraftCardHTML(a){
     +'<div class="affair-row">'
     +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+budgetBadgeHTML(a)+'</div>'
     +actionsRowHTML('affair-actions','<button class="btn btn-sm" onclick="openAffairPlanModal(\''+a.id+'\')">计划</button>'
+    +affairUndoBtnHTML(a)
     +affairMoreBtn(a),true)
     +'</div>'
     +affairAxisHTML(a)
@@ -460,6 +496,7 @@ function affairDoneCardHTML(a){
     +'<div class="affair-row">'
     +'<div class="affair-name-wrap"><span class="affair-name">'+esc(a.name)+'</span>'+affairTags(a)+budgetBadgeHTML(a)+'</div>'
     +actionsRowHTML('affair-actions',affairMoreBtn(a)
+    +affairUndoBtnHTML(a)
     +'<span class="affair-time">✓ '+fmtTime(a.doneAt)+'</span>',true)
     +'</div>'
     +affairAxisHTML(a)
@@ -553,7 +590,15 @@ function agendaBlockHTML(){
 function renderTodayAgenda(){
   const box=document.getElementById('todayAgenda');
   if(!box)return;
+  // 整块重写 innerHTML 会让内部滚动容器回到顶部：先记住位置，写回后再恢复。
+  // 只处理「同样的内容重渲染」这一种情况，不做局部 diff。
+  const prev=box.querySelector('.agenda-scroll');
+  const scrollTop=prev?prev.scrollTop:0;
   box.innerHTML=agendaBlockHTML();
+  if(scrollTop>0){
+    const next=box.querySelector('.agenda-scroll');
+    if(next)next.scrollTop=scrollTop;
+  }
 }
 
 function agendaSelector(kind,id){
@@ -617,21 +662,19 @@ function renderAffairSchedule(){
   let html='';
   defs.forEach(function(d){
     const items=units.filter(function(u){return bucket(u.ts)===d.key;}).sort(function(a,b){return a.ts-b.ts;});
+    if(items.length===0)return; // 空分组不占位，避免把有内容的卡片挤出首屏
     html+='<div class="affair-day-group'+(d.key==='overdue'?' overdue':'')+'">'
-      +'<div class="affair-day-title">'+d.title+' <span class="affair-zone-count">'+items.length+'</span></div>';
-    if(items.length===0){
-      html+='<div class="affair-empty">无</div>';
-    }else{
-      html+=items.map(function(u){
+      +'<div class="affair-day-title">'+d.title+' <span class="affair-zone-count">'+items.length+'</span></div>'
+      +items.map(function(u){
         const late=u.ts<todayStart;
         const timeOnly=(d.key==='today'||d.key==='tomorrow')?fmtClock(u.ts):fmtPlan(u.ts);
         if(u.kind==='step')return affairStepUnitCardHTML(u,{late:late,time:timeOnly});
         return affairScheduleCardHTML(u.affair,{late:late,time:timeOnly});
-      }).join('');
-    }
-    html+='</div>';
+      }).join('')
+      +'</div>';
   });
-  return html;
+  // 整个日程为空时合并成一行提示
+  return html||'<div class="affair-empty">日程暂无安排</div>';
 }
 
 function renderAffairCalendar(){
@@ -729,7 +772,7 @@ function affairApplyProgress(a,cell,opts){
       if(cell>0&&!a.startedAt)a.startedAt=now();
       // 现实预算先于本笔收益入账（先扣后收）
       if(opts.plan){
-        const got=BudgetEngine.commitEntry(tx,opts.plan,{affairId:a.id,affairAdvanceId:opts.advanceId||''});
+        const got=commitActionBudget(tx,opts.plan,{affairId:a.id,affairAdvanceId:opts.advanceId||''});
         if(opts.snap)opts.snap.budgetRef=budgetRefOf(got.entry,opts.plan);
         if(a.budget&&a.budget.mode==='prompt')a.budget.lastAmount=opts.plan.amount;
       }
@@ -961,15 +1004,19 @@ function initAffairAxes(){
     if(!track||track._affairBound)return;
     track._affairBound=true;
     const id=axis.dataset.affairId;
-    let startX=0,startY=0,startCell=0,pid=0;
-    let dragging=false,decided=false,abandoned=false,pushed=false,dragSnap=null,lastCell=0;
+    let startX=0,startY=0,startCell=0,pid=null;
+    let dragging=false,pushed=false,dragSnap=null,lastCell=0;
+    // 拖进度轴后，浏览器仍可能补发一次 click；吞掉它，避免顺手打开项目弹窗
+    let suppressClick=false;
     function setCellFromX(clientX){
       const a=state.affairs.find(function(x){return x.id===id;});
       if(!a||a.doneAt)return;
       const rect=track.getBoundingClientRect();
+      if(!rect.width)return;
       let p=(clientX-rect.left)/rect.width;
       p=Math.max(0,Math.min(1,p));
-      let cell=Math.floor(p*10);if(cell>9)cell=9;if(cell<0)cell=0;
+      const cell=stageCellFromRatio(p);
+      // 设计意图：事务进度轴只允许向后推进，向前拖动不生效。
       if(cell<=startCell)return;
       if(!pushed){dragSnap=affairPushUndo(a);pushed=true;}
       lastCell=cell;
@@ -986,7 +1033,7 @@ function initAffairAxes(){
       if(gate.status==='prompt')return;
       if(!gate.plan){commit();return;}
       const txr=Ledger.txn(function(tx){
-        const got=BudgetEngine.commitEntry(tx,gate.plan,{affairId:a.id,affairAdvanceId:''});
+        const got=commitActionBudget(tx,gate.plan,{affairId:a.id,affairAdvanceId:''});
         snap.budgetRef=budgetRefOf(got.entry,gate.plan);
         if(a.budget&&a.budget.mode==='prompt')a.budget.lastAmount=gate.plan.amount;
       },{label:'affair-drag-budget',save:'none',render:false});
@@ -998,26 +1045,31 @@ function initAffairAxes(){
       if(!a||a.doneAt)return;
       startX=e.clientX;startY=e.clientY;pid=e.pointerId;
       startCell=a.currentCell||0;
-      dragging=false;decided=false;abandoned=false;pushed=false;dragSnap=null;lastCell=startCell;
+      dragging=false;pushed=false;dragSnap=null;lastCell=startCell;
+      suppressClick=false;
+      // 与任务阶段条一致：按下即捕获指针，离开窄带后继续跟手
+      if(track.setPointerCapture){try{track.setPointerCapture(pid);}catch(err){}}
     });
     track.addEventListener('pointermove',function(e){
-      if(e.pointerId!==pid||decided)return;
+      if(pid===null||e.pointerId!==pid)return;
       const dx=e.clientX-startX,dy=e.clientY-startY;
-      if(Math.abs(dx)<THRESH&&Math.abs(dy)<THRESH)return;
-      if(Math.abs(dx)>Math.abs(dy)){
-        decided=true;dragging=true;
-        if(track.setPointerCapture){try{track.setPointerCapture(pid);}catch(err){}}
-        e.preventDefault();
-        setCellFromX(e.clientX);
-      }else{
-        decided=true;abandoned=true;
+      if(!dragging){
+        if(Math.abs(dx)<THRESH&&Math.abs(dy)<THRESH)return;
+        // 方向判定只表示“开始拖动”，不终止整个手势
+        if(Math.abs(dx)<=Math.abs(dy))return;
+        dragging=true;
+        suppressClick=true;
       }
+      e.preventDefault();
+      setCellFromX(e.clientX);
     });
     function end(e){
-      if(e&&e.pointerId!==pid)return;
+      if(pid===null||e.pointerId!==pid)return;
+      if(track.releasePointerCapture){try{track.releasePointerCapture(pid);}catch(err){}}
+      pid=null;
       const a=state.affairs.find(function(x){return x.id===id;});
       const snap=dragSnap;
-      dragging=false;decided=false;abandoned=false;pushed=false;dragSnap=null;
+      dragging=false;pushed=false;dragSnap=null;
       if(!a||!snap){return;}
       if(lastCell>startCell)finishDragBudget(a,snap,undefined);
       else commit();
@@ -1025,6 +1077,13 @@ function initAffairAxes(){
     }
     track.addEventListener('pointerup',end);
     track.addEventListener('pointercancel',end);
+    // 捕获阶段拦下拖拽后补发的 click，行为与排序把手一致
+    track.addEventListener('click',function(e){
+      if(!suppressClick)return;
+      suppressClick=false;
+      e.preventDefault();
+      e.stopPropagation();
+    },true);
   });
 }
 
@@ -1034,6 +1093,7 @@ function openAffairPlanModal(id){
   document.getElementById('affairPlanId').value=id;
   document.getElementById('affairPlanInput').value=a.plannedAt?toLocalInput(a.plannedAt):'';
   openModal('affairPlanModal');
+  markModalClean('affairPlanModal');
 }
 
 function saveAffairPlan(){
@@ -1041,12 +1101,104 @@ function saveAffairPlan(){
   const a=state.affairs.find(function(x){return x.id===id;});
   if(!a)return;
   const v=document.getElementById('affairPlanInput').value;
-  if(!v){toast('请选择日期时间','err');return;}
+  if(!v){
+    const first=rejectFields('affairPlanModal',[{field:'affairPlanInput',msg:'请选择日期时间'}]);
+    if(!first)toast('请选择日期时间','err');
+    return;
+  }
   a.plannedAt=fromLocalInput(v);
   save();
   closeModal('affairPlanModal');
   toast('已规划项目「'+a.name+'」');
   render();
+}
+
+// ===== 项目弹窗：折叠分组、摘要、脏检查 =====
+const AFFAIR_CURVE_NAMES={even:'平均',lateHeavy:'后重',earlyHeavy:'前重',allAtEnd:'全押后',custom:'自定义'};
+const AFFAIR_ACC_IDS={basic:'affairAccBasic',reward:'affairAccReward',steps:'affairAccSteps'};
+
+function affairAccGroup(key){
+  const id=AFFAIR_ACC_IDS[key];
+  return id?document.getElementById(id):null;
+}
+function applyAffairAccState(){
+  Object.keys(AFFAIR_ACC_IDS).forEach(function(k){
+    const el=affairAccGroup(k);
+    if(el&&el.classList)el.classList.toggle('open',!!affairAccState[k]);
+  });
+}
+// 内联入口：切换分组并记住本次会话的选择
+function toggleAffairAcc(key){
+  if(!(key in AFFAIR_ACC_IDS))return;
+  affairAccState[key]=!affairAccState[key];
+  applyAffairAccState();
+}
+// 校验失败时把目标分组强行展开（不改变用户对其它分组的记忆）
+function expandAffairAcc(key){
+  if(!(key in AFFAIR_ACC_IDS))return;
+  affairAccState[key]=true;
+  applyAffairAccState();
+}
+// 折叠标题行的摘要：收起后仍能看出这一组里装了什么
+function affairAccSummaryRefresh(){
+  const basicSum=document.getElementById('affairAccBasicSum');
+  if(basicSum){
+    const nameEl=document.getElementById('affairName');
+    const name=nameEl?String(nameEl.value||'').trim():'';
+    const timeEl=document.getElementById('affairPlannedAt');
+    let planned='';
+    if(timeEl&&timeEl.value){planned='🕒 '+fmtPlan(fromLocalInput(timeEl.value));}
+    basicSum.textContent=[name||'未命名',planned].filter(Boolean).join(' · ');
+  }
+  const rewardSum=document.getElementById('affairAccRewardSum');
+  if(rewardSum){
+    const rEl=document.getElementById('affairReward');
+    const total=rEl?Number(rEl.value):0;
+    const parts=[total>0?('总奖励 '+fmt(total)):'未设置奖励'];
+    parts.push(AFFAIR_CURVE_NAMES[editAffairCurve.type]||'自定义');
+    const achEl=document.getElementById('affairAchEnabled');
+    if(achEl&&achEl.checked)parts.push('成果点');
+    rewardSum.textContent=parts.join(' · ');
+  }
+  const stepsSum=document.getElementById('affairAccStepsSum');
+  if(stepsSum)stepsSum.textContent=editAffairSteps.length?(editAffairSteps.length+' 步'):'暂无步骤';
+}
+function affairFieldValue(id){
+  const el=document.getElementById(id);
+  return el?String(el.value==null?'':el.value):'';
+}
+function affairFieldChecked(id){
+  const el=document.getElementById(id);
+  return !!(el&&el.checked);
+}
+// 表单快照只用于判断“有没有未保存改动”，不参与保存与数据形状
+function affairFormSnapshot(){
+  return JSON.stringify({
+    name:affairFieldValue('affairName'),
+    reward:affairFieldValue('affairReward'),
+    domain:affairFieldValue('affairDomain'),
+    plannedAt:affairFieldValue('affairPlannedAt'),
+    ach:affairFieldChecked('affairAchEnabled'),
+    achAmount:affairFieldValue('affairAchAmount'),
+    curve:editAffairCurve,
+    steps:editAffairSteps,
+    budget:readBudgetBinding('affair')
+  });
+}
+function affairIsDirty(){
+  return affairOpenSnapshot!==''&&affairFormSnapshot()!==affairOpenSnapshot;
+}
+// 关闭项目弹窗：有未保存改动时先确认；force=true 用于保存成功、删除成功等已提交路径
+function closeAffairModal(force){
+  if(!force&&affairIsDirty()){
+    if(!confirm('项目还有未保存的修改，确定放弃并关闭？'))return false;
+  }
+  affairOpenSnapshot='';
+  closeModal('affairModal');
+  return true;
+}
+function requestAffairModalClose(){
+  return closeAffairModal(false);
 }
 
 function openAffairModal(id){
@@ -1094,6 +1246,9 @@ function openAffairModal(id){
   const budBox=document.getElementById('affairBudgetBind');
   if(budBox)budBox.innerHTML=budgetBindingHTML('affair',id?state.affairs.find(function(x){return x.id===id;}):null);
   if(budBox)budgetBindingModeChange('affair');
+  applyAffairAccState();
+  affairAccSummaryRefresh();
+  affairOpenSnapshot=affairFormSnapshot();
   openModal('affairModal');
   setTimeout(function(){document.getElementById('affairName').focus();},50);
 }
@@ -1101,15 +1256,25 @@ function openAffairModal(id){
 function handleAffairSave(){
   const id=document.getElementById('affairId').value;
   const name=document.getElementById('affairName').value.trim();
-  let totalReward=Number(document.getElementById('affairReward').value);
-  if(isNaN(totalReward)||totalReward<0)totalReward=0;
+  const rewardRaw=Number(document.getElementById('affairReward').value);
+  const rewardInvalid=!isNaN(rewardRaw)&&rewardRaw<0;
+  let totalReward=isNaN(rewardRaw)||rewardRaw<0?0:rewardRaw;
   const curve=getAffairCurve();
   const achEnabled=document.getElementById('affairAchEnabled').checked;
   const achAmount=Math.max(0,Number(document.getElementById('affairAchAmount').value)||0);
   const domainId=document.getElementById('affairDomain').value||null;
   const plannedAt=fromLocalInput(document.getElementById('affairPlannedAt').value);
   const steps=readAffairSteps();
-  if(!name){toast('请输入项目名称','err');return;}
+  if(!name||rewardInvalid){
+    // 校验失败时展开所在分组并聚焦字段，避免错误被折叠藏起来
+    expandAffairAcc('basic');
+    const errs=[];
+    if(!name)errs.push({field:'affairName',msg:'请输入项目名称'});
+    if(rewardInvalid)errs.push({field:'affairReward',msg:'总奖励需 ≥ 0'});
+    const first=rejectFields('affairModal',errs);
+    if(!first)toast(errs[0].msg,'err');
+    return;
+  }
   const budget=readBudgetBinding('affair');
   const ach={enabled:achEnabled,amount:achEnabled?achAmount:0};
   // 步骤委派（引用已有杂事 / 就地新建）与项目本身必须在同一条事务里落盘：
@@ -1135,7 +1300,15 @@ function handleAffairSave(){
       return {toast:{msg:id?'项目已更新':'项目已创建'}};
     }
   });
-  if(!r.ok)return;
+  if(!r.ok){
+    // 步骤/委派校验失败时展开步骤分组，让错误原因有可定位的落点
+    const stepIssue=editAffairSteps.some(function(s){
+      return !!(s&&(stepChoreRef(s)||(typeof s.pendingChoreName==='string'&&s.pendingChoreName.trim())));
+    });
+    if(stepIssue)expandAffairAcc('steps');
+    return;
+  }
+  affairOpenSnapshot='';
   closeModal('affairModal');
 }
 
@@ -1182,10 +1355,10 @@ function confirmAffairDelete(mode){
 function applyAffairDelete(id,purge){
   const r=runCommand({
     label:purge?'affair-del-with-chores':'affair-del',
-    toast:purge?'项目与委派杂事已删除':'项目已删除',
+    toast:purge?'项目与委派杂事已删除，可在面板顶部撤销':'项目已删除，可在面板顶部撤销',
     run:function(){return deleteAffairCore(id,purge?'purge':'pool');}
   });
-  if(r.ok)closeModal('affairModal');
+  if(r.ok)closeAffairModal(true);
   return r;
 }
 // 恢复被规则归档的项目（归档是可逆状态，不消耗资产）
@@ -1199,16 +1372,20 @@ function restoreAffair(id){
 
 // ===== B5 二：删除撤销条 =====
 // 删除后项目卡片消失，撤销入口只能放在面板顶部；没有删除记录时不渲染（不影响对照基线）。
+// 数据层本就保留最近 5 条，这里把 5 条全部露出，不扩大上限。
 function affairDeleteUndoBarHTML(){
   const list=Array.isArray(state.affairDeleteUndo)?state.affairDeleteUndo:[];
-  if(!list.length)return '';
-  const rec=list[list.length-1];
-  if(!rec||!rec.affair)return '';
-  const n=Array.isArray(rec.chores)?rec.chores.length:0;
-  return '<div class="affair-empty affair-delete-undo">已删除「'+esc(rec.affair.name)+'」'
-    +(n?'（含 '+n+' 条杂事）':'')
-    +'<button class="btn btn-sm" onclick="undoAffairDelete(\''+rec.id+'\')">撤销删除</button>'
-    +'<button class="btn btn-sm" onclick="dismissAffairDeleteUndo(\''+rec.id+'\')">忽略</button>'
+  const recs=list.filter(function(rec){return rec&&rec.affair;}).slice().reverse();
+  if(!recs.length)return '';
+  return '<div class="affair-empty affair-delete-undo"><div class="affair-delete-undo-head">最近删除 · 最多保留 5 条</div>'
+    +recs.map(function(rec){
+      const n=Array.isArray(rec.chores)?rec.chores.length:0;
+      return '<div class="affair-delete-undo-row">'
+        +'<span class="affair-delete-undo-name">已删除「'+esc(rec.affair.name)+'」'+(n?'（含 '+n+' 条杂事）':'')+'</span>'
+        +'<button class="btn btn-sm" onclick="undoAffairDelete(\''+rec.id+'\')">撤销删除</button>'
+        +'<button class="btn btn-sm" onclick="dismissAffairDeleteUndo(\''+rec.id+'\')">忽略</button>'
+        +'</div>';
+    }).join('')
     +'</div>';
 }
 function undoAffairDelete(recId){
@@ -1231,24 +1408,30 @@ function renderAffairSteps(){
   if(!cont)return;
   if(editAffairSteps.length===0){
     cont.innerHTML='<div class="affair-step-empty">暂无步骤（可选填，保存后可直接「完成」整个项目）</div>';
+    affairAccSummaryRefresh();
     return;
   }
-  const affairId=document.getElementById('affairId').value;
+  const affairIdEl=document.getElementById('affairId');
+  const affairId=affairIdEl?affairIdEl.value:'';
+  const last=editAffairSteps.length-1;
   cont.innerHTML=editAffairSteps.map(function(s,i){
     const t=s.plannedAt?toLocalInput(s.plannedAt):'';
     const badge=s.plannedAt?('🕒 '+fmtPlan(s.plannedAt)):'';
     return '<div class="affair-step-row">'
-      +'<div class="affair-step-line">'
+      +'<div class="affair-step-main">'
+      +'<button type="button" class="affair-step-move" title="上移" aria-label="上移步骤 '+(i+1)+'"'+(i===0?' disabled':'')+' onclick="affairMoveStep('+i+',-1)">↑</button>'
+      +'<button type="button" class="affair-step-move" title="下移" aria-label="下移步骤 '+(i+1)+'"'+(i===last?' disabled':'')+' onclick="affairMoveStep('+i+',1)">↓</button>'
       +'<input type="text" class="affair-step-input" data-i="'+i+'" value="'+escAttr(s.text||'')+'" placeholder="步骤 '+(i+1)+'" maxlength="60" oninput="affairStepInput('+i+',this.value)">'
-      +'<button type="button" class="btn btn-sm btn-danger" onclick="affairRemoveStep('+i+')">×</button>'
+      +'<button type="button" class="btn btn-sm btn-danger affair-step-del" title="删除步骤" aria-label="删除步骤 '+(i+1)+'" onclick="affairRemoveStep('+i+')">×</button>'
       +'</div>'
-      +'<div class="affair-step-line">'
+      +'<div class="affair-step-sub">'
       +'<input type="datetime-local" class="affair-step-time" value="'+t+'" title="单独安排本步骤执行时间（可选）" oninput="affairStepTime('+i+',this.value)">'
       +'<span class="affair-step-time-badge" id="affairStepBadge'+i+'">'+badge+'</span>'
-      +'</div>'
       +affairStepDelegateHTML(s,i,affairId)
+      +'</div>'
       +'</div>';
   }).join('');
+  affairAccSummaryRefresh();
 }
 // 步骤行的「委派杂事」入口：已是委派步骤时显示引用与解除，纯步骤时给出候选下拉 + 就地新建。
 function affairStepDelegateHTML(s,i,affairId){
@@ -1273,7 +1456,7 @@ function affairStepDelegateHTML(s,i,affairId){
     +'<option value="">委派到已有杂事…</option>'
     +cands.map(function(c){return '<option value="'+escAttr(c.id)+'">'+esc(c.name)+'</option>';}).join('')
     +'</select>'
-    +'<button type="button" class="btn btn-sm" onclick="affairStepDelegateNew('+i+')">＋ 新建杂事并委派</button>'
+    +'<button type="button" class="btn btn-sm" title="新建一条杂事并委派给此步骤" onclick="affairStepDelegateNew('+i+')">＋<span class="affair-delegate-new-label"> 新建</span></button>'
     +'</div>';
 }
 // 以下三个动作只改编辑草稿；保存时由 resolveDelegatedSteps 在同一个事务里落盘。
@@ -1313,6 +1496,15 @@ function affairStepTime(i,v){
   if(b)b.textContent=editAffairSteps[i].plannedAt?('🕒 '+fmtPlan(editAffairSteps[i].plannedAt)):'';
 }
 function affairAddStep(){editAffairSteps.push({stepId:uid(),text:'',doneAt:null,plannedAt:null});renderAffairSteps();}
+// 上下移动步骤：整体交换步骤对象，stepId / doneAt / 委派引用都跟着走
+function affairMoveStep(i,delta){
+  const j=i+(Number(delta)||0);
+  if(i<0||i>=editAffairSteps.length||j<0||j>=editAffairSteps.length)return;
+  const tmp=editAffairSteps[i];
+  editAffairSteps[i]=editAffairSteps[j];
+  editAffairSteps[j]=tmp;
+  renderAffairSteps();
+}
 function affairRemoveStep(i){editAffairSteps.splice(i,1);renderAffairSteps();}
 function readAffairSteps(){
   // 委派步骤的引用随步骤一起保存：编辑名称/时间时不能把 choreRef 冲掉（否则杂事会被动回池）。
@@ -1343,6 +1535,7 @@ function affairCurvePreview(){
 function affairCurveRefresh(){
   const p=document.getElementById('affairCurvePreview');
   if(p)p.innerHTML=affairCurvePreview();
+  affairAccSummaryRefresh();
 }
 function setAffairCurve(type){
   editAffairCurve.type=type;
@@ -1375,6 +1568,7 @@ function toggleAffairAch(){
   const on=document.getElementById('affairAchEnabled').checked;
   const row=document.getElementById('affairAchAmountRow');
   if(row)row.style.display=on?'':'none';
+  affairAccSummaryRefresh();
 }
 // 以下四个动作只改项目面板的展示状态（affairView / affairDoneOpen / affairCalCursor / affairCalSelected
 // 仅在 renderAffairs 内被读取），不写账、不改分数，局部重绘即可。
@@ -1479,6 +1673,8 @@ function toggleChoreDone(id,resolved){
   runCommand({
     label:'chore-check',
     failText:'勾选失败：现实账目未写入',
+    // 勾完该行会立刻离开待办、进入默认收起的「已完成」：给一条即时提示，避免被当成误删
+    toast:{msg:'已完成「'+c.name+'」，可在「已完成」查看'},
     onFail:function(){if(plan)rememberBudgetDraft('chore',c.id,plan.amount);},
     run:function(tx){
       const at=now();
@@ -1501,7 +1697,7 @@ function toggleChoreDone(id,resolved){
       }
       let ref=null;
       if(plan){
-        const got=BudgetEngine.commitEntry(tx,plan,{choreId:c.id});
+        const got=commitActionBudget(tx,plan,{choreId:c.id});
         ref=budgetRefOf(got.entry,plan);
         if(c.budget&&c.budget.mode==='prompt')c.budget.lastAmount=plan.amount;
       }
@@ -1621,17 +1817,31 @@ function openChoreModal(id){
   choreDraftTags=normalizeChoreTags(c?c.tags:[]);
   renderChoreTags();
   document.getElementById('choreDelBtn').style.display=isEdit?'':'none';
+  const moreBox=document.getElementById('choreMore');
+  if(moreBox)moreBox.style.display=isEdit?'':'none';
   const convBtn=document.getElementById('choreConvertBtn');
   if(convBtn)convBtn.style.display=isEdit?'':'none';
-  const convUndoBtn=document.getElementById('choreUndoConvBtn');
-  if(convUndoBtn){
+  // 转换提示常驻在弹窗顶部：可撤销时给按钮，不可撤销时给具体原因，避免入口无声消失。
+  const convNotice=document.getElementById('choreConvNotice');
+  if(convNotice){
     const last=lastConversion();
-    convUndoBtn.style.display=(isEdit&&last&&last.entityId===(c?c.id:'')&&canUndoConversion())?'':'none';
+    if(!(isEdit&&last&&last.entityId===(c?c.id:''))){
+      convNotice.style.display='none';
+      convNotice.innerHTML='';
+    }else{
+      const st=conversionUndoState();
+      convNotice.innerHTML=st.ok
+        ?'<span>此杂事由项目转换而来</span><span class="conv-notice-hint">本周期内可撤销</span>'
+          +'<button type="button" class="btn btn-sm" onclick="choreUndoConversionFromModal()">撤销转换</button>'
+        :'<span>此杂事由项目转换而来</span><span class="conv-notice-hint">'+esc(st.reason)+'</span>';
+      convNotice.style.display='';
+    }
   }
   const budBox=document.getElementById('choreBudgetBind');
   if(budBox)budBox.innerHTML=budgetBindingHTML('chore',c||null);
   if(budBox)budgetBindingModeChange('chore');
   openModal('choreModal');
+  markModalClean('choreModal');
   if(!isEdit)setTimeout(function(){document.getElementById('choreName').focus();},50);
 }
 // 循环开关只切换字段可见性；关闭时保存会清掉 cycle 与 history
@@ -1668,19 +1878,28 @@ function removeChoreTag(i){
   renderChoreTags();
 }
 // 读取循环表单：未勾选返回 {cyclic:false}；配置与原对象一致时原样复用（含 nextDue/lastDue）
-function readChoreCycleForm(old){
+function readChoreCycleForm(old,errs){
   const onEl=document.getElementById('choreCycleOn');
   if(!onEl||!onEl.checked)return {cyclic:false,cycle:null};
   const unitEl=document.getElementById('choreCycleUnit');
   const unit=unitEl?String(unitEl.value):'day';
-  if(['day','week','month'].indexOf(unit)<0){toast('循环单位无效','err');return null;}
+  if(['day','week','month'].indexOf(unit)<0){
+    if(errs)errs.push({field:'choreCycleUnit',msg:'循环单位无效'});
+    return null;
+  }
   const ivEl=document.getElementById('choreCycleInterval');
   const iv=Math.round(Number(ivEl?ivEl.value:''));
-  if(!isFinite(iv)||iv<1){toast('循环间隔需为不小于 1 的整数','err');return null;}
+  if(!isFinite(iv)||iv<1){
+    if(errs)errs.push({field:'choreCycleInterval',msg:'循环间隔需为不小于 1 的整数'});
+    return null;
+  }
   const anEl=document.getElementById('choreCycleAnchor');
   const raw=anEl?String(anEl.value||''):'';
   const parsed=raw?new Date(raw+'T00:00:00').getTime():NaN;
-  if(!isFinite(parsed)){toast('请选择循环锚点日期','err');return null;}
+  if(!isFinite(parsed)){
+    if(errs)errs.push({field:'choreCycleAnchor',msg:'请选择循环锚点日期'});
+    return null;
+  }
   const anchor=dayStart(parsed);
   const oldCy=choreCycleOf(old);
   if(oldCy&&oldCy.unit===unit&&oldCy.interval===iv&&oldCy.anchor===anchor)return {cyclic:true,cycle:oldCy};
@@ -1693,27 +1912,32 @@ function readChoreCycleForm(old){
 function saveChore(){
   const id=document.getElementById('choreId').value;
   const name=document.getElementById('choreName').value.trim();
-  if(!name){toast('请输入杂事名称','err');return;}
+  const errs=[];
+  if(!name)errs.push({field:'choreName',msg:'请输入杂事名称'});
   const dv=document.getElementById('choreDate').value;
   const plannedAt=dv?new Date(dv+'T00:00:00').getTime():null;
   const fv=String(document.getElementById('choreFreshDays').value).trim();
   let fresh=null;
   if(fv!==''){
     const n=Number(fv);
-    if(!isFinite(n)){toast('保鲜期需为数字','err');return;}
-    fresh=Math.max(0,Math.round(n));
+    if(!isFinite(n))errs.push({field:'choreFreshDays',msg:'保鲜期需为数字'});
+    else fresh=Math.max(0,Math.round(n));
   }
   if(!Array.isArray(state.chores))state.chores=[];
   const editing=id?state.chores.find(function(x){return x.id===id;}):null;
-  const cyc=readChoreCycleForm(editing);
-  if(!cyc)return;
+  const cyc=readChoreCycleForm(editing,errs);
   // 产出进度值：留空视为 0（不产出）；领域留空回落到默认领域
   const pv=String(document.getElementById('choreProgressAmount').value).trim();
   let pAmt=0;
   if(pv!==''){
     const n=Number(pv);
-    if(!isFinite(n)||n<0){toast('产出进度值需为非负数字','err');return;}
-    pAmt=round2(n);
+    if(!isFinite(n)||n<0)errs.push({field:'choreProgressAmount',msg:'产出进度值需为非负数字'});
+    else pAmt=round2(n);
+  }
+  if(errs.length||!cyc){
+    const first=rejectFields('choreModal',errs);
+    if(!first&&errs.length)toast(errs[0].msg,'err');
+    return;
   }
   const pDids=[];
   document.querySelectorAll('#choreProgressDomains .dom-check input:checked').forEach(function(cb){pDids.push(cb.value);});
@@ -1762,6 +1986,11 @@ function choreConvertFromModal(){
   const r=choreToAffair(id);
   if(!r.ok){toast(r.reason||'无法转换','warn');return;}
   closeModal('choreModal');
+}
+// 撤销后弹窗里的杂事已被换回项目，留在旧弹窗会指向不存在的实体，因此成功后直接关闭。
+function choreUndoConversionFromModal(){
+  const r=undoConversion();
+  if(r&&r.ok)closeModal('choreModal');
 }
 function delChore(){
   const id=document.getElementById('choreId').value;
@@ -1814,6 +2043,7 @@ function openChoreConfigModal(){
   writeChoreCfgForm(choreCfg());
   choreCfgInputPreview();
   openModal('choreConfigModal');
+  markModalClean('choreConfigModal');
 }
 function resetChoreConfig(){
   writeChoreCfgForm(defaultChoreConfig());
@@ -1902,7 +2132,7 @@ function taskCardHTML(t,collId){
   const checkinBtn=v.checkedToday
     ?'<button class="btn btn-sm btn-checkin" disabled title="今日已打卡，明天再来">今日已打卡</button>'
     :'<button class="btn btn-sm btn-checkin" onclick="checkIn(\''+t.id+'\')" '+(cost>0&&state.scores.vitality<cost?'title="活力点不足，将进入负值（贷款）"':'')+'>打卡</button>';
-  return '<div class="card task-card" data-task-id="'+t.id+'" data-coll-id="'+(collId||'')+'">'
+  return '<div class="card task-card'+(revealedTaskId===t.id?' revealed':'')+'" data-task-id="'+t.id+'" data-coll-id="'+(collId||'')+'">'
     +'<div class="task-row">'
     +'<div class="task-title-wrap">'
     +(hasV?'<span class="tdot v" title="活力点"></span>':'')+(hasP?'<span class="tdot p" title="进度值"></span>':'')
@@ -1960,12 +2190,20 @@ function updateStageBar(track,tid,cell){
     applyStageBar(bar,t,cell);
   });
 }
+// 指针横坐标比例 → 0..9 格位。按“最近格心”吸附：
+// 滑块画在 cell*10+5% 处，若用 floor(p*10) 会最多领先指针一格（602px 轨道约 60px），
+// 看起来就是滑块跟不上手。改取最近格心后误差不超过半格。
+function stageCellFromRatio(p){
+  const c=Math.round(p*10-0.5);
+  return c<0?0:(c>9?9:c);
+}
 function setStageFromX(track,tid,clientX){
   const t=state.tasks.find(x=>x.id===tid);if(!t||!taskIsStaged(t))return;
   const rect=track.getBoundingClientRect();
+  if(!rect.width)return;
   let p=(clientX-rect.left)/rect.width;
   p=Math.max(0,Math.min(1,p));
-  let cell=Math.floor(p*10);if(cell>9)cell=9;if(cell<0)cell=0; // 吸附到 10 个格位 0..9
+  const cell=stageCellFromRatio(p); // 吸附到 10 个格位 0..9
   if(t.stageRewards)t.stageRewards.last=cell;
   updateStageBar(track,tid,cell);
 }
@@ -1976,55 +2214,68 @@ function initStageBars(){
     if(!track||track._stageBound)return;
     track._stageBound=true;
     const tid=bar.dataset.tid;
-    let startX=0,startY=0,pid=0;
-    let dragging=false,decided=false,abandoned=false,dirty=false;
+    let startX=0,startY=0,pid=null;
+    // dragging 表示方向已判定并进入拖动；它不随每次 pointermove 复位，
+    // 也不用来表示“本次手势结束”（结束只看 pointerup/pointercancel）。
+    let dragging=false,dirty=false;
     track.addEventListener('pointerdown',function(e){
       if(!state.tasks.find(x=>x.id===tid))return;
       startX=e.clientX;startY=e.clientY;pid=e.pointerId;
-      dragging=false;decided=false;abandoned=false;dirty=false;
+      dragging=false;dirty=false;
+      // 立即接管指针：手指/鼠标离开 22px 窄带后仍能收到 pointermove
+      if(track.setPointerCapture){try{track.setPointerCapture(pid);}catch(err){}}
     });
     track.addEventListener('pointermove',function(e){
-      if(e.pointerId!==pid||decided)return;
+      if(pid===null||e.pointerId!==pid)return;
       const dx=e.clientX-startX,dy=e.clientY-startY;
-      if(Math.abs(dx)<THRESH&&Math.abs(dy)<THRESH)return;
-      if(Math.abs(dx)>Math.abs(dy)){
-        decided=true;dragging=true;
-        if(track.setPointerCapture){try{track.setPointerCapture(pid);}catch(err){}}
-        e.preventDefault();
-        setStageFromX(track,tid,e.clientX);
-        dirty=true;
-      }else{
-        decided=true;abandoned=true;
+      if(!dragging){
+        if(Math.abs(dx)<THRESH&&Math.abs(dy)<THRESH)return;
+        // 方向判定只决定“是否开始拖”，不再把纵向优先当成终止：
+        // 先纵向晃一下、再横向移动时依然能开始拖动（触屏纵向滚动由浏览器 pointercancel 接管）。
+        if(Math.abs(dx)<=Math.abs(dy))return;
+        dragging=true;dirty=true;
       }
+      e.preventDefault();
+      setStageFromX(track,tid,e.clientX);
     });
-    track.addEventListener('pointerup',function(e){
-      if(e.pointerId!==pid)return;
-      if(dirty)save();
-      dragging=false;decided=false;abandoned=false;dirty=false;
-    });
-    track.addEventListener('pointercancel',function(e){
-      if(e.pointerId!==pid)return;
-      dragging=false;decided=false;abandoned=false;dirty=false;
-    });
+    function end(e,isCancel){
+      if(pid===null||e.pointerId!==pid)return;
+      if(track.releasePointerCapture){try{track.releasePointerCapture(pid);}catch(err){}}
+      const tap=!dragging&&!isCancel&&Math.abs(e.clientX-startX)<THRESH&&Math.abs(e.clientY-startY)<THRESH;
+      pid=null;
+      if(tap){
+        // 点哪跳哪：轻点轨道与点击滑块同义
+        setStageFromX(track,tid,e.clientX);
+        save();
+      }else if(dirty){
+        save();
+      }
+      dragging=false;dirty=false;
+    }
+    track.addEventListener('pointerup',function(e){end(e,false);});
+    track.addEventListener('pointercancel',function(e){end(e,true);});
   });
 }
 
 // ===== 任务卡片：点击标题展开详情，再点标题收起；点页面空白处也收起 =====
-let revealedTaskCard=null;
+// 展开状态只记 id（revealedTaskId）：整块重渲染后 taskCardHTML 会按 id 补回 revealed 类，
+// 不再依赖会被 innerHTML 重写丢弃的 DOM 引用。
 function initTaskReveal(){
   document.addEventListener('click',function(e){
     const title=e.target.closest?e.target.closest('.task-title-wrap'):null;
     if(title){
       const card=title.closest('.task-card');
       if(!card)return;
-      const wasOpen=card.classList.contains('revealed');
+      const id=card.dataset?String(card.dataset.taskId||''):'';
+      const wasOpen=!!id&&id===revealedTaskId;
       closeTaskReveal();
-      if(!wasOpen){card.classList.add('revealed');revealedTaskCard=card;}
+      if(!wasOpen){card.classList.add('revealed');revealedTaskId=id||null;}
       return;
     }
     // 点卡片内的操作按钮/详情区不收起；点卡片外空白处、或切换到另一张卡片时收起
     const card=e.target.closest?e.target.closest('.task-card'):null;
-    if(!card||card!==revealedTaskCard)closeTaskReveal();
+    const id=card&&card.dataset?String(card.dataset.taskId||''):'';
+    if(!card||!revealedTaskId||id!==revealedTaskId)closeTaskReveal();
   });
   // 长按卡片不弹系统右键/文本选择菜单（卡片已 user-select:none，这里兜底）
   document.addEventListener('contextmenu',function(e){
@@ -2032,8 +2283,7 @@ function initTaskReveal(){
   });
 }
 function closeTaskReveal(){
-  if(revealedTaskCard&&revealedTaskCard.isConnected)revealedTaskCard.classList.remove('revealed');
-  revealedTaskCard=null;
+  revealedTaskId=null;
   document.querySelectorAll('.task-card.revealed').forEach(function(c){c.classList.remove('revealed');});
 }
 
@@ -2057,11 +2307,11 @@ function achCardHTML(a,domId){
 }
 
 registerWorkUiState({
-  reset:function(){affairView='list';affairCalCursor=null;affairCalSelected=null;affairDoneOpen=false;choreDoneOpen=false;choreArchivedOpen=false;},
+  reset:function(){affairView='list';affairCalCursor=null;affairCalSelected=null;affairDoneOpen=false;choreDoneOpen=false;choreArchivedOpen=false;revealedTaskId=null;},
   closeChoreDoneZone:function(){choreDoneOpen=false;}
 });
 
-export { affairView, affairCalCursor, affairCalSelected, affairDoneOpen, choreDoneOpen, choreArchivedOpen, editAffairSteps, setScoreCell, renderWork, frSameDay, fmtClock, fmtPlan, fmtDateCal, toLocalInput, fromLocalInput, editAffairCurve, affairTags, editPresetCurve, renderAffairPresetsHTML, applyAffairPreset, openPresetModal, presetCurvePreview, presetCurveRefresh, setPresetCurve, renderPresetCurveCustom, presetCurveInput, getPresetCurve, togglePresetAch, savePreset, delPreset, renderAffairs, affairStatusLine, affairAxisHTML, affairZoneStart, AFFAIR_ZONE_END, doneZoneHTML, toggleAffairZone, affairMoreBtn, affairMenuTarget, toggleAffairMenu, closeAffairMenu, affairInProgressCardHTML, affairScheduleCardHTML, affairDraftCardHTML, affairDoneCardHTML, affairUnits, affairStepUnitCardHTML, renderTodayAgenda, jumpToAgendaItem, renderAffairSchedule, renderAffairCalendar, addAffairFromInput, applyAffairValue, reverseAffairValue, affairApplyProgress, AFFAIR_UNDO_LIMIT, affairCanUndo, affairPushUndo, affairUndoAction, _completeAffairStep, advanceAffairStep, completeAffair, completeAffairStep, initAffairAxes, openAffairPlanModal, saveAffairPlan, openAffairModal, handleAffairSave, delAffair, undoAffairDelete, dismissAffairDeleteUndo, affairDeleteUndoBarHTML, openAffairDeleteModal, cancelAffairDelete, confirmAffairDelete, restoreAffair, renderAffairSteps, affairStepDelegateHTML, affairStepDelegateExisting, affairStepDelegateNew, affairStepUndelegate, affairStepInput, affairStepTime, affairAddStep, affairRemoveStep, readAffairSteps, affairCurvePreview, affairCurveRefresh, setAffairCurve, renderAffairCurveCustom, affairCurveInput, getAffairCurve, toggleAffairAch, toggleAffairView, toggleAffairDone, affairSelectDay, affairCalShift, settleChoreBatches, computeChoreDecay, processChoreDecay, addChoreFromInput, toggleChoreDone, toggleChoreDoneZone, fmtChoreDate, choreCardHTML, renderChores, toggleChoreArchivedZone, restoreChore, toDateInputValue, openChoreModal, saveChore, choreCycleToggle, renderChoreTags, addChoreTag, removeChoreTag, readChoreCycleForm, affairConvertToChore, choreConvertFromModal, delChore, CHORE_CFG_FIELDS, readChoreCfgForm, writeChoreCfgForm, choreCfgInputPreview, openChoreConfigModal, resetChoreConfig, saveChoreConfig, stageBarHTML, taskCardHTML, applyStageBar, updateStageBar, setStageFromX, initStageBars, initTaskReveal, achCardHTML };
+export { affairView, affairCalCursor, affairCalSelected, affairDoneOpen, choreDoneOpen, choreArchivedOpen, editAffairSteps, setScoreCell, renderWork, frSameDay, fmtClock, fmtPlan, fmtDateCal, toLocalInput, fromLocalInput, editAffairCurve, affairTags, editPresetCurve, renderAffairPresetsHTML, applyAffairPreset, openPresetModal, presetCurvePreview, presetCurveRefresh, setPresetCurve, renderPresetCurveCustom, presetCurveInput, getPresetCurve, togglePresetAch, savePreset, delPreset, renderAffairs, affairStatusLine, affairAxisHTML, affairZoneStart, AFFAIR_ZONE_END, doneZoneHTML, toggleAffairZone, affairMoreBtn, affairMenuTarget, toggleAffairMenu, closeAffairMenu, affairInProgressCardHTML, affairScheduleCardHTML, affairDraftCardHTML, affairDoneCardHTML, affairUnits, affairStepUnitCardHTML, renderTodayAgenda, jumpToAgendaItem, renderAffairSchedule, renderAffairCalendar, addAffairFromInput, applyAffairValue, reverseAffairValue, affairApplyProgress, AFFAIR_UNDO_LIMIT, affairCanUndo, affairPushUndo, affairUndoAction, _completeAffairStep, advanceAffairStep, completeAffair, completeAffairStep, initAffairAxes, openAffairPlanModal, saveAffairPlan, openAffairModal, toggleAffairAcc, affairAccSummaryRefresh, affairIsDirty, closeAffairModal, requestAffairModalClose, handleAffairSave, delAffair, undoAffairDelete, dismissAffairDeleteUndo, affairDeleteUndoBarHTML, openAffairDeleteModal, cancelAffairDelete, confirmAffairDelete, restoreAffair, renderAffairSteps, affairStepDelegateHTML, affairStepDelegateExisting, affairStepDelegateNew, affairStepUndelegate, affairStepInput, affairStepTime, affairAddStep, affairMoveStep, affairRemoveStep, readAffairSteps, affairCurvePreview, affairCurveRefresh, setAffairCurve, renderAffairCurveCustom, affairCurveInput, getAffairCurve, toggleAffairAch, toggleAffairView, toggleAffairDone, affairSelectDay, affairCalShift, settleChoreBatches, computeChoreDecay, processChoreDecay, addChoreFromInput, toggleChoreDone, toggleChoreDoneZone, fmtChoreDate, choreCardHTML, renderChores, toggleChoreArchivedZone, restoreChore, toDateInputValue, openChoreModal, saveChore, choreCycleToggle, renderChoreTags, addChoreTag, removeChoreTag, readChoreCycleForm, affairConvertToChore, choreConvertFromModal, choreUndoConversionFromModal, delChore, CHORE_CFG_FIELDS, readChoreCfgForm, writeChoreCfgForm, choreCfgInputPreview, openChoreConfigModal, resetChoreConfig, saveChoreConfig, stageBarHTML, taskCardHTML, applyStageBar, updateStageBar, setStageFromX, initStageBars, initTaskReveal, achCardHTML };
 
 registerRenderer('work', renderWork);
 registerRenderer('stageBars', initStageBars);

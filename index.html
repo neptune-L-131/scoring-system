@@ -13,6 +13,7 @@
   <button class="btn btn-sm" onclick="attemptRecovery()">尝试恢复</button>
 </div>
 
+<div class="app-top">
 <div class="app-header">
   <div>
     <div class="app-title">计分系统</div>
@@ -33,6 +34,7 @@
   <div class="tab" data-tab="shop" onclick="goTab('shop')">商店</div>
   <div class="tab" data-tab="budget" onclick="goTab('budget')">预算</div>
   <div class="tab" data-tab="cycle" onclick="goTab('cycle')">周期</div>
+</div>
 </div>
 
 <div class="page">
@@ -205,6 +207,7 @@
   <div class="chart-tooltip" id="chartTooltip" style="display:none"></div>
 
   <div class="sec-head"><div class="sec-title">流水记录</div><div class="sec-head-tools"><button class="btn btn-sm" onclick="manualAdjustBalance()">手动修正余额</button><button class="btn btn-sm btn-danger" onclick="openModal('clearDataModal')">清除</button><div class="sec-meta" id="logMeta"></div></div></div>
+  <div class="ledger-undo-note">带「撤销」的流水可原路撤销，撤销成功后该条会从列表消失。删除项目请到项目面板顶部的撤销条；动作流运行可在流水「因果 → 本次执行」里整单撤销，也可到「周期 → 试跑与运行历史」。</div>
   <div id="ledgerBar"></div>
   <div class="log-list" id="logList"></div>
 
@@ -254,6 +257,7 @@
   <div id="budgetCategories"></div>
 
   <div class="sec-head mt-lg"><div class="sec-title">现实账目</div><div class="sec-meta" id="budgetLedgerMeta"></div></div>
+  <div class="ledger-undo-note">「撤销」与「撤销退回」是两条不同的路：前者撤支出，后者撤退款。跨期账目不能直接撤销，撤销原操作时会自动冲正。</div>
   <div class="log-list" id="budgetLedgerList"></div>
 </div>
 
@@ -283,9 +287,26 @@
   <div class="modal">
     <h2 id="taskModalTitle">新建任务</h2>
     <input type="hidden" id="taskId">
-    <div class="fg">
-      <label>任务名称</label>
-      <input type="text" id="taskName" placeholder="例如：晨跑30分钟" maxlength="30" autocomplete="off">
+    <div class="acc open" id="accTaskBasic">
+      <div class="acc-head" onclick="toggleAcc('accTaskBasic')">
+        <div class="acc-title">基本信息</div>
+        <div class="acc-sum" id="accTaskBasicSum"></div>
+        <span class="acc-arrow">▾</span>
+      </div>
+      <div class="acc-body">
+        <div class="fg">
+          <label>任务名称</label>
+          <input type="text" id="taskName" placeholder="例如：晨跑30分钟" maxlength="30" autocomplete="off">
+        </div>
+        <div class="fg">
+          <label>解释/定义 <span class="h">为AI助手提供任务说明（不显示在卡片上）</span></label>
+          <textarea id="taskDesc" rows="2" placeholder="例如：每天早晨跑步30分钟，锻炼身体并培养自律习惯" style="resize:vertical;font-family:inherit"></textarea>
+        </div>
+        <div class="fg">
+          <label>所属集合</label>
+          <select id="taskCollection"></select>
+        </div>
+      </div>
     </div>
 
     <div class="acc open" id="accTaskType">
@@ -342,31 +363,14 @@
       </div>
     </div>
 
-    <div class="acc" id="accTaskMeta">
-      <div class="acc-head" onclick="toggleAcc('accTaskMeta')">
-        <div class="acc-title">定义与归属</div>
-        <div class="acc-sum" id="accTaskMetaSum"></div>
-        <span class="acc-arrow">▾</span>
-      </div>
-      <div class="acc-body">
-        <div class="fg">
-          <label>解释/定义 <span class="h">为AI助手提供任务说明（不显示在卡片上）</span></label>
-          <textarea id="taskDesc" rows="2" placeholder="例如：每天早晨跑步30分钟，锻炼身体并培养自律习惯" style="resize:vertical;font-family:inherit"></textarea>
-        </div>
-        <div class="fg">
-          <label>所属集合</label>
-          <select id="taskCollection"></select>
-        </div>
-      </div>
-    </div>
-
     <div class="acc" id="accTaskStage">
       <div class="acc-head" onclick="toggleAcc('accTaskStage')">
-        <div class="acc-title">阶段奖励</div>
+        <div class="acc-title">阶段奖励 <span class="h">任务独有</span></div>
         <div class="acc-sum" id="accTaskStageSum">未配置</div>
         <span class="acc-arrow">▾</span>
       </div>
       <div class="acc-body">
+        <div class="sec-note" style="margin:0 0 10px">按打卡阶段发放的额外数值；项目没有阶段奖励，项目用「总奖励 + 奖励曲线」。</div>
         <label class="stage-enable">
           <input type="checkbox" id="taskStageEnabled" onchange="onStageEnabled()">
           <span>启用阶段奖励 <span class="h">5 档固定：起步 / 训练 / 进步 / 突破 / 超常</span></span>
@@ -378,66 +382,99 @@
     <div id="taskBudgetBind"></div>
 
     <div class="modal-foot">
-      <button class="btn" onclick="closeModal('taskModal')">取消</button>
-      <button class="btn" id="taskSaveBtn">保存</button>
+      <button class="btn" onclick="requestModalClose('taskModal')">取消</button>
+      <button class="btn btn-primary" id="taskSaveBtn">保存</button>
     </div>
   </div>
 </div>
 
-<!-- ===== Affair (事务) Modal ===== -->
+<!-- ===== Affair (项目) Modal ===== -->
+<!-- 布局：三组折叠 + sticky footer；默认展开「基本信息」「步骤与预算」，收起「奖励与成果」 -->
 <div class="modal-bg" id="affairModal">
-  <div class="modal">
+  <div class="modal modal-wide affair-modal">
     <h2 id="affairModalTitle">新建项目</h2>
     <input type="hidden" id="affairId">
-    <div class="fg">
-      <label>套用预设 <span class="h">选择后自动填充总奖励、曲线与成果点，仍可手动微调</span></label>
-      <select id="affairPresetSel" onchange="applyAffairPreset()"></select>
-    </div>
-    <div class="fg">
-      <label>项目名称</label>
-      <input type="text" id="affairName" placeholder="例如：报销上月差旅" maxlength="40" autocomplete="off">
-    </div>
-    <div class="fg">
-      <label>关联领域 <span class="h">选择后完成项目给该领域加进度值；不选则加活力点</span></label>
-      <select id="affairDomain"></select>
-    </div>
-    <div class="fg">
-      <label>总奖励 <span class="h">完成后累计可获得的进度值/活力点总额</span></label>
-      <input type="number" id="affairReward" step="0.1" min="0" placeholder="例如 1" oninput="affairCurveRefresh()">
-    </div>
-    <div class="fg">
-      <label>奖励曲线 <span class="h">控制奖励随进度格位的发放节奏（格 9 = 100%）</span></label>
-      <div class="curve-row" id="affairCurveRow">
-        <button type="button" class="curve-btn" data-curve="even" onclick="setAffairCurve('even')">平均</button>
-        <button type="button" class="curve-btn" data-curve="lateHeavy" onclick="setAffairCurve('lateHeavy')">后重</button>
-        <button type="button" class="curve-btn" data-curve="earlyHeavy" onclick="setAffairCurve('earlyHeavy')">前重</button>
-        <button type="button" class="curve-btn" data-curve="allAtEnd" onclick="setAffairCurve('allAtEnd')">全押后</button>
-        <button type="button" class="curve-btn" data-curve="custom" onclick="setAffairCurve('custom')">自定义</button>
+
+    <div class="acc open" id="affairAccBasic">
+      <div class="acc-head" onclick="toggleAffairAcc('basic')">
+        <div class="acc-title">基本信息</div>
+        <div class="acc-sum" id="affairAccBasicSum"></div>
+        <span class="acc-arrow">▾</span>
       </div>
-      <div class="curve-custom" id="affairCurveCustom" style="display:none"></div>
-      <div class="curve-preview" id="affairCurvePreview"></div>
-    </div>
-    <div class="fg">
-      <label>成果点 <span class="h">完成时额外一次性发放</span></label>
-      <label class="ach-check"><input type="checkbox" id="affairAchEnabled" onchange="toggleAffairAch()"> 启用成果点奖励</label>
-      <div id="affairAchAmountRow" style="display:none;margin-top:6px">
-        <input type="number" id="affairAchAmount" step="1" min="0" value="1" placeholder="成果点数量">
+      <div class="acc-body">
+        <div class="fg">
+          <label>项目名称</label>
+          <input type="text" id="affairName" placeholder="例如：报销上月差旅" maxlength="40" autocomplete="off" oninput="affairAccSummaryRefresh()">
+        </div>
+        <div class="fg">
+          <label>关联领域 <span class="h">选择后完成项目给该领域加进度值；不选则加活力点</span></label>
+          <select id="affairDomain" onchange="affairAccSummaryRefresh()"></select>
+        </div>
+        <div class="fg">
+          <label>计划时间 <span class="h">可选，用于日程安排</span></label>
+          <input type="datetime-local" id="affairPlannedAt" oninput="affairAccSummaryRefresh()">
+        </div>
       </div>
     </div>
-    <div class="fg">
-      <label>计划时间 <span class="h">可选，用于日程安排</span></label>
-      <input type="datetime-local" id="affairPlannedAt">
+
+    <div class="acc" id="affairAccReward">
+      <div class="acc-head" onclick="toggleAffairAcc('reward')">
+        <div class="acc-title">奖励与成果</div>
+        <div class="acc-sum" id="affairAccRewardSum"></div>
+        <span class="acc-arrow">▾</span>
+      </div>
+      <div class="acc-body">
+        <div class="sec-note" style="margin:0 0 10px">项目没有阶段奖励：总奖励按 9 个进度格、由「奖励曲线」决定每格发放多少。</div>
+        <div class="fg">
+          <label>套用预设 <span class="h">选择后自动填充总奖励、曲线与成果点，仍可手动微调</span></label>
+          <select id="affairPresetSel" onchange="applyAffairPreset()"></select>
+        </div>
+        <div class="fg">
+          <label>总奖励 <span class="h">完成后累计可获得的进度值/活力点总额</span></label>
+          <input type="number" id="affairReward" step="0.1" min="0" placeholder="例如 1" oninput="affairCurveRefresh()">
+        </div>
+        <div class="fg">
+          <label>奖励曲线 <span class="h">控制奖励随进度格位的发放节奏（格 9 = 100%）</span></label>
+          <div class="curve-row" id="affairCurveRow">
+            <button type="button" class="curve-btn" data-curve="even" onclick="setAffairCurve('even')">平均</button>
+            <button type="button" class="curve-btn" data-curve="lateHeavy" onclick="setAffairCurve('lateHeavy')">后重</button>
+            <button type="button" class="curve-btn" data-curve="earlyHeavy" onclick="setAffairCurve('earlyHeavy')">前重</button>
+            <button type="button" class="curve-btn" data-curve="allAtEnd" onclick="setAffairCurve('allAtEnd')">全押后</button>
+            <button type="button" class="curve-btn" data-curve="custom" onclick="setAffairCurve('custom')">自定义</button>
+          </div>
+          <div class="curve-custom" id="affairCurveCustom" style="display:none"></div>
+          <div class="curve-preview" id="affairCurvePreview"></div>
+        </div>
+        <div class="fg">
+          <label>成果点 <span class="h">完成时额外一次性发放</span></label>
+          <label class="ach-check"><input type="checkbox" id="affairAchEnabled" onchange="toggleAffairAch()"> 启用成果点奖励</label>
+          <div id="affairAchAmountRow" style="display:none;margin-top:6px">
+            <input type="number" id="affairAchAmount" step="1" min="0" value="1" placeholder="成果点数量">
+          </div>
+        </div>
+      </div>
     </div>
-    <div class="fg">
-      <label>步骤列表 <span class="h">可选，逐个完成步骤；每步可单独安排时间，也可以把步骤委派给一条杂事；全部完成或手动标记完成时结算奖励</span></label>
-      <div id="affairSteps"></div>
-      <button type="button" class="btn btn-sm" style="margin-top:8px" onclick="affairAddStep()">+ 添加步骤</button>
+
+    <div class="acc open" id="affairAccSteps">
+      <div class="acc-head" onclick="toggleAffairAcc('steps')">
+        <div class="acc-title">步骤与预算</div>
+        <div class="acc-sum" id="affairAccStepsSum"></div>
+        <span class="acc-arrow">▾</span>
+      </div>
+      <div class="acc-body">
+        <div class="fg">
+          <label>步骤列表 <span class="h">可选，逐个完成步骤；每步可单独安排时间，也可以把步骤委派给一条杂事；全部完成或手动标记完成时结算奖励</span></label>
+          <div id="affairSteps"></div>
+          <button type="button" class="btn btn-sm" style="margin-top:8px" onclick="affairAddStep()">+ 添加步骤</button>
+        </div>
+        <div id="affairBudgetBind"></div>
+      </div>
     </div>
-    <div id="affairBudgetBind"></div>
+
     <div class="modal-foot">
-      <button class="btn" onclick="closeModal('affairModal')">取消</button>
+      <button class="btn" onclick="closeAffairModal()">取消</button>
       <button class="btn btn-danger" id="affairDelBtn" style="display:none" onclick="delAffair(document.getElementById('affairId').value)">删除</button>
-      <button class="btn" id="affairSaveBtn">保存</button>
+      <button class="btn btn-primary" id="affairSaveBtn">保存</button>
     </div>
   </div>
 </div>
@@ -491,9 +528,9 @@
       </div>
     </div>
     <div class="modal-foot">
-      <button class="btn" onclick="closeModal('presetModal')">取消</button>
+      <button class="btn" onclick="requestModalClose('presetModal')">取消</button>
       <button class="btn btn-danger" id="presetDelBtn" style="display:none" onclick="delPreset(document.getElementById('presetId').value)">删除</button>
-      <button class="btn" id="presetSaveBtn">保存</button>
+      <button class="btn btn-primary" id="presetSaveBtn">保存</button>
     </div>
   </div>
 </div>
@@ -508,8 +545,8 @@
       <input type="datetime-local" id="affairPlanInput">
     </div>
     <div class="modal-foot">
-      <button class="btn" onclick="closeModal('affairPlanModal')">取消</button>
-      <button class="btn" id="affairPlanSaveBtn">保存</button>
+      <button class="btn" onclick="requestModalClose('affairPlanModal')">取消</button>
+      <button class="btn btn-primary" id="affairPlanSaveBtn">保存</button>
     </div>
   </div>
 </div>
@@ -518,6 +555,7 @@
 <div class="modal-bg" id="choreModal">
   <div class="modal">
     <h2 id="choreModalTitle">编辑杂事</h2>
+    <div id="choreConvNotice" class="conv-notice" style="display:none"></div>
     <input type="hidden" id="choreId">
     <div class="fg">
       <label>名称</label>
@@ -562,11 +600,15 @@
     </div>
     <div id="choreBudgetBind"></div>
     <div class="modal-foot">
-      <button class="btn" onclick="closeModal('choreModal')">取消</button>
-      <button class="btn" id="choreUndoConvBtn" style="display:none" onclick="undoConversion()">撤销转换</button>
-      <button class="btn" id="choreConvertBtn" style="display:none" onclick="choreConvertFromModal()">转为项目</button>
-      <button class="btn btn-danger" id="choreDelBtn" style="display:none" onclick="delChore()">删除</button>
-      <button class="btn" id="choreSaveBtn">保存</button>
+      <button class="btn" onclick="requestModalClose('choreModal')">取消</button>
+      <details class="foot-more" id="choreMore">
+        <summary class="btn">更多 ▾</summary>
+        <div class="foot-menu">
+          <button class="btn btn-sm" id="choreConvertBtn" style="display:none" onclick="choreConvertFromModal()">转为项目</button>
+          <button class="btn btn-sm btn-danger" id="choreDelBtn" style="display:none" onclick="delChore()">删除</button>
+        </div>
+      </details>
+      <button class="btn btn-primary" id="choreSaveBtn">保存</button>
     </div>
   </div>
 </div>
@@ -602,7 +644,7 @@
       <input type="number" id="choreCfgFresh" min="0" step="1" oninput="choreCfgInputPreview()">
     </div>
     <div class="fg">
-      <label>批量结算 <span class="h">单件完成不发放活力点</span></label>
+      <label>批量结算 <span class="h">每完成 N 件统一发放一次；单件完成不发</span></label>
       <div class="cfg-inline">
         <span>每</span><input type="number" id="choreCfgN" min="1" step="1" oninput="choreCfgInputPreview()"><span>件 → +</span><input type="number" id="choreCfgY" min="0" step="1" oninput="choreCfgInputPreview()"><span>活力点</span>
       </div>
@@ -624,9 +666,9 @@
       <div class="curve-preview" id="choreCfgPreview"></div>
     </div>
     <div class="modal-foot">
-      <button class="btn" onclick="closeModal('choreConfigModal')">取消</button>
+      <button class="btn" onclick="requestModalClose('choreConfigModal')">取消</button>
       <button class="btn" onclick="resetChoreConfig()">恢复默认</button>
-      <button class="btn" id="choreCfgSaveBtn">保存</button>
+      <button class="btn btn-primary" id="choreCfgSaveBtn">保存</button>
     </div>
   </div>
 </div>
@@ -653,8 +695,8 @@
       <input type="number" id="achPoints" value="1" min="0.1" step="0.1">
     </div>
     <div class="modal-foot">
-      <button class="btn" onclick="closeModal('achModal')">取消</button>
-      <button class="btn" id="achSaveBtn">保存</button>
+      <button class="btn" onclick="requestModalClose('achModal')">取消</button>
+      <button class="btn btn-primary" id="achSaveBtn">保存</button>
     </div>
   </div>
 </div>
@@ -673,8 +715,8 @@
       <div class="domain-checklist" id="metricDomainList"></div>
     </div>
     <div class="modal-foot">
-      <button class="btn" onclick="closeModal('metricModal')">取消</button>
-      <button class="btn" id="metricSaveBtn">保存</button>
+      <button class="btn" onclick="requestModalClose('metricModal')">取消</button>
+      <button class="btn btn-primary" id="metricSaveBtn">保存</button>
     </div>
   </div>
 </div>
@@ -697,10 +739,6 @@
   <div class="modal">
     <h2 id="assetModalTitle">新建资产</h2>
     <input type="hidden" id="assetOriginalId">
-    <div class="fg">
-      <label>资产 ID <span class="h">小写字母开头，3–32 位小写字母/数字/下划线；创建后不可修改</span></label>
-      <input type="text" id="assetId" placeholder="例如：star" maxlength="32" autocomplete="off">
-    </div>
     <div class="fg">
       <label>资产名称</label>
       <input type="text" id="assetName" placeholder="例如：星星" maxlength="20" autocomplete="off">
@@ -727,10 +765,23 @@
         <option value="task-exempt">任务豁免（消耗 1 张）</option>
       </select>
     </div>
+    <div class="acc" id="accAssetAdvanced">
+      <div class="acc-head" onclick="toggleAcc('accAssetAdvanced')">
+        <div class="acc-title">高级</div>
+        <div class="acc-sum">资产 ID</div>
+        <span class="acc-arrow">▾</span>
+      </div>
+      <div class="acc-body">
+        <div class="fg">
+          <label>资产 ID <span class="h">留空自动生成；小写字母开头，3–32 位小写字母/数字/下划线；创建后不可修改</span></label>
+          <input type="text" id="assetId" placeholder="留空自动生成，例如：star" maxlength="32" autocomplete="off">
+        </div>
+      </div>
+    </div>
     <div class="asset-form-hint" id="assetFormHint"></div>
     <div class="modal-foot">
-      <button class="btn" onclick="closeModal('assetModal')">取消</button>
-      <button class="btn" id="assetSaveBtn">保存</button>
+      <button class="btn" onclick="requestModalClose('assetModal')">取消</button>
+      <button class="btn btn-primary" id="assetSaveBtn">保存</button>
     </div>
   </div>
 </div>
@@ -739,6 +790,7 @@
 <div class="modal-bg" id="flowModal">
   <div class="modal modal-wide">
     <h2 id="flowModalTitle">动作流</h2>
+    <div class="sec-note" style="margin:0 0 12px">文中的「事项」是伞形词，指任务 / 项目 / 杂事；每个动作只作用于你选择的类型。</div>
     <div class="fg">
       <label>名称</label>
       <input type="text" id="flowName" maxlength="40" placeholder="例如：每周活力结算" autocomplete="off">
@@ -794,7 +846,7 @@
     <div id="flowStepsWrap">
       <div class="sec-head">
         <div class="sec-title">有序步骤</div>
-        <div class="sec-meta">只能选择已开放的 8 个原子；金额与数量在保存时校验</div>
+        <div class="sec-meta">只能选择已开放的 8 个原子；保存配置不会立即执行，金额与数量在保存时校验</div>
       </div>
       <div id="flowStepList"></div>
     </div>
@@ -803,7 +855,7 @@
     <div class="asset-form-hint" id="flowFormHint"></div>
     <div class="modal-foot">
       <button class="btn" onclick="closeFlowModal()">取消</button>
-      <button class="btn" id="flowSaveBtn">保存配置（不执行）</button>
+      <button class="btn btn-primary" id="flowSaveBtn">保存配置（不执行）</button>
     </div>
   </div>
 </div>
@@ -824,7 +876,7 @@
 
 <!-- ===== Product Modal ===== -->
 <div class="modal-bg" id="prodModal">
-  <div class="modal">
+  <div class="modal modal-wide">
     <h2 id="prodModalTitle">上架商品</h2>
     <input type="hidden" id="prodId">
     <div class="fg"><label>商品名称</label><input type="text" id="prodName" placeholder="例如：看一部电影" maxlength="30" autocomplete="off"></div>
@@ -926,12 +978,12 @@
       <select id="prodBudgetCategory" onchange="onProdBudgetChange()"></select>
     </div>
     <div class="fg" id="prodBudgetAmountFG" style="display:none">
-      <label>现实金额 <span class="h">按该分类的币种计入本期已花</span></label>
+      <label>现实金额 <span class="h" id="prodBudgetHint">仅支出 · 按该分类的币种计入本期已花</span></label>
       <input type="number" id="prodBudgetAmount" value="0" min="0" step="0.01">
     </div>
     <div class="modal-foot">
-      <button class="btn" onclick="closeModal('prodModal')">取消</button>
-      <button class="btn" id="prodSaveBtn">保存</button>
+      <button class="btn" onclick="requestModalClose('prodModal')">取消</button>
+      <button class="btn btn-primary" id="prodSaveBtn">保存</button>
     </div>
   </div>
 </div>
@@ -946,7 +998,7 @@
         <input type="text" id="budgetCatName" placeholder="例如：餐饮" maxlength="40" autocomplete="off">
       </div>
       <div class="fg">
-        <label>结算周期 <span class="h">每周按起始日切 / 每月 1 日切</span></label>
+        <label>账期 <span class="h">按周或按月切分预算额度；每周按起始日切 / 每月 1 日切</span></label>
         <select id="budgetCatCycle" onchange="syncBudgetAnchorVisibility()">
           <option value="week">每周</option>
           <option value="month">每月</option>
@@ -973,6 +1025,11 @@
       <div class="fg">
         <label>默认领域 <span class="h">进度类规则没填领域时用它</span></label>
         <select id="budgetCatDefaultDomain"></select>
+      </div>
+      <div class="fg">
+        <label>币种 <span class="h">该分类现实账目的币种</span></label>
+        <select id="budgetCatCurrency"></select>
+        <div class="h" id="budgetCatCurrencyHint">换币种建议在周期边界上做，本期内更换会让该期的金额类条件失效。</div>
       </div>
     </div>
     <div class="fg">
@@ -1012,15 +1069,15 @@
       <div class="sec-title">规则列表 <span class="sec-meta">按优先级从下到上执行</span></div>
       <div class="sec-actions">
         <button class="btn btn-sm" onclick="budRuleAdd('penalty')">+ 惩罚</button>
-        <button class="btn btn-sm" onclick="budRuleAdd('reward')">+ 奖励</button>
+        <button class="btn btn-sm" onclick="budRuleAdd('reward')">+ 结余奖励</button>
         <button class="btn btn-sm" onclick="budRuleAdd('feedback')">+ 反哺</button>
       </div>
     </div>
     <div id="budgetRuleList"></div>
 
     <div class="modal-foot">
-      <button class="btn" onclick="closeModal('budgetCatModal')">取消</button>
-      <button class="btn" onclick="saveBudgetCategory()">保存</button>
+      <button class="btn" onclick="requestModalClose('budgetCatModal')">取消</button>
+      <button class="btn btn-primary" id="budgetCatSaveBtn">保存</button>
     </div>
   </div>
 </div>
@@ -1035,7 +1092,14 @@
         <select id="qrCategory" onchange="renderQuickPreview()"></select>
       </div>
       <div class="fg">
-        <label>金额</label>
+        <label>方向</label>
+        <select id="qrDirection" onchange="renderQuickPreview()">
+          <option value="spend">支出</option>
+          <option value="refund">退回</option>
+        </select>
+      </div>
+      <div class="fg">
+        <label>金额<span class="h" id="qrCurrencyLabel">（CNY）</span></label>
         <input type="number" id="qrAmount" min="0" step="0.01" placeholder="0.00" oninput="renderQuickPreview()">
       </div>
     </div>
@@ -1049,7 +1113,7 @@
     </div>
     <div class="modal-foot">
       <button class="btn" onclick="closeModal('quickRecordModal')">取消</button>
-      <button class="btn" id="qrConfirmBtn" onclick="qrConfirm()">确认记账</button>
+      <button class="btn" id="qrConfirmBtn">确认记账</button>
     </div>
   </div>
 </div>
