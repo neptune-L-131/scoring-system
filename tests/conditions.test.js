@@ -216,6 +216,95 @@ describe('evalCondItem：阶段 1 指标（项目 / 杂事 / 不活跃）', () =
   });
 });
 
+describe('evalCondItem：情境指标', () => {
+  it('chore_tag_overdue 只数当前超期且带该情境的未归档杂事', () => {
+    api.resetState({
+      chores: [
+        { id: 'c1', done: false, createdAt: T - 10 * DAY, freshDays: 0, tags: ['@电脑'] },
+        { id: 'c2', done: false, createdAt: T - 10 * DAY, freshDays: 0, tags: ['电话'] },
+        { id: 'c3', done: false, createdAt: T - DAY, freshDays: 7, tags: ['电脑'] },
+        { id: 'c4', done: false, createdAt: T - 10 * DAY, freshDays: 0, tags: ['电脑'], archived: true },
+      ],
+    });
+    const q = (target) => item({ range: 'today', metric: 'chore_tag_overdue', targetType: 'tag', target, value: 1 });
+    expect(api.evalCondItem(q('电脑'), week, T)).toBe(true);
+    expect(api.evalCondItem(q('PC'), week, T)).toBe(false);
+    expect(api.evalCondItem(item({ range: 'today', metric: 'chore_tag_overdue', targetType: 'tag', target: '电脑', value: 2 }), week, T)).toBe(false);
+    expect(api.evalCondItem(q(''), week, T)).toBe(false);
+  });
+
+  it('chore_tag_completed 按每条完成记录的标签快照分别归因', () => {
+    api.resetState({
+      chores: [{
+        id: 'c1', tags: ['电话'], done: false,
+        cycle: { unit: 'day', interval: 1, anchor: T - 10 * DAY },
+        history: [
+          { ts: T - 3 * DAY, due: T - 3 * DAY, settled: true, tags: ['电脑'] },
+          { ts: T - 2 * DAY, due: T - 2 * DAY, settled: true, tags: ['电话'] },
+        ],
+      }],
+    });
+    const q = (target, range, days) => item({ range, days, metric: 'chore_tag_completed', targetType: 'tag', target, value: 1 });
+    expect(api.evalCondItem(q('电脑', 'total'), week, T)).toBe(true);
+    expect(api.evalCondItem(q('电话', 'total'), week, T)).toBe(true);
+    expect(api.evalCondItem(q('电脑', 'recent', 7), week, T)).toBe(true);
+    expect(api.evalCondItem(item({ range: 'recent', days: 1, metric: 'chore_tag_completed', targetType: 'tag', target: '电脑', value: 1 }), week, T)).toBe(false);
+  });
+
+  it('一次性杂事优先用最近完成记录的标签快照', () => {
+    api.resetState({
+      chores: [{
+        id: 'c1', done: true, doneAt: T - 2 * DAY, tags: ['电话'],
+        history: [{ ts: T - 2 * DAY, due: 0, settled: false, tags: ['电脑'] }],
+      }],
+    });
+    const q = (target) => item({ range: 'recent', days: 7, metric: 'chore_tag_completed', targetType: 'tag', target, value: 1 });
+    expect(api.evalCondItem(q('电脑'), week, T)).toBe(true);
+    expect(api.evalCondItem(q('电话'), week, T)).toBe(false);
+  });
+
+  it('旧记录两条归因路径：迁移快照（当前行为）冻结；快照缺失时回落当前标签', () => {
+    api.resetState({
+      chores: [{
+        id: 'c1', name: '旧循环', tags: ['电脑'],
+        cycle: { unit: 'day', interval: 1, anchor: T - 10 * DAY },
+        history: [{ ts: T - 2 * DAY, due: T - 2 * DAY, settled: false }],
+      }],
+    });
+    // 走真实读档路径：升级前无 tags 键的旧条目，迁移时按当时标签反填快照
+    const loaded = api.parseState(JSON.stringify(api.getState()));
+    api.setState(loaded);
+    const c = api.getLive().chores[0];
+    expect(c.history[0].tags).toEqual(['电脑']);
+    // 当前行为：之后改标签不回溯历史，完成数仍归到升级时的「电脑」
+    c.tags = ['电话'];
+    const q = (target) => item({ range: 'total', metric: 'chore_tag_completed', targetType: 'tag', target, value: 1 });
+    expect(api.evalCondItem(q('电脑'), week, T)).toBe(true);
+    expect(api.evalCondItem(q('电话'), week, T)).toBe(false);
+    // 异常路径：快照缺失（未经历迁移）时，求值层按当前标签归因，不会静默计 0
+    c.history = [{ ts: T - 2 * DAY, due: T - 2 * DAY, settled: false }];
+    expect(api.evalCondItem(q('电话'), week, T)).toBe(true);
+    expect(api.evalCondItem(q('电脑'), week, T)).toBe(false);
+  });
+
+  it('条件项归一化保留 tag 主体；文案显示情境名与失效提示', () => {
+    const it = api.normalizeCondItem(item({ range: 'total', metric: 'chore_tag_completed', targetType: 'tag', target: '电脑' }));
+    expect(it.targetType).toBe('tag');
+    expect(it.target).toBe('电脑');
+    api.resetState({ chores: [{ id: 'c1', tags: ['@电脑'] }] });
+    expect(api.condItemLabel(item({ range: 'total', metric: 'chore_tag_completed', targetType: 'tag', target: '电脑' }))).toContain('情境「@电脑」');
+    expect(api.condItemLabel(item({ range: 'total', metric: 'chore_tag_completed', targetType: 'tag', target: '不存在' }))).toContain('已不存在');
+  });
+
+  it('情境完成数的展示收短为「完成数」，主体与指标键不变', () => {
+    api.resetState({ chores: [{ id: 'c1', tags: ['@电脑'] }] });
+    const label = api.condItemLabel(item({ range: 'total', metric: 'chore_tag_completed', targetType: 'tag', target: '电脑', value: 2 }));
+    expect(label).toContain('情境「@电脑」');
+    expect(label).toContain('·完成数');
+    expect(label).not.toContain('带情境的杂事完成数');
+  });
+});
+
 describe('商品门槛：三段式兼容层', () => {
   it('日常级永远可买', () => {
     expect(api.evaluateProductGate({ tier: 'daily', gate: { minLifetime: 999 } })).toMatchObject({ ok: true, deny: false, tier: 'daily' });

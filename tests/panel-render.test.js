@@ -320,3 +320,45 @@ describe('work.affairs 局部重绘（S3-C2）', () => {
     expect((html('logList').match(/class="log-item"/g) || []).length).toBe(countBefore + 1);
   });
 });
+
+// ===== 领域筛选：失效引用必须回落「全部」 =====
+describe('领域筛选失效回落', () => {
+  function seedFilter(over) {
+    api.resetState(Object.assign({
+      domains: [{ id: 'd_default', name: '默认' }, { id: 'd2', name: '二' }],
+      collections: [{ id: 'c_default', name: '默认' }],
+      tasks: [{
+        id: 't1', name: '任务A', collectionId: 'c_default', domainIds: ['d2'],
+        scoreTypes: ['progress'], initialValue: 10, interestRate: 0, debtRate: 0,
+        vitalityCost: 0, checkInCount: 0, streak: 0, lastCheckIn: null,
+        totalEarned: 0, pendingDebt: 0, archived: false,
+      }],
+      filterDomain: 'd2',
+    }, over || {}));
+    api.resetWorkUiState();
+  }
+
+  it('删除正在筛选的领域后筛选清空，任务重新可见', () => {
+    seedFilter();
+    api.delDomain('d2');
+    expect(api.getLive().filterDomain).toBe(null);
+    render();
+    expect(html('taskGroups')).toContain('data-task-id="t1"');
+  });
+
+  it('筛选值残留失效时渲染回落「全部」，不激活任何 pill', () => {
+    seedFilter({ domains: [{ id: 'd_default', name: '默认' }], filterDomain: 'ghost' });
+    render();
+    expect(html('taskGroups')).toContain('data-task-id="t1"');
+    expect(html('domainPills')).not.toContain('domain-pill active');
+  });
+
+  it('读档归一：失效 filterDomain 变 null，有效值保留', () => {
+    const raw = api.defaults();
+    raw.domains = [{ id: 'd_default', name: '默认' }, { id: 'd2', name: '二' }];
+    raw.filterDomain = 'ghost';
+    expect(api.parseState(JSON.stringify(raw)).filterDomain).toBe(null);
+    raw.filterDomain = 'd2';
+    expect(api.parseState(JSON.stringify(raw)).filterDomain).toBe('d2');
+  });
+});

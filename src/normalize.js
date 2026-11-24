@@ -2,9 +2,9 @@ import { normalizeAffairStepRefs } from './affair-steps.js';
 import { normalizeCondition } from './cond-model.js';
 import { gateConditionOf } from './cond-model.js';
 import { normalizeBudgetBinding, normalizeBudgetRef } from './budget-binding.js';
-import { ACTIVITY_MAX_DAYS, ASSET_VERSION, AUDIT_MAX, BUDGET_LEDGER_MAX, BUDGET_PERIOD_KEEP, BUDGET_RULE_KINDS, FLOW_MAX_STEPS, FLOW_RUN_KEEP, FLOW_VERSION, LOG_MAX, PROD_TIERS, PRODUCT_EXEC_MAX_PER_PERIOD, SCHEMA_VERSION, SHADOW_MAX, STATS_ENTITY_MAPS, STATS_KEEP_DAYS, STATS_SCALARS } from './constants.js';
+import { ACTIVITY_MAX_DAYS, ASSET_VERSION, AUDIT_MAX, BUDGET_LEDGER_MAX, BUDGET_PERIOD_KEEP, BUDGET_RULE_KINDS, FLOW_MAX_STEPS, FLOW_RUN_KEEP, FLOW_VERSION, LOG_MAX, PROD_TIERS, PRODUCT_EXEC_MAX_PER_PERIOD, REVERSED_LOG_KEEP, SCHEMA_VERSION, SHADOW_MAX, STATS_ENTITY_MAPS, STATS_KEEP_DAYS, STATS_SCALARS } from './constants.js';
 import { defaultAssetDefs, defaultBudgetsState, defaultProductGate, migrateChore, normalizeChoreConfig, tierCurrency, defaults } from './defaults.js';
-import { normalizeChoreOrder, reconcileChoreOrder } from './chore-list.js';
+import { normalizeChoreOrder, reconcileChoreOrder, normalizeChoreTags } from './chore-list.js';
 import { normalizeExecBuys } from './exec-quota.js';
 import { budgetBounds, periodKey, migrateAffair, esc, now, uid, toNum, toTs, asArray, dateKeyOffset, round2, validAssetCat, isCurrencyCode } from './pure.js';
 import { emptyAccountSums } from './stats.js';
@@ -734,8 +734,6 @@ function normalizeExt(x,ctx){
       progress:{}
     },
     budgets:normalizeBudgets(x.budgets,ctx),
-    investment:{window:Math.max(1,Math.round(toNum((x.investment||{}).window,30)))},
-    reports:asArray(x.reports).filter(Boolean),
     audit:asArray(x.audit).filter(Boolean).slice(-AUDIT_MAX),
     activity:normalizeActivityIndex(x.activity),
     achievementCounted:normalizeAchievementCounted(x.achievementCounted),
@@ -747,7 +745,9 @@ function normalizeExt(x,ctx){
     // 执行权购买次数：老存档缺省为空，计数从 0 起步
     execBuys:normalizeExecBuys(x.execBuys),
     // 阶段 5 事件触发：事件记录与派发留痕
-    events:normalizeEventStore(x.events)
+    events:normalizeEventStore(x.events),
+    // 撤销留痕：旧存档缺省为空；只保留带 id 的只读副本，独立上限
+    reversedLogs:asArray(x.reversedLogs).filter(function(l){return l&&l.id;}).slice(0,REVERSED_LOG_KEEP)
   };
   const pr=wm.progress&&typeof wm.progress==='object'?wm.progress:{};
   Object.keys(pr).forEach(function(k){out.watermarks.progress[k]=normalizeWatermark(pr[k]);});
@@ -806,7 +806,11 @@ function parseState(raw){
     tasks.forEach(function(t){t.budget=normalizeBudgetBinding(t.budget,budCtx);});
     const affairs=asArray(p.affairs).filter(Boolean).map(migrateAffair);
     const chores=asArray(p.chores).filter(Boolean).map(migrateChore);
-    affairs.forEach(function(a){a.budget=normalizeBudgetBinding(a.budget,budCtx);});
+    affairs.forEach(function(a){
+      // 项目侧情境：只随转换保留，当前无消费者；旧存档缺省为空数组
+      a.tags=normalizeChoreTags(a.tags);
+      a.budget=normalizeBudgetBinding(a.budget,budCtx);
+    });
     chores.forEach(function(c){
       c.budget=normalizeBudgetBinding(c.budget,budCtx);
       c.budgetRef=normalizeBudgetRef(c.budgetRef);
@@ -845,12 +849,16 @@ function parseState(raw){
       affairUndo:(p.affairUndo&&typeof p.affairUndo==='object'&&!Array.isArray(p.affairUndo))?p.affairUndo:{},
       // B5：删除快照原样放行（条数上限由写入侧维护）；只挡明显损坏的条目
       affairDeleteUndo:asArray(p.affairDeleteUndo).filter(function(x){return x&&typeof x==='object'&&!Array.isArray(x)&&x.affair&&typeof x.affair==='object';}).slice(-5),
+      // 杂事 / 资产删除快照：与项目删除同一放行口径，写入侧维护 5 条上限
+      choreDeleteUndo:asArray(p.choreDeleteUndo).filter(function(x){return x&&typeof x==='object'&&!Array.isArray(x)&&x.chore&&typeof x.chore==='object'&&!Array.isArray(x.chore);}).slice(-5),
+      assetDeleteUndo:asArray(p.assetDeleteUndo).filter(function(x){return x&&typeof x==='object'&&!Array.isArray(x)&&x.def&&typeof x.def==='object'&&!Array.isArray(x.def);}).slice(-5),
       conversions:asArray(p.conversions).filter(function(x){return x&&typeof x==='object'&&!Array.isArray(x);}),
       products:asArray(p.products).filter(Boolean).map(function(prod){return normalizeProduct(prod,prodCtx);}),
       logs:asArray(p.logs).filter(Boolean).map(normalizeLogNums),
       loans:asArray(p.loans).filter(Boolean).map(normalizeLoanNums),
       lastDebtDate:toTs(p.lastDebtDate),
-      filterDomain:p.filterDomain||null,
+      // 筛选只接受仍存在的领域；坏存档里的失效 id 归一为「全部」
+      filterDomain:(p.filterDomain&&domains.some(function(d){return d&&d.id===p.filterDomain;}))?p.filterDomain:null,
       metrics:asArray(p.metrics).filter(Boolean),
       cards:cards,
       assetDefs:assetDefs,

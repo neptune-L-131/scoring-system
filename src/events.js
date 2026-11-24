@@ -3,16 +3,18 @@
 // 边界：
 // 1. 只定义事件对象、事件环形记录与「事件 → 流」匹配计划；不写账本。
 //    真正的执行在 event-bus.js：发起方事务提交后由 post-commit.js 触发。
-// 2. 第一期只识别打卡与购买两类事件；预算超支等留在后续阶段。
+// 2. 识别打卡、购买、杂事完成三类事件；预算超支、项目完成等留在后续阶段。
 // 3. 事件键 = 类型 + 来源记录 id，天然唯一；撤销源动作不重发事件。
+//    杂事完成：循环杂事用「本次满足的到期日」、一次性用完成时刻作来源 id。
 // 4. 本模块不 import state/normalize/flow-engine，避免把预留结构接进运行时依赖。
 import { EVENT_DEPTH_MAX, EVENT_KEEP, EVENT_MAX_FLOWS_PER_EVENT } from './constants.js';
 
-export const EVENT_KINDS = ['checkin', 'purchase'];
+export const EVENT_KINDS = ['checkin', 'purchase', 'chore.completed'];
 
 const PAYLOAD_FIELDS = {
   checkin: ['taskId', 'streak', 'cost', 'logId', 'budgetEntryId'],
   purchase: ['productId', 'tier', 'price', 'paid', 'assetPayments', 'stockAfter', 'orderId', 'budgetEntryId'],
+  'chore.completed': ['choreId', 'name', 'doneAt', 'due', 'cycleUnit'],
 };
 
 function tsOf(v) {
@@ -53,7 +55,7 @@ function normalizePayload(kind, raw) {
       if (pays.length) out[k] = pays;
       return;
     }
-    if (k === 'tier' || k === 'price' || k === 'paid' || k === 'streak' || k === 'cost' || k === 'stockAfter') {
+    if (k === 'tier' || k === 'price' || k === 'paid' || k === 'streak' || k === 'cost' || k === 'stockAfter' || k === 'doneAt' || k === 'due') {
       out[k] = numOr(v);
       return;
     }
@@ -99,6 +101,31 @@ export function makeEvent(kind, sourceId, occurredAt, payload) {
     payload: normalizePayload(kind, payload),
     results: [],
   };
+}
+
+// 一次完成的稳定来源 id：循环杂事用「本次满足的到期日」，一次性杂事用完成时刻。
+// 循环杂事同一周期即使历史被重放/反复写，也只会得到同一个事件键。
+export function choreCompletionSourceId(choreId, entry) {
+  const id = strOf(choreId);
+  if (!id) return '';
+  const due = Math.round(numOr(entry && entry.due));
+  if (due > 0) return id + ':due:' + due;
+  const ts = tsOf(entry && entry.ts);
+  return ts ? (id + ':done:' + ts) : '';
+}
+
+// 由完成历史条目构造 chore.completed 事件（只给用户手工完成的路径使用）。
+export function makeChoreCompletedEvent(chore, entry) {
+  if (!chore || !chore.id || !entry) return null;
+  const sourceId = choreCompletionSourceId(chore.id, entry);
+  if (!sourceId) return null;
+  return makeEvent('chore.completed', sourceId, tsOf(entry.ts), {
+    choreId: chore.id,
+    name: chore.name || '',
+    doneAt: tsOf(entry.ts),
+    due: Math.round(numOr(entry.due)),
+    cycleUnit: (chore.cycle && chore.cycle.unit) || '',
+  });
 }
 
 export function normalizeEvent(x) {

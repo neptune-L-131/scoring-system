@@ -1,4 +1,4 @@
-import { AFFAIR_CURVES, ASSET_LOG_CATS, ASSET_LOG_CAT_NAMES, COND_AFFAIR_METRICS, COND_ASSET_METRICS, COND_CHORE_METRICS, COND_GATE_METRICS, COND_POINT_METRICS, CURRENCIES, STAGE_NAMES, WEEK_ANCHOR_NAMES } from './constants.js';
+import { AFFAIR_CURVES, ASSET_LOG_CATS, ASSET_LOG_CAT_NAMES, COND_AFFAIR_METRICS, COND_ASSET_METRICS, COND_CHORE_METRICS, COND_ENTITY_KINDS, COND_ENTITY_METRICS, COND_ENTITY_ONLY_METRICS, COND_ENTITY_POINT_METRICS, COND_GATE_METRICS, COND_POINT_METRICS, CURRENCIES, STAGE_NAMES, WEEK_ANCHOR_NAMES } from './constants.js';
 import * as time from './time.js';
 // pure.js —— 纯函数底层（不读写全局 state、不调用 Ledger、import 时无副作用）
 // 由 utils/state/business/conditions/normalize/budget/render-work 抽离（第六轮循环依赖治理），实现逐字未改。
@@ -192,6 +192,25 @@ function condWindowByRange(range,act,ts,days){
 function validRange(r){return r==='period'||r==='total'||r==='recent'||r==='today';}
 function normOp(op){return ['>','<','<=','>='].indexOf(op)>=0?op:'>=';}
 function isPointMetric(m){return COND_POINT_METRICS.indexOf(m)>=0;}
+// ===== 单实体条件（D1）=====
+// target 形状与 entity-kit.normalizeEntityRef 一致：'kind:id'；首批只认项目/杂事。
+function parseEntityTarget(raw){
+  const s=(typeof raw==='string')?raw.trim():'';
+  const i=s.indexOf(':');
+  if(i<=0)return null;
+  const kind=s.slice(0,i);
+  const id=s.slice(i+1);
+  if(COND_ENTITY_KINDS.indexOf(kind)<0||!id||id.length>64)return null;
+  return {kind:kind,id:id};
+}
+function isEntityMetricFor(kind,metric){
+  const list=COND_ENTITY_METRICS[kind];
+  return !!list&&list.indexOf(metric)>=0;
+}
+// 实体条件下按「读实体字段/当刻状态」取值的指标；事件触发编译期拒绝。
+function isEntityPointMetric(metric){return COND_ENTITY_POINT_METRICS.indexOf(metric)>=0;}
+// 只在单实体目标下才有定义的指标：非 entity 目标下不套聚合读法。
+function isEntityOnlyMetric(metric){return COND_ENTITY_ONLY_METRICS.indexOf(metric)>=0;}
 // 资产类指标：主体是「某一份资产」；asset_hold 是事件时刻即确定的点态值
 function isAssetMetric(m){return COND_ASSET_METRICS.indexOf(m)>=0;}
 function isAssetHoldMetric(m){return m==='asset_hold';}
@@ -273,7 +292,7 @@ function migrateAffair(a){
 }
 
 
-export { uid, fmt, now, daysSince, effectiveLastTs, taskCheckedToday, fmtTime, esc, escAttr, clone, splitCents, logHasType, taskScoreTypes, taskHasType, getTaskDomainIds, round2, logAmt, stageRewards, taskIsStaged, stageValues, stageSel, stageValueAt, stageCellLabel, stageNetAt, calcCheckIn, calcSkip, dayKey, weekStartKey, weekStartTs, periodKey, dayStartTs, prevPeriodRange, condWindowByRange, validRange, normOp, isPointMetric, isAssetMetric, isAssetHoldMetric, validAssetCat, assetCatName, assetLogMeta, isAffairMetric, isChoreMetric, isStage1Metric, isGateMetric, toNum, toTs, asArray, defaultWatermark, dateKeyOffset, budgetBounds, weekAnchorName, round4, isCurrencyCode, currencyOf, historicalCurrencyOf, money, affairSteps, affairTotalSteps, affairDoneSteps, affairLastAdvance, affairCurve, affairCurveType, affairTargetAt, affairIsDone, migrateAffair };
+export { uid, fmt, now, daysSince, effectiveLastTs, taskCheckedToday, fmtTime, esc, escAttr, clone, splitCents, logHasType, taskScoreTypes, taskHasType, getTaskDomainIds, round2, logAmt, stageRewards, taskIsStaged, stageValues, stageSel, stageValueAt, stageCellLabel, stageNetAt, calcCheckIn, calcSkip, dayKey, weekStartKey, weekStartTs, periodKey, dayStartTs, prevPeriodRange, condWindowByRange, validRange, normOp, isPointMetric, parseEntityTarget, isEntityMetricFor, isEntityPointMetric, isEntityOnlyMetric, isAssetMetric, isAssetHoldMetric, validAssetCat, assetCatName, assetLogMeta, isAffairMetric, isChoreMetric, isStage1Metric, isGateMetric, toNum, toTs, asArray, defaultWatermark, dateKeyOffset, budgetBounds, weekAnchorName, round4, isCurrencyCode, currencyOf, historicalCurrencyOf, money, affairSteps, affairTotalSteps, affairDoneSteps, affairLastAdvance, affairCurve, affairCurveType, affairTargetAt, affairIsDone, migrateAffair };
 
 function idleDaysSince(baseTs,refTs){
   if(!baseTs)return null;

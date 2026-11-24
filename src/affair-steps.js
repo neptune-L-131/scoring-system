@@ -210,9 +210,13 @@ function isChoreClaimed(choreId, affairs) {
   return !!choreClaimOf(choreId, affairs);
 }
 
-// 全部被引用的杂事 id（后续 UI 用它把杂事池里的委派杂事排除）
+// 全部被引用的杂事 id（后续 UI 用它把杂事池里的委派杂事排除）。
+// 只统计「未归档」项目：项目归档后，它委派的杂事回到待办池，不再被隐藏；
+// 步骤上的 choreRef 不动，项目取消归档后下一次调用会自动恢复隐藏。
+// 注意：这里只影响「杂事池是否隐藏」，引用独占 / 冲突校验仍用 buildChoreClaimIndex 的全量口径。
 function claimedChoreIds(affairs) {
-  return new Set(buildChoreClaimIndex(affairs || state.affairs || []).keys());
+  const visible = (affairs || state.affairs || []).filter(function (a) { return !a || !a.archived; });
+  return new Set(buildChoreClaimIndex(visible).keys());
 }
 
 // 这个项目有哪些委派步骤（返回步骤本身 + 位置 + 引用）

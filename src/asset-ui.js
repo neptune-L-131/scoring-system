@@ -5,11 +5,12 @@
 // - 余额写入仍走既有账务/清空入口，这里只做资产定义的编辑与状态切换；
 // - 所有资产（含默认播种的示例）在编辑权限与操作入口上完全一致。
 import { ASSET_VERSION } from './constants.js';
+import { runCommand } from './command.js';
 import { openModal, closeModal } from './modal-host.js';
 import { markModalClean, rejectFields } from './form-contract.js';
 import { isValidAssetId } from './normalize.js';
 import { save } from './persist.js';
-import { assetLogMeta, esc, escAttr, fmt, now } from './pure.js';
+import { assetLogMeta, clone, esc, escAttr, fmt, now, uid } from './pure.js';
 import { render } from './render.js';
 import { state } from './state.js';
 import { toast } from './toast.js';
@@ -242,11 +243,12 @@ function renderAssetDefs() {
   const el = document.getElementById('assetDefsList');
   if (!el) return;
   const defs = Array.isArray(state.assetDefs) ? state.assetDefs : [];
+  const bar = assetDeleteUndoBarHTML();
   if (!defs.length) {
-    el.innerHTML = '<div class="empty" style="padding:16px"><p style="margin:0">暂无资产定义</p></div>';
+    el.innerHTML = bar + '<div class="empty" style="padding:16px"><p style="margin:0">暂无资产定义</p></div>';
     return;
   }
-  el.innerHTML = defs.map(assetRowHTML).join('');
+  el.innerHTML = bar + defs.map(assetRowHTML).join('');
 }
 
 function fieldValue(id) {
@@ -492,6 +494,96 @@ function unarchiveAssetDef(assetId) {
   return { ok: true, message: message };
 }
 
+// ===== 资产定义删除撤销 =====
+// 与项目/杂事删除同构：删除前快照定义、原下标、余额键与资产计量；
+// 余额 > 0 的删除在入口已被拒绝，因此快照里余额恒为 0，撤销恢复的是「定义 + 空余额键 + 计量」。
+const ASSET_DELETE_UNDO_LIMIT = 5;
+function assetDeleteUndoList() {
+  if (!Array.isArray(state.assetDeleteUndo)) state.assetDeleteUndo = [];
+  return state.assetDeleteUndo;
+}
+function makeAssetDeleteUndo(def) {
+  const cards = state.cards && typeof state.cards === 'object' ? state.cards : null;
+  const meters = state.ext && state.ext.assetMeters && state.ext.assetMeters.byAsset;
+  const meterHad = !!(meters && typeof meters === 'object' && Object.prototype.hasOwnProperty.call(meters, def.id));
+  return {
+    v: 1,
+    id: uid(),
+    at: now(),
+    def: clone(def),
+    index: (Array.isArray(state.assetDefs) ? state.assetDefs : []).indexOf(def),
+    cardHad: !!(cards && Object.prototype.hasOwnProperty.call(cards, def.id)),
+    cardValue: cards ? Number(cards[def.id]) || 0 : 0,
+    meterHad: meterHad,
+    meter: meterHad ? clone(meters[def.id]) : null,
+  };
+}
+function pushAssetDeleteUndo(rec) {
+  const list = assetDeleteUndoList();
+  list.push(rec);
+  while (list.length > ASSET_DELETE_UNDO_LIMIT) list.shift();
+}
+function restoreAssetDeletion(recId) {
+  const list = assetDeleteUndoList();
+  const at = list.findIndex(r => r && r.id === recId);
+  if (at < 0) return { ok: false, reason: '没有可恢复的删除记录' };
+  const rec = list[at];
+  const def = rec && rec.def;
+  if (!def || typeof def !== 'object' || Array.isArray(def) || !def.id) {
+    return { ok: false, reason: '删除记录已损坏' };
+  }
+  // 冲突校验先于任何写入：同 id 已被占用则整笔拒绝，避免覆盖现有定义。
+  if (assetDefOf(def.id)) return { ok: false, reason: '资产「' + def.id + '」已存在，无法恢复' };
+  if (!Array.isArray(state.assetDefs)) state.assetDefs = [];
+  let index = Number(rec.index);
+  if (!isFinite(index)) index = state.assetDefs.length;
+  index = Math.max(0, Math.min(Math.floor(index), state.assetDefs.length));
+  state.assetDefs.splice(index, 0, clone(def));
+  if (rec.cardHad) {
+    if (!state.cards || typeof state.cards !== 'object') state.cards = {};
+    state.cards[def.id] = Number(rec.cardValue) || 0;
+  }
+  if (rec.meterHad) {
+    const meters = state.ext && state.ext.assetMeters && state.ext.assetMeters.byAsset;
+    if (meters && typeof meters === 'object') meters[def.id] = clone(rec.meter || {});
+  }
+  list.splice(at, 1);
+  return { ok: true, id: def.id };
+}
+function assetDeleteUndoBarHTML() {
+  const list = Array.isArray(state.assetDeleteUndo) ? state.assetDeleteUndo : [];
+  const recs = list.filter(r => r && r.def).slice().reverse();
+  if (!recs.length) return '';
+  return '<div class="affair-empty affair-delete-undo"><div class="affair-delete-undo-head">最近删除 · 最多保留 5 条</div>'
+    + recs.map(function (rec) {
+      return '<div class="affair-delete-undo-row">'
+        + '<span class="affair-delete-undo-name">已删除「' + esc(rec.def.name) + '」</span>'
+        + '<button class="btn btn-sm" onclick="undoAssetDelete(\'' + rec.id + '\')">撤销删除</button>'
+        + '<button class="btn btn-sm" onclick="dismissAssetDeleteUndo(\'' + rec.id + '\')">忽略</button>'
+        + '</div>';
+    }).join('')
+    + '</div>';
+}
+function undoAssetDelete(recId) {
+  runCommand({
+    label: 'asset-delete-undo',
+    toast: '已恢复删除前的资产定义与余额',
+    run: function () { return restoreAssetDeletion(recId); },
+  });
+}
+function dismissAssetDeleteUndo(recId) {
+  runCommand({
+    label: 'asset-delete-dismiss',
+    run: function () {
+      const list = assetDeleteUndoList();
+      const i = list.findIndex(r => r && r.id === recId);
+      if (i < 0) return { ok: false, reason: '没有这条删除记录' };
+      list.splice(i, 1);
+      return { ok: true, toast: { msg: '已忽略该撤销提示' } };
+    },
+  });
+}
+
 function delAssetDef(assetId) {
   const def = assetDefOf(assetId);
   if (!def) {
@@ -500,8 +592,9 @@ function delAssetDef(assetId) {
     return r;
   }
   const balance = balanceOf(def.id);
-  if (balance > 0) {
-    const r = fail('ASSET_BALANCE_NOT_ZERO', '「' + def.name + '」仍有余额 ' + fmt(balance) + '，请先清零后再删除');
+  // 非零即拦：正余额和负余额都必须先清零（负数同样不是可删除的干净状态）。
+  if (balance !== 0) {
+    const r = fail('ASSET_BALANCE_NOT_ZERO', '「' + def.name + '」余额为 ' + fmt(balance) + '，需清零后才能删除');
     toast(r.message, 'err');
     return r;
   }
@@ -512,26 +605,34 @@ function delAssetDef(assetId) {
     toast(r.message, 'err');
     return r;
   }
-  const actRefs = refs.filter(r => r.kind === 'activity');
-  if (actRefs.length) {
-    const r = fail('ASSET_REFERENCED_BY_ACTIVITY', '「' + def.name + '」仍被 ' + actRefs.length + ' 个周期活动引用，请先从活动中移除对应动作项');
+  // 商品引用（资产定价消耗 / 购买赠送）与流引用同一口径：结构性引用一律拦。
+  // 历史流水（logs[].card）只是记账痕迹，不拦住删除。
+  const productRefs = refs.filter(r => r.kind === 'product');
+  if (productRefs.length) {
+    const r = fail('ASSET_REFERENCED_BY_PRODUCT', '「' + def.name + '」仍被 ' + productRefs.length + ' 个商品引用，请先在商品里改用其他资产或移除相关定价/赠送');
     toast(r.message, 'err');
     return r;
   }
-
-  state.assetDefs = (Array.isArray(state.assetDefs) ? state.assetDefs : []).filter(d => !d || d.id !== def.id);
-  if (state.cards && typeof state.cards === 'object') delete state.cards[def.id];
-  const meters = state.ext && state.ext.assetMeters && state.ext.assetMeters.byAsset;
-  if (meters && typeof meters === 'object') delete meters[def.id];
-  save();
-  render();
-  const message = '已删除资产「' + def.name + '」';
-  toast(message);
-  return { ok: true, message: message };
+  // 既有语义保持不变：仍有余额、被动作流引用时不允许删除。
+  // 删除与快照写入放在同一事务里，任何失败整单回滚。
+  return runCommand({
+    label: 'asset-def-del',
+    run: function () {
+      const rec = makeAssetDeleteUndo(def);
+      state.assetDefs = (Array.isArray(state.assetDefs) ? state.assetDefs : []).filter(d => !d || d.id !== def.id);
+      if (state.cards && typeof state.cards === 'object') delete state.cards[def.id];
+      const meters = state.ext && state.ext.assetMeters && state.ext.assetMeters.byAsset;
+      if (meters && typeof meters === 'object') delete meters[def.id];
+      pushAssetDeleteUndo(rec);
+      return { ok: true, toast: { msg: '已删除资产「' + def.name + '」，可在资产面板顶部撤销' } };
+    },
+  });
 }
 
 export {
   validateAssetDraft, assetReferencesOf, renderAssetDefs,
   openAssetModal, handleAssetSave, toggleAssetEnabled,
   archiveAssetDef, unarchiveAssetDef, delAssetDef,
+  undoAssetDelete, dismissAssetDeleteUndo, assetDeleteUndoBarHTML, restoreAssetDeletion,
+  ASSET_DELETE_UNDO_LIMIT,
 };

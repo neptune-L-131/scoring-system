@@ -57,7 +57,7 @@ function noteEvicted(entry){
 const SHADOW_SRC_NAMES={
   'loan-draw':'贷款放款','checkin-replay':'打卡流水重放','recalc':'历史重算','recalc-cost':'历史重算退款',
   'delete-domain':'删除领域搬运','undo-delete-domain':'撤销删除领域','delete-task':'删除任务搬运',
-  'undo-delete-task':'撤销删除任务','task-domain-migrate':'任务领域迁移','activity-revoke':'活动奖励回收',
+  'undo-delete-task':'撤销删除任务','task-domain-migrate':'任务领域迁移','activity-revoke':'动作流奖励回收',
   'exempt-use':'使用断更豁免卡','undo-exempt':'撤销豁免卡使用','undo-card-grant':'撤销卡券发放',
   'undo-cost':'撤销成本','undo-purchase':'撤销购买','undo-achievement':'撤销里程碑解锁',
   'undo-loan-repay':'撤销还贷','undo-manual-adjust':'撤销手动修正','undo-unlock':'撤销解锁',

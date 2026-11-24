@@ -252,3 +252,110 @@ describe('S8 资产定义渲染与清空数据说明', () => {
     expect(html).toContain('资产定义与动作流配置保留');
   });
 });
+
+describe('资产定义删除撤销', () => {
+  it('仍有余额时维持既有行为：拒绝删除，不产生撤销快照', () => {
+    seed({ cards: { exemption: 0, star: 5 } });
+    const r = api.delAssetDef('star');
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('ASSET_BALANCE_NOT_ZERO');
+    expect(api.getLive().assetDefs.some(d => d.id === 'star')).toBe(true);
+    expect(api.getLive().assetDeleteUndo).toEqual([]);
+  });
+
+  it('被动作流引用时维持既有行为：拒绝删除', () => {
+    seed({
+      flows: [{ id: 'f1', name: '周结流', steps: [{ id: 's1', atom: 'asset.grant', params: { assetId: 'star', amount: 1 } }] }],
+    });
+    const r = api.delAssetDef('star');
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('ASSET_REFERENCED_BY_FLOW');
+    expect(api.getLive().assetDefs.some(d => d.id === 'star')).toBe(true);
+  });
+
+  it('删除后撤销：定义、原下标、余额键与计量回到删除前状态', () => {
+    seed({ cards: { exemption: 0, star: 0 } });
+    api.patchState(s => {
+      s.logs = [{ id: 'l1', time: 1, st: 'card', card: 'star', amt: 1, assetCat: 'issue', text: '发放' }];
+      s.ext.assetMeters.byAsset.star = { issued: 1, spent: 0 };
+    });
+    expect(api.delAssetDef('star').ok).toBe(true);
+
+    const live = api.getLive();
+    expect(live.assetDefs.some(d => d.id === 'star')).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(live.cards, 'star')).toBe(false);
+    expect(live.ext.assetMeters.byAsset.star).toBeUndefined();
+    expect(live.assetDeleteUndo).toHaveLength(1);
+    const rec = live.assetDeleteUndo[0];
+    expect(rec.index).toBe(1);
+
+    expect(api.restoreAssetDeletion(rec.id).ok).toBe(true);
+    const after = api.getLive();
+    expect(after.assetDefs.map(d => d.id)).toEqual(['exemption', 'star']);
+    expect(after.cards.star).toBe(0);
+    expect(after.ext.assetMeters.byAsset.star).toEqual({ issued: 1, spent: 0 });
+    expect(after.logs[0].card).toBe('star');
+    expect(after.assetDeleteUndo).toEqual([]);
+  });
+
+  it('同 id 已被占用时恢复拒绝且零写入，快照保留', () => {
+    seed();
+    api.delAssetDef('star');
+    const rec = api.getLive().assetDeleteUndo[0];
+    api.patchState(s => { s.assetDefs.push(starDef()); });
+    const before = JSON.stringify(api.getLive().assetDefs);
+
+    const r = api.restoreAssetDeletion(rec.id);
+    expect(r.ok).toBe(false);
+    expect(JSON.stringify(api.getLive().assetDefs)).toBe(before);
+    expect(api.getLive().assetDeleteUndo).toHaveLength(1);
+  });
+
+  it('仅被历史流水引用时仍可删除，撤销后引用重新指向同一资产', () => {
+    seed();
+    api.patchState(s => {
+      s.logs = [{ id: 'l1', time: 1, st: 'card', card: 'star', amt: 1, assetCat: 'issue', text: '发放' }];
+    });
+    expect(api.delAssetDef('star').ok).toBe(true);
+    const rec = api.getLive().assetDeleteUndo[0];
+    expect(api.restoreAssetDeletion(rec.id).ok).toBe(true);
+    expect(api.getLive().assetDefs.some(d => d.id === 'star')).toBe(true);
+    expect(api.getLive().logs[0].card).toBe('star');
+  });
+
+  it('被商品引用时拒绝删除，错误码与动作流引用平行', () => {
+    seed({
+      products: [{
+        id: 'p1', name: '星星商品',
+        grants: [{ kind: 'asset', assetId: 'star', amount: 1 }],
+      }],
+    });
+    const r = api.delAssetDef('star');
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('ASSET_REFERENCED_BY_PRODUCT');
+    expect(r.message).toContain('商品');
+    expect(api.getLive().assetDefs.some(d => d.id === 'star')).toBe(true);
+  });
+
+  it('负余额同样拒绝删除，提示说明需清零', () => {
+    seed({ cards: { exemption: 0, star: -3 } });
+    const r = api.delAssetDef('star');
+    expect(r.ok).toBe(false);
+    expect(r.code).toBe('ASSET_BALANCE_NOT_ZERO');
+    expect(r.message).toContain('余额为 -3');
+    expect(r.message).toContain('需清零');
+  });
+
+  it('读档保留合法快照、丢弃损坏条目', () => {
+    const raw = api.defaults();
+    raw.assetDeleteUndo = [
+      { v: 1, id: 'u1', def: { id: 'star', name: '星星' }, index: 1 },
+      null,
+      { v: 1, id: 'u2' },
+      { v: 1, id: 'u3', def: [] },
+    ];
+    const parsed = api.parseState(JSON.stringify(raw));
+    expect(parsed.assetDeleteUndo).toHaveLength(1);
+    expect(parsed.assetDeleteUndo[0].id).toBe('u1');
+  });
+});

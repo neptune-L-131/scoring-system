@@ -10,10 +10,6 @@ export function setPostCommitHandler(fn) {
   handler = (typeof fn === 'function') ? fn : null;
 }
 
-export function hasPostCommitHandler() {
-  return !!handler;
-}
-
 export function isPostCommitDispatching() {
   return dispatching;
 }

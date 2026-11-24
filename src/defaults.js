@@ -71,12 +71,19 @@ function migrateChore(c){
     const cy=normalizeChoreCycle(c.cycle);
     if(cy)c.cycle=cy;else delete c.cycle;
   }
-  if(c.history!==undefined){
-    const hist=normalizeChoreHistory(c.history);
-    if(hist)c.history=hist;else delete c.history;
-  }
   // 标签：独立命名空间；旧存档缺省读入空数组，非法条目丢弃，不批量迁移。
   c.tags=normalizeChoreTags(c.tags);
+  if(c.history!==undefined){
+    const hist=normalizeChoreHistory(c.history);
+    if(hist){
+      // 旧完成记录没有 tags 键时，用迁移时刻的当前情境一次性反填；
+      // 已有 tags（包括空数组）一律不动，保证重复读档幂等。
+      hist.forEach(function(e){
+        if(!Object.prototype.hasOwnProperty.call(e,'tags'))e.tags=c.tags.slice();
+      });
+      c.history=hist;
+    } else delete c.history;
+  }
   return c;
 }
 
@@ -102,8 +109,6 @@ function newExtState(){
     stats:{lifetimeVitalityIn:0,lifetimeVitalityOut:0,lifetimeProgressIn:0,lifetimeProgressOut:0,lifetimeAchievementIn:0,lifetimeAchievementOut:0,totalCheckins:0,totalPurchases:0,lifetimeAchievementEarned:0,version:STATS_VERSION,lastDay:null,daily:{},invisible:{vitality:0,achievement:0,progress:{},cards:{}},evicted:{vitality:0,achievement:0,progress:{},cards:{}},updatedAt:null},
     watermarks:{vitality:defaultWatermark(),achievement:defaultWatermark(),totalProgress:defaultWatermark(),progress:{}},
     budgets:defaultBudgetsState(),
-    investment:{window:30},
-    reports:[],
     audit:[],
     activity:{},
     achievementCounted:{},
@@ -140,6 +145,9 @@ function defaults(){
     affairUndo:{},
     // 删除项目的撤销快照（B5）：只留最近几条，整笔恢复项目与被一起删除的杂事
     affairDeleteUndo:[],
+    // 删除杂事 / 资产定义的撤销快照：与项目删除同构，同样只留最近 5 条
+    choreDeleteUndo:[],
+    assetDeleteUndo:[],
     // 事项转换记录（P3）：只保留最近若干条，最后一条可撤销
     conversions:[],
     loans:[],

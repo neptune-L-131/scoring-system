@@ -600,6 +600,11 @@ html.modal-lock{overflow:hidden}
 /* 隐形变动：虚线边 + 「隐形」标签，提示不进入可见余额 */
 .ledger-row.shadow{border-left:2px dashed var(--border-2)}
 .ledger-row.shadow .log-src{border-style:dashed}
+/* 已撤销留痕：整行置灰、不可操作，仅用于回看 */
+.ledger-row.reversed{opacity:.5}
+.ledger-row.reversed .log-dot{background:var(--text-3);border-color:var(--text-3)}
+.ledger-row.reversed .log-amt{text-decoration:line-through}
+.log-rev{display:inline-block;margin-left:6px;padding:0 4px;border:1px solid var(--border-2);border-radius:4px;font-size:10px;line-height:15px;color:var(--text-3);vertical-align:1px}
 /* 事件派发失败提示：只读汇总，无失败时整块不渲染 */
 .ledger-event-fail{margin:8px;padding:8px 10px;border:1px solid rgba(214,69,69,.35);border-radius:var(--radius);background:rgba(214,69,69,.06)}
 .ledger-event-fail-head{font-size:11px;font-weight:600;color:var(--danger);margin-bottom:4px}
@@ -1101,6 +1106,18 @@ html.modal-lock{overflow:hidden}
 .chore-tag{display:inline-flex;align-items:center;gap:4px;margin-right:0;padding-right:4px}
 .chore-tag-del{border:none;background:none;color:var(--text-3);cursor:pointer;font-size:13px;line-height:1;padding:0 3px}
 .chore-tag-del:hover{color:var(--danger)}
+/* 卡片上的情境 chip：最多 3 个 + n，窄屏省略而不是撑破卡片 */
+.chore-tags{display:inline-flex;flex-wrap:wrap;gap:4px;align-items:center;min-width:0}
+.chore-tags .tag{margin-right:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chore-tag-more{white-space:nowrap}
+/* 情境候选：贴在输入框下方，点击填入，不弹新层 */
+.chore-tag-suggest{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}
+.chore-tag-sug{cursor:pointer;border:1px dashed var(--border);background:transparent;font:inherit;margin-right:0}
+.chore-tag-sug:hover{border-style:solid;color:var(--text-2)}
+/* 待办池情境筛选：有标签才出现，单行可换行，不挤压卡片 */
+.chore-tag-filter{display:flex;flex-wrap:wrap;gap:4px;margin:0 0 10px}
+.chore-tag-fbtn{cursor:pointer;border:1px solid transparent;background:var(--surface-2);color:var(--text-3);font:inherit;margin-right:0}
+.chore-tag-fbtn.on{border-color:var(--text-2);color:var(--text);font-weight:600}
 #choreDate{width:100%;font-size:14px;border-radius:var(--radius);padding:8px 11px;background:var(--surface)}
 /* 杂事经济设置 */
 .fg .cfg-inline input,.fg .cfg-tier-row input{

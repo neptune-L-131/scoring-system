@@ -176,6 +176,13 @@ describe('只读聚合视图', () => {
     const ids = api.claimedChoreIds();
     expect([...ids].sort()).toEqual(['c1', 'c2']);
   });
+
+  it('项目归档后不再隐藏其委派杂事，取消归档后恢复隐藏', () => {
+    api.patchState(s => { s.affairs[0].archived = true; });
+    expect([...api.claimedChoreIds()]).toEqual([]);
+    api.patchState(s => { s.affairs[0].archived = false; });
+    expect([...api.claimedChoreIds()].sort()).toEqual(['c1', 'c2']);
+  });
 });
 
 describe('读档与保存的读取兼容', () => {

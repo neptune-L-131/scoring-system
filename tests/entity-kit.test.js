@@ -167,3 +167,36 @@ describe('entity-kit：todayAgenda', () => {
     expect(JSON.stringify(api.getState())).toBe(before);
   });
 });
+
+describe('entity-kit：议程去重（委派步骤由其杂事代表）', () => {
+  function seedDelegated(choreExtra) {
+    api.__setClockForTest(() => at(10, 12));
+    api.resetState({
+      chores: [Object.assign({
+        id: 'c1', name: '交水费', createdAt: at(1, 9),
+        done: false, archived: false, freshDays: 5,
+      }, choreExtra || {})],
+      affairs: [{
+        id: 'a1', name: '装修', createdAt: at(1, 9), plannedAt: null, doneAt: null, archived: false,
+        steps: [{ text: '交水费', plannedAt: at(9, 10), doneAt: null, choreRef: { id: 'c1', origin: 'existing' } }],
+      }],
+    });
+  }
+
+  it('被引用的杂事会进议程时，委派步骤不再单独出现，只保留杂事', () => {
+    seedDelegated({ plannedAt: at(9, 9), freshDays: 0 }); // 已逾期 → 杂事进议程
+    const items = api.todayAgenda();
+    expect(items.some(i => i.kind === 'chore' && i.id === 'c1')).toBe(true);
+    expect(items.some(i => i.kind === 'affair' && i.id === 'a1')).toBe(false);
+    expect(items.length).toBe(1);
+  });
+
+  it('边界：杂事没有日期（不进议程）时，带 plannedAt 的委派步骤仍然出现', () => {
+    seedDelegated({ plannedAt: null, freshDays: 30 }); // 近期不逾期，且无日期
+    const items = api.todayAgenda();
+    const step = items.find(i => i.kind === 'affair' && i.id === 'a1');
+    expect(step).toBeTruthy();
+    expect(step.stepIndex).toBe(0);
+    expect(items.some(i => i.kind === 'chore' && i.id === 'c1')).toBe(false);
+  });
+});

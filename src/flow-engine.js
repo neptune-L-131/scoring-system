@@ -6,6 +6,7 @@
 // 3. 原子复用 S3 的 runFlowAtom，不新造写入路径；
 // 4. 条件不成立 = “本次未发生”：不写 lastRun、不写幂等键、不落流水，同一周期可再次求值。
 import {
+  CHORE_TAG_MAX_COUNT, CHORE_TAG_MAX_LEN,
   FLOW_ATOM_CREATE_NAME_MAX, FLOW_ATOM_IDLE_DAYS_MAX, FLOW_ATOM_MAX_ASSET, FLOW_ATOM_MAX_CREATE,
   FLOW_ATOM_MAX_CURRENCY, FLOW_ATOM_NOTE_MAX_LEN, FLOW_IDEM_KEEP, FLOW_MAX_DEPTH, FLOW_MAX_STEPS, FLOW_RUN_KEEP,
 } from './constants.js';
@@ -16,7 +17,7 @@ import { evalCondition } from './cond-eval.js';
 import { EVENT_KINDS } from './events.js';
 import { Ledger } from './ledger.js';
 import { save } from './persist.js';
-import { isPointMetric, now, periodKey, uid } from './pure.js';
+import { isEntityPointMetric, isPointMetric, now, periodKey, uid } from './pure.js';
 import { getState, setState, state } from './state.js';
 
 const STEP_ID_RE = /^[a-z][a-z0-9_]{0,15}$/;
@@ -121,7 +122,9 @@ function compile(flow) {
   if (trig.type === 'event') {
     const checkEventCond = function (when) {
       walkCondLeaves(when, function (it) {
-        if (isPointMetric(it.metric)) errors.push(cErr('FLOW_EVENT_POINT_METRIC', it.metric, 'metric'));
+        // 单实体条件里 affair_progress 等按实体累计字段取值，也属于点态，事件时刻没有稳定窗口。
+        const pointLike = (it.targetType === 'entity') ? isEntityPointMetric(it.metric) : isPointMetric(it.metric);
+        if (pointLike) errors.push(cErr('FLOW_EVENT_POINT_METRIC', it.metric, 'metric'));
         if (it.range === 'period') errors.push(cErr('FLOW_EVENT_PERIOD_RANGE', it.metric, 'range'));
       });
     };
@@ -298,6 +301,18 @@ function checkStaticParams(step, params, insideBranch, st, errors) {
     }
     if (params.count !== undefined && (!Number.isInteger(params.count) || params.count < 1 || params.count > FLOW_ATOM_MAX_CREATE)) {
       errors.push(cErr('FLOW_CREATE_LIMIT', step.id, params.count));
+    }
+    // 情境标签：只属于杂事，必须是字符串数组，条数与单条长度沿用与手建杂事相同的上限。
+    if (params.tags !== undefined) {
+      let tagsBad = params.kind !== 'chore' || !Array.isArray(params.tags);
+      if (!tagsBad) {
+        if (params.tags.length > CHORE_TAG_MAX_COUNT) tagsBad = true;
+        for (let ti = 0; ti < params.tags.length && !tagsBad; ti += 1) {
+          const t = params.tags[ti];
+          if (typeof t !== 'string' || !t.trim() || t.trim().length > CHORE_TAG_MAX_LEN) tagsBad = true;
+        }
+      }
+      if (tagsBad) errors.push(cErr('FLOW_BAD_PARAMS', step.id, 'tags'));
     }
     if (params.amount !== undefined) {
       const isRefAmount = params.amount && typeof params.amount === 'object' && !Array.isArray(params.amount) && params.amount.ref !== undefined;
@@ -795,6 +810,7 @@ function processDue(ts, silent) {
     if (r && r.ok && (!r.skipped || r.settled)) changed = true;
     results.push(r);
   });
+  // 单条流由 runFlow 以 save:'none' 执行；批量求值后只在这里落盘一次
   if (changed && !silent) save();
   return results;
 }

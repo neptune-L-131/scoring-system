@@ -242,3 +242,50 @@ describe('步骤排序与未保存保护（批次 3）', () => {
     expect(api.affairIsDirty()).toBe(false);
   });
 });
+
+describe('委派步骤行：杂事已完成的可见提示', () => {
+  it('委派杂事已完成且步骤未完成时显示提示，不写步骤 doneAt', () => {
+    seed({
+      chores: [chore('c1', { done: true, doneAt: at(2) })],
+      affairs: [affair('a1', [step({ text: '交水费', choreRef: { id: 'c1', origin: 'existing' } })])],
+    });
+    api.openAffairModal('a1');
+    const html = document.getElementById('affairSteps').innerHTML;
+    expect(html).toContain('委派的杂事已完成');
+    expect(api.getState().affairs[0].steps[0].doneAt).toBeNull();
+  });
+
+  it('边界：步骤本身已完成时不再显示提示', () => {
+    seed({
+      chores: [chore('c1', { done: true, doneAt: at(2) })],
+      affairs: [affair('a1', [step({ text: '交水费', doneAt: at(3), choreRef: { id: 'c1', origin: 'existing' } })])],
+    });
+    api.openAffairModal('a1');
+    const html = document.getElementById('affairSteps').innerHTML;
+    expect(html).not.toContain('委派的杂事已完成');
+  });
+});
+
+describe('项目归档：委派杂事回待办池并标注', () => {
+  it('归档项目的委派杂事重新出现在待办池，卡片标注「委派项目已归档」', () => {
+    seed({
+      chores: [chore('c1')],
+      affairs: [affair('a1', [step({ text: '交水费', choreRef: { id: 'c1', origin: 'existing' } })], { archived: true })],
+    });
+    api.renderChores();
+    const html = document.getElementById('chorePanel').innerHTML;
+    expect(html).toContain('data-chore-id="c1"');
+    expect(html).toContain('委派项目已归档');
+  });
+
+  it('边界：取消归档后杂事重新被隐藏', () => {
+    seed({
+      chores: [chore('c1')],
+      affairs: [affair('a1', [step({ text: '交水费', choreRef: { id: 'c1', origin: 'existing' } })], { archived: true })],
+    });
+    api.patchState(s => { s.affairs[0].archived = false; });
+    api.renderChores();
+    const html = document.getElementById('chorePanel').innerHTML;
+    expect(html).not.toContain('data-chore-id="c1"');
+  });
+});

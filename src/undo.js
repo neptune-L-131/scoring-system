@@ -1,6 +1,7 @@
 import { BudgetEngine } from './budget.js';
 import { checkAchievements } from './business.js';
 import { reverseBoundBudget } from './budget-binding.js';
+import { REVERSED_LOG_KEEP } from './constants.js';
 import { runCommand } from './command.js';
 import { noteCheckinActivity } from './gate.js';
 import { Ledger, applyCheckinGain, setReverseHandler } from './ledger.js';
@@ -436,6 +437,33 @@ const UNDO_ADAPTERS={
   }}
 };
 
+// 撤销留痕：把本次撤销从主账本移除的「可见」流水另存一份只读副本，供银行流水灰显。
+// 账务、统计与 state.logs 完全不受影响（账务恢复仍走原有逻辑）；副本按 id 去重，独立上限。
+// 撤销留痕：本次撤销从主账本删掉的行（含整单撤销的联动腿）各留一份只读副本，
+// 供流水面板显示「已撤销」并置灰。旁挂 state.ext.reversedLogs，不动 state.logs。
+// 上限 REVERSED_LOG_KEEP，按 id 幂等，不参与账务/统计。撤销期间的反向补账都是隐形
+// 流水（不进 state.logs），因此这里只会看到“被删掉的行”，不会把容量裁剪误标成撤销。
+function archiveReversedLogs(before,reversedAt){
+  const ext=state.ext;
+  if(!ext||typeof ext!=='object')return;
+  const alive=new Set();
+  (state.logs||[]).forEach(function(l){if(l&&l.id)alive.add(l.id);});
+  let bucket=Array.isArray(ext.reversedLogs)?ext.reversedLogs:(ext.reversedLogs=[]);
+  const known=new Set();
+  bucket.forEach(function(l){if(l&&l.id)known.add(l.id);});
+  let changed=false;
+  (before||[]).forEach(function(l){
+    if(!l||!l.id||l.visible===false)return;
+    if(alive.has(l.id)||known.has(l.id))return; // 幂等：同一条日志只留一份
+    known.add(l.id);
+    const copy=clone(l);
+    copy.reversedAt=reversedAt;
+    bucket.unshift(copy);
+    changed=true;
+  });
+  if(changed&&bucket.length>REVERSED_LOG_KEEP)bucket.length=REVERSED_LOG_KEEP;
+}
+
 function undoLog(logId){
   const log=state.logs.find(l=>l.id===logId);
   if(!log)return runCommand({reject:{reason:'missing',toast:{msg:'记录不存在',type:'err'}}});
@@ -450,10 +478,13 @@ function undoLog(logId){
     },
     onFail:function(err){console.warn('undo aborted',logId,err);},
     run:function(){
-      const ad=Object.prototype.hasOwnProperty.call(UNDO_ADAPTERS,log.src)?UNDO_ADAPTERS[log.src]:null;
-      if(!ad)return;
+      const before=(state.logs||[]).slice();
+      const reversedAt=now();
+      const ad=UNDO_ADAPTERS[log.src];
       // 适配器返回 false：内层已处理并完成收尾（如 cost → 父打卡）
-      if(ad.reverse(log,{undo:undoLog})===false)return;
+      const adResult=ad.reverse(log,{undo:undoLog});
+      archiveReversedLogs(before,reversedAt);
+      if(adResult===false)return;
       // 撤销里程碑解锁本身不能再触发重新解锁（否则点数与日志会被立刻补回来）
       if(log.src!=='achievement')checkAchievements();
       processDailyTaskDebts(true);

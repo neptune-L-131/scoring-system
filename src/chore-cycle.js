@@ -8,13 +8,15 @@
 //     anchor  首个到期日（本地零点时间戳）
 //     nextDue 下一次到期日；完成时推进到严格晚于完成日的下一个格点
 //     lastDue 最近一次被完成所满足的到期日（0 表示还没有完成记录）
-//   c.history = [{ ts:完成时刻, due:这次完成满足的到期日(一次性为 0), settled:是否已进批次 }]
+//   c.history = [{ ts:完成时刻, due:这次完成满足的到期日(一次性为 0), settled:是否已进批次,
+//                  tags:完成时刻的情境快照(旧条目可能缺失) }]
 //
 // 语义（用户已拍板）：
 // 1) 只留最近一次：错过多个周期只推进到未来第一个格点，不生成多张待办。
 // 2) 到期那天才重新出现：完成等待期内 done=true；今天 >= nextDue 即重新待办。
 // 3) “今天做没做”看本周期内有没有完成（history 中 due===lastDue 的记录），不看完成时间。
 import { addDays, addMonths, dayDiff, dayStart, now } from './time.js';
+import { normalizeChoreTags } from './chore-list.js';
 
 const CYCLE_UNITS = ['day', 'week', 'month'];
 
@@ -38,6 +40,8 @@ function normalizeChoreCycle(raw) {
 }
 
 // 完成历史守卫：非数组视为“没有历史”（返回 null，调用方不写回）；坏条目丢弃。
+// tags 只在原本是数组时保留（空数组是有效快照）；键存在但形状非法时记为 []，
+// 以区别于“旧条目根本没有 tags 键”，避免读档时被误反填。
 function normalizeChoreHistory(list) {
   if (!Array.isArray(list)) return null;
   const out = [];
@@ -45,7 +49,10 @@ function normalizeChoreHistory(list) {
     if (!e || typeof e !== 'object') return;
     const ts = Number(e.ts);
     if (!isFinite(ts) || ts <= 0) return;
-    out.push({ ts: ts, due: toDayTs(e.due), settled: e.settled === true });
+    const item = { ts: ts, due: toDayTs(e.due), settled: e.settled === true };
+    if (Array.isArray(e.tags)) item.tags = normalizeChoreTags(e.tags);
+    else if ('tags' in e) item.tags = [];
+    out.push(item);
   });
   return out;
 }
@@ -125,7 +132,7 @@ function choreMarkCompletion(c, ts) {
     if (choreDoneInCycle(c, at)) return false;
     const hist = Array.isArray(c.history) ? c.history : [];
     const due = cy.nextDue;
-    hist.push({ ts: at, due: due, settled: false });
+    hist.push({ ts: at, due: due, settled: false, tags: Array.isArray(c.tags) ? c.tags.slice() : [] });
     c.history = hist;
     cy.lastDue = due;
     cy.nextDue = choreCycleDueAfter(cy, at);
@@ -138,7 +145,7 @@ function choreMarkCompletion(c, ts) {
   c.done = true;
   c.doneAt = at;
   const hist = Array.isArray(c.history) ? c.history : [];
-  hist.push({ ts: at, due: 0, settled: false });
+  hist.push({ ts: at, due: 0, settled: false, tags: Array.isArray(c.tags) ? c.tags.slice() : [] });
   c.history = hist;
   return true;
 }

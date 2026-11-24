@@ -20,6 +20,66 @@ const chore = id => api.getState().chores.find(c => c.id === id);
 beforeEach(() => seed([]));
 afterAll(() => api.__setClockForTest(null));
 
+describe('完成历史的情境快照', () => {
+  it('完成时写入当时情境；之后改标签不回溯改写历史', () => {
+    seed([{ id: 't1', name: '循环', tags: ['电脑'], cycle: { unit: 'day', interval: 1, anchor: at(9) }, history: [] }]);
+    const c = api.getLive().chores[0];
+    expect(api.choreMarkCompletion(c, at(10, 12))).toBe(true);
+    expect(c.history[0].tags).toEqual(['电脑']);
+    c.tags = ['电话'];
+    expect(c.history[0].tags).toEqual(['电脑']);
+  });
+
+  it('取消完成时快照随末条一起弹出', () => {
+    seed([{ id: 't2', name: '循环', tags: ['电脑'], cycle: { unit: 'day', interval: 1, anchor: at(9) }, history: [] }]);
+    const c = api.getLive().chores[0];
+    api.choreMarkCompletion(c, at(10, 12));
+    expect(api.choreUndoCompletion(c)).toBe(true);
+    expect(c.history).toEqual([]);
+  });
+
+  it('migrateChore 只对缺失 tags 键的旧条目反填，且幂等', () => {
+    const raw = {
+      id: 'legacy', name: '旧循环', tags: ['电脑'],
+      history: [{ ts: at(1, 10), due: at(1), settled: false }],
+    };
+    const once = api.migrateChore(JSON.parse(JSON.stringify(raw)));
+    expect(once.history[0].tags).toEqual(['电脑']);
+    const twice = api.migrateChore(JSON.parse(JSON.stringify(once)));
+    expect(twice.history).toEqual(once.history);
+  });
+
+  it('读档路径反填一次即可：parseState 往返两次不再变化', () => {
+    seed([{ id: 'p1', name: '循环', tags: ['电脑'], cycle: { unit: 'day', interval: 1, anchor: at(9) }, history: [{ ts: at(1, 10), due: at(1), settled: false }] }]);
+    const raw = JSON.parse(JSON.stringify(api.getState()));
+    delete raw.chores[0].history[0].tags;
+    const once = api.parseState(JSON.stringify(raw));
+    const onceHist = once.chores.find(c => c.id === 'p1').history;
+    expect(onceHist[0].tags).toEqual(['电脑']);
+    const twice = api.parseState(JSON.stringify(once));
+    expect(twice.chores.find(c => c.id === 'p1').history).toEqual(onceHist);
+  });
+
+  it('键存在但为空数组视为有效快照，不被反填', () => {
+    const c = api.migrateChore({
+      id: 'blank', name: '旧循环', tags: ['电脑'],
+      history: [{ ts: at(1, 10), due: at(1), settled: false, tags: [] }],
+    });
+    expect(c.history[0].tags).toEqual([]);
+  });
+
+  it('当前情境为空时反填为空数组，仍然幂等', () => {
+    const raw = {
+      id: 'empty', name: '旧循环', tags: [],
+      history: [{ ts: at(1, 10), due: at(1), settled: false }],
+    };
+    const once = api.migrateChore(JSON.parse(JSON.stringify(raw)));
+    expect(once.history[0].tags).toEqual([]);
+    const twice = api.migrateChore(JSON.parse(JSON.stringify(once)));
+    expect(twice.history).toEqual(once.history);
+  });
+});
+
 describe('形状守卫：缺字段按一次性读入', () => {
   it('旧杂事没有 cycle/history 时不补字段、不报错', () => {
     const c = api.migrateChore({ id: 'x', name: '旧杂事', done: false });
@@ -42,7 +102,7 @@ describe('形状守卫：缺字段按一次性读入', () => {
       history: [{ ts: at(1, 10), due: at(1, 9), settled: false }, null, { ts: 0 }],
     });
     expect(c.cycle).toMatchObject({ unit: 'day', interval: 2, anchor: at(1), nextDue: at(5), lastDue: 0 });
-    expect(c.history).toEqual([{ ts: at(1, 10), due: at(1), settled: false }]);
+    expect(c.history).toEqual([{ ts: at(1, 10), due: at(1), settled: false, tags: [] }]);
   });
 
   it('一次性杂事完成/取消沿用原 done 标记', () => {

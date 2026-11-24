@@ -13,6 +13,54 @@ function normalizeChoreTag(raw) {
   return s;
 }
 
+// 情境键：判重 / 筛选 / 条件匹配的唯一口径。
+// 忽略前导 @ 与大小写，但存储永远保留用户原文；只有 @ 时回退为去空白后的小写原文。
+function choreTagKey(raw) {
+  if (typeof raw !== 'string') return '';
+  const s = raw.trim();
+  if (!s) return '';
+  const stripped = s.replace(/^@+/, '').trim().toLowerCase();
+  return stripped || s.toLowerCase();
+}
+
+// 两个标签是否指向同一情境（按键比较，不看原样拼写）。
+function choreTagMatches(a, b) {
+  const key = choreTagKey(a);
+  return !!key && key === choreTagKey(b);
+}
+
+// 数组里是否已有指向同一情境的标签（忽略 @ 与大小写）。
+function choreTagIncludes(tags, tag) {
+  return (Array.isArray(tags) ? tags : []).some(function(t){ return choreTagMatches(t, tag); });
+}
+
+// 汇总已使用的情境：按情境键聚合，label 取首次出现的原样拼写。
+// 排序：使用次数降序 → 首次出现顺序升序；用于输入补全与池内筛选。
+function collectChoreTags(chores, opts){
+  const includeArchived = !opts || opts.includeArchived !== false;
+  const map = new Map();
+  let order = 0;
+  (Array.isArray(chores) ? chores : []).forEach(function(c){
+    if(!c) return;
+    if(!includeArchived && c.archived) return;
+    const list = Array.isArray(c.tags) ? c.tags : [];
+    list.forEach(function(t){
+      const key = choreTagKey(t);
+      if(!key) return;
+      let item = map.get(key);
+      if(!item){
+        item = { key: key, label: String(t).trim(), count: 0, firstIndex: order };
+        order += 1;
+        map.set(key, item);
+      }
+      item.count += 1;
+    });
+  });
+  const out = Array.from(map.values());
+  out.sort(function(a, b){ return b.count - a.count || a.firstIndex - b.firstIndex; });
+  return out;
+}
+
 // 标签数组归一：旧存档缺省读入 []；非法条目丢弃；trim 后完全相同即视为重复。
 // 超出条数上限的部分丢弃，不迁移、不补齐。
 function normalizeChoreTags(raw) {
@@ -113,6 +161,7 @@ function sortChoresByOrder(list, order, fallback) {
 }
 
 export {
+  choreTagKey, choreTagMatches, choreTagIncludes, collectChoreTags,
   normalizeChoreTag, normalizeChoreTags, normalizeChoreOrder, reconcileChoreOrder,
   choreOrderInsert, choreOrderRemove, choreOrderMove, sortChoresByOrder,
 };

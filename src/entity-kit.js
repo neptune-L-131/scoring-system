@@ -1,4 +1,5 @@
 import { affairLastAdvance, affairSteps, effectiveLastTs, getTaskDomainIds, taskCheckedToday } from './pure.js';
+import { stepChoreRef } from './affair-steps.js';
 import { choreCycleOf, choreDoneInCycle, choreHistoryOf, choreIsCyclic } from './chore-cycle.js';
 import { state } from './state.js';
 import { addDays, dayStart, now } from './time.js';
@@ -207,6 +208,25 @@ function todayAgenda(opts) {
     });
   });
 
+  // 先算出「会进议程的杂事」：委派步骤是否去重，取决于它引用的杂事是否会各自出现在议程里。
+  // 一个动作只出现一次——杂事进议程时由它代表委派步骤；杂事没有日期（不进议程）时步骤照常出现。
+  const choreItems = [];
+  (state.chores || []).forEach(function (c) {
+    if (!c || c.archived || choreDoneInCycle(c, ts)) return;
+    const cy = choreCycleOf(c);
+    const dueDay = cy ? dayStart(cy.nextDue) : (c.plannedAt ? dayStart(c.plannedAt) : null);
+    const dueAt = cy ? cy.nextDue : (c.plannedAt || null);
+    const overdue = choreOverdueDays(c, ts) > 0;
+    const dueToday = dueDay !== null && dueDay === today;
+    if (!overdue && !dueToday) return;
+    choreItems.push({
+      kind: 'chore', id: c.id, title: String(c.name || ''), subtitle: '',
+      status: 'todo', dueAt: dueAt, overdue: overdue,
+      bucket: overdue ? 'overdue' : 'today', domainIds: [],
+    });
+  });
+  const shownChoreIds = new Set(choreItems.map(function (it) { return it.id; }));
+
   (state.affairs || []).forEach(function (a) {
     if (!a || a.doneAt || a.archived) return;
     const steps = affairSteps(a);
@@ -215,6 +235,8 @@ function todayAgenda(opts) {
     if (timed.length) {
       timed.forEach(function (u) {
         if (u.ts >= tomorrow) return;
+        const ref = stepChoreRef(u.step);
+        if (ref && shownChoreIds.has(ref.id)) return; // 委派步骤由杂事代表，避免同一个动作出现两次
         out.push({
           kind: 'affair', id: a.id, title: String(u.step.text || ''),
           subtitle: String(a.name || ''), status: 'todo', stepIndex: u.index,
@@ -234,20 +256,7 @@ function todayAgenda(opts) {
     }
   });
 
-  (state.chores || []).forEach(function (c) {
-    if (!c || c.archived || choreDoneInCycle(c, ts)) return;
-    const cy = choreCycleOf(c);
-    const dueDay = cy ? dayStart(cy.nextDue) : (c.plannedAt ? dayStart(c.plannedAt) : null);
-    const dueAt = cy ? cy.nextDue : (c.plannedAt || null);
-    const overdue = choreOverdueDays(c, ts) > 0;
-    const dueToday = dueDay !== null && dueDay === today;
-    if (!overdue && !dueToday) return;
-    out.push({
-      kind: 'chore', id: c.id, title: String(c.name || ''), subtitle: '',
-      status: 'todo', dueAt: dueAt, overdue: overdue,
-      bucket: overdue ? 'overdue' : 'today', domainIds: [],
-    });
-  });
+  choreItems.forEach(function (it) { out.push(it); });
 
   // 逾期优先，其次按到期时间（无到期时间排后），最后按标题稳定排序
   out.sort(function (a, b) {

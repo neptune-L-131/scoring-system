@@ -1,6 +1,6 @@
 import { ACTIVITY_MAX_DAYS, COND_METRIC_KEYS } from './constants.js';
 import { defaultProductGate } from './defaults.js';
-import { normOp, toNum, validRange } from './pure.js';
+import { normOp, parseEntityTarget, toNum, validRange } from './pure.js';
 // cond-model.js —— 条件模型底层：归一化、展示文案、门槛条件推导
 // 由 normalize/cycle/gate 抽离（第六轮循环依赖治理），实现逐字未改。
 
@@ -13,7 +13,16 @@ function normalizeCondItem(it){
   if(!it||!validRange(it.range)||COND_METRIC_KEYS.indexOf(it.metric)<0)return null;
   const o={range:it.range,metric:it.metric,op:normOp(it.op),value:Number(it.value)||0};
   if(it.range==='recent')o.days=Math.max(1,Math.round(Number(it.days)||7));
-  o.targetType=(it.targetType==='task'||it.targetType==='domain'||it.targetType==='milestone'||it.targetType==='budget'||it.targetType==='asset')?it.targetType:'all';
+  o.targetType=(it.targetType==='task'||it.targetType==='domain'||it.targetType==='milestone'||it.targetType==='budget'||it.targetType==='asset'||it.targetType==='tag'||it.targetType==='entity')?it.targetType:'all';
+  if(o.targetType==='entity'){
+    // 单实体目标是软引用：形状合法才保留，非法形状保持 entity + 空目标（求值 fail-closed），
+    // 不静默降级成 all —— 那会改变规则语义且用户看不见。
+    const ref=parseEntityTarget(it.target);
+    o.target=ref?(ref.kind+':'+ref.id):'';
+    o.newFilter='none';
+    o.aggregate='sum';
+    return o;
+  }
   o.target=(o.targetType==='all')?'':(it.target||'');
   o.newFilter=(it.newFilter==='new_task'||it.newFilter==='new_domain')?it.newFilter:'none';
   o.aggregate=(it.aggregate==='any')?'any':'sum';

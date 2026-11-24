@@ -330,3 +330,86 @@ describe('S9 刷新归一化：配置与历史都在', () => {
     expect(rec.status).toBe('active');
   });
 });
+
+describe('删除动作流：配置与运行/去重记录一起清理', () => {
+  function seedFlow() {
+    seed({
+      flows: [{
+        v: 1, id: 'f1', name: '周结流', enabled: false,
+        trigger: { type: 'manual' }, condition: { mode: 'all', items: [] },
+        limits: {}, steps: [{ id: 's1', atom: 'log.note', params: { text: '记录' } }],
+      }],
+    });
+    api.patchState(s => {
+      s.ext.flowRuns = {
+        v: 1, seq: 2,
+        byId: { r1: { id: 'r1', flowId: 'f1' }, r2: { id: 'r2', flowId: 'other' } },
+        recent: ['r1', 'r2'],
+      };
+      s.ext.assetMeters.idem = {
+        'f1@manual@1': { flowId: 'f1', at: 1 },
+        'other@manual@2': { flowId: 'other', at: 2 },
+      };
+    });
+  }
+
+  it('删除后清掉该流的运行记录与去重键，其它流不受影响', () => {
+    seedFlow();
+    api.renderFlowPanel();
+    expect(document.getElementById('flowList').innerHTML).toContain('delFlow(');
+    expect(api.delFlow('f1').ok).toBe(true);
+    const s = api.getState();
+
+    expect(s.flows).toEqual([]);
+    expect(s.ext.flowRuns.byId.r1).toBeUndefined();
+    expect(s.ext.flowRuns.byId.r2).toBeDefined();
+    expect(s.ext.flowRuns.recent).toEqual(['r2']);
+    expect(s.ext.assetMeters.idem['f1@manual@1']).toBeUndefined();
+    expect(s.ext.assetMeters.idem['other@manual@2']).toBeDefined();
+  });
+
+  it('二次确认文案说明会连带删除运行记录与去重记录；取消则不删', () => {
+    seedFlow();
+    const old = globalThis.confirm;
+    let msg = '';
+    globalThis.confirm = m => { msg = m; return false; };
+    try {
+      expect(api.delFlow('f1').ok).toBe(false);
+    } finally {
+      globalThis.confirm = old;
+    }
+    expect(msg).toContain('运行记录');
+    expect(msg).toContain('去重');
+    expect(api.getState().flows).toHaveLength(1);
+  });
+
+  it('编辑弹窗只在已有流时显示删除按钮', () => {
+    seedFlow();
+    api.openFlowModal('f1');
+    expect(document.getElementById('flowDeleteBtn').style.display).toBe('');
+    api.openFlowModal();
+    expect(document.getElementById('flowDeleteBtn').style.display).toBe('none');
+  });
+});
+
+describe('entity.create 情境标签：编辑器与保存', () => {
+  it('sanitizeFlowSteps 保留标签数组并按同一守卫归一', () => {
+    const out = api.sanitizeFlowSteps([{
+      id: 's1', atom: 'entity.create',
+      params: { kind: 'chore', name: '杂事', tags: [' @电脑 ', '@电脑', ''] },
+    }]);
+    expect(out[0].params.tags).toEqual(['@电脑']);
+  });
+
+  it('编辑器逗号输入写入数组，保存后落盘', () => {
+    api.openFlowModal();
+    setVal('flowName', '标签流');
+    api.flowStepAtomChanged('0', 'entity.create');
+    api.flowStepParamChanged('0', 'kind', 'chore');
+    api.flowStepParamChanged('0', 'name', '带情境杂事');
+    api.flowStepParamChanged('0', 'tags', '@电脑, @阅读');
+    const r = api.handleFlowSave();
+    expect(r.ok).toBe(true);
+    expect(api.getState().flows[0].steps[0].params.tags).toEqual(['@电脑', '@阅读']);
+  });
+});

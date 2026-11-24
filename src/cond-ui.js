@@ -1,7 +1,8 @@
 import { BudgetEngine } from './budget.js';
-import { COND_RANGES } from './constants.js';
-import { COND_AGGREGATES, COND_METRICS, COND_NEW_FILTERS, COND_TARGET_TYPES, condNewFilterOptions, condTargetTypesFor, metricLabel, opLabel, rangeLabel } from './cycle.js';
-import { isAssetHoldMetric, isAssetMetric, isGateMetric, isPointMetric, isStage1Metric, esc, fmt } from './pure.js';
+import { COND_ENTITY_KINDS, COND_RANGES } from './constants.js';
+import { COND_AGGREGATES, COND_METRICS, COND_NEW_FILTERS, COND_TARGET_TYPES, condNewFilterOptions, condTargetTypesFor, isChoreTagMetric, metricLabel, opLabel, rangeLabel } from './cycle.js';
+import { isAssetHoldMetric, isAssetMetric, isEntityMetricFor, isEntityOnlyMetric, isEntityPointMetric, isGateMetric, isPointMetric, isStage1Metric, parseEntityTarget, esc, escAttr, fmt } from './pure.js';
+import { collectChoreTags } from './chore-list.js';
 import { state } from './state.js';
 import { toast } from './toast.js';
 // cond-ui.js —— 条件芯片编辑器与点选浮层
@@ -9,11 +10,18 @@ import { toast } from './toast.js';
 
 let condDraft={mode:'all',items:[]};
 let condDraftUI={box:'activityCondItems',previewId:'condPreview',previewFn:null,afterChange:null};
-let condPanel={visible:false,kind:'metric',path:'',step:'range',range:'period',days:7,metric:'checkins',targetType:'all',newFilter:'none',target:'',aggregate:'sum'};
+let condPanel={visible:false,kind:'metric',path:'',step:'range',range:'period',days:7,metric:'checkins',targetType:'all',newFilter:'none',target:'',aggregate:'sum',entityKind:''};
 // 事件触发模式：条件编辑器提前禁用点态指标与「本周期」范围（与编译期拒绝保持一致）
 let condEventMode=false;
 export function setCondEventMode(v){condEventMode=!!v;}
 export function isCondEventMode(){return condEventMode;}
+// 能力开关：entity 目标只在动作流条件里可选。
+// 所有入口都经过 setCondDraftContext / resetCondDraftUI，能力在这里统一复位为关闭；
+// 只有动作流绑定后再显式调用 setCondEntityAllowed(true)，因此预算规则、商品/里程碑门槛
+// 不需要各自写过滤逻辑，也拿不到 entity 目标。
+let condAllowEntity=false;
+export function setCondEntityAllowed(v){condAllowEntity=!!v;}
+export function isCondEntityAllowed(){return condAllowEntity;}
 export function refreshCondPanel(){
   if(condPanel&&condPanel.visible){renderCondPanel();positionCondPanel(condPanel.anchor);}
 }
@@ -101,9 +109,12 @@ function renderCondTree(){
 function setCondDraftContext(draft,box,previewId,previewFn,afterChange){
   condDraft=draft;
   condDraftUI={box:box,previewId:previewId,previewFn:previewFn||null,afterChange:afterChange||null};
+  // 入口隔离：每次绑定新入口先关闭 entity 能力，动作流随后显式打开
+  condAllowEntity=false;
 }
 function resetCondDraftUI(){
   condDraftUI={box:'',previewId:'',previewFn:null,afterChange:null};
+  condAllowEntity=false;
 }
 // 事件模式下新增条件默认「今天」，避免一加就落在不可用的「本周期」上
 function defaultCondLeaf(){return {range:condEventMode?'today':'period',metric:'checkins',op:'>=',value:1,targetType:'all'};}
@@ -187,15 +198,21 @@ function renderCondPanel(){
     if(condEventMode)html+='<div class="cp-note">事件触发不能使用点态指标（如任务闲置、周期状态）：这些值只在当前时刻快照中有意义，事件发生后无法复现。</div>';
     html+='<div class="cp-opts">';
     COND_METRICS.forEach(m=>{
+      // 能力关闭的入口（预算规则 / 商品门槛）不暴露只在单实体目标下才成立的指标
+      if(isEntityOnlyMetric(m.v)&&!condAllowEntity)return;
       const blocked=condEventMode&&isPointMetric(m.v);
       html+='<button class="cp-opt"'+(blocked?' disabled title="事件触发不能用点态指标"':' onclick="pickCondMetric(\''+m.v+'\')"')+'>'+m.n+(blocked?'（事件不可用）':'')+'</button>';
     });
     html+='</div>';
   }else if(p.step==='targetType'){
-    html='<div class="cp-title">统计主体</div><div class="cp-opts">';
-    condTargetTypesFor(p.metric).forEach(tt=>{
+    const entityPointBlocked=condEventMode&&isEntityPointMetric(p.metric);
+    html='<div class="cp-title">统计主体</div>';
+    if(entityPointBlocked)html+='<div class="cp-note">事件触发按事件发生时刻求值，单个事项的点态指标（如项目进度值）无法稳定复现；请改用周期触发或手动执行。</div>';
+    html+='<div class="cp-opts">';
+    condTargetTypesFor(p.metric,condAllowEntity).forEach(tt=>{
       const n=(COND_TARGET_TYPES.find(x=>x.v===tt)||{}).n||tt;
-      html+='<button class="cp-opt" onclick="pickCondTargetType(\''+tt+'\')">'+n+'</button>';
+      const blocked=entityPointBlocked&&tt==='entity';
+      html+='<button class="cp-opt"'+(blocked?' disabled title="事件触发不能用单个事项的点态指标"':' onclick="pickCondTargetType(\''+tt+'\')"')+'>'+n+(blocked?'（事件不可用）':'')+'</button>';
     });
     html+='</div>';
   }else if(p.step==='newFilter'){
@@ -240,6 +257,39 @@ function renderCondPanel(){
     });
     html+='</div>';
     if(!(state.assetDefs||[]).length)html+='<div class="cp-note">还没有自定义资产</div>';
+  }else if(p.step==='tag'){
+    const tags=collectChoreTags(state.chores,{includeArchived:true});
+    html='<div class="cp-title">选择情境</div>';
+    html+='<div class="cp-note">'+(p.metric==='chore_tag_overdue'
+      ?'点态指标：统计当前仍超期且带该情境的杂事；事件触发不可用。'
+      :'与「杂事完成数」同一窗口口径；升级前的旧完成记录按升级时的情境归属，之后新增的情境不回溯。')+'</div>';
+    html+='<div class="cp-opts">';
+    tags.forEach(it=>{
+      html+='<button class="cp-opt" onclick="pickCondTag(this.dataset.key)" data-key="'+escAttr(it.key)+'">'+esc(it.label)+'</button>';
+    });
+    html+='</div>';
+    if(!tags.length)html+='<div class="cp-note">还没有任何情境。先给杂事添加情境后再回来。</div>';
+  }else if(p.step==='entityKind'){
+    const kinds=COND_ENTITY_KINDS.filter(k=>isEntityMetricFor(k,p.metric));
+    html='<div class="cp-title">选择事项类型</div><div class="cp-opts">';
+    kinds.forEach(k=>{
+      html+='<button class="cp-opt" onclick="pickCondEntityKind(\''+k+'\')">'+(k==='affair'?'项目':'杂事')+'</button>';
+    });
+    html+='</div>';
+    if(!kinds.length)html+='<div class="cp-note">当前指标不支持按单个事项统计。</div>';
+  }else if(p.step==='entity'){
+    const kind=p.entityKind==='chore'?'chore':'affair';
+    const word=kind==='affair'?'项目':'杂事';
+    const list=condEntityCandidates(kind);
+    html='<div class="cp-title">选择'+word+'</div>';
+    html+='<div class="cp-note">只列出未归档的'+word+'；已归档的不参与新条件选择。</div>';
+    html+='<div class="cp-opts">';
+    list.forEach(x=>{
+      const done=kind==='affair'?!!x.doneAt:!!x.done;
+      html+='<button class="cp-opt" onclick="pickCondEntity(this.dataset.ref)" data-ref="'+escAttr(kind+':'+x.id)+'">'+esc(String(x.name||x.id))+(done?'（已完成）':'')+'</button>';
+    });
+    html+='</div>';
+    if(!list.length)html+='<div class="cp-note">还没有可选的'+word+'。</div>';
   }else if(p.step==='aggregate'){
     html='<div class="cp-title">聚合方式</div><div class="cp-opts">';
     COND_AGGREGATES.forEach(a=>{
@@ -254,12 +304,13 @@ function renderCondPanel(){
 }
 function openCondMetricPanel(path,anchor){
   const it=condNodeAt(path)||{range:'period',metric:'checkins',op:'>=',value:1,targetType:'all',newFilter:'none',target:'',aggregate:'sum'};
-  condPanel={visible:true,kind:'metric',path:path,anchor:anchor,step:(isPointMetric(it.metric)||isAssetHoldMetric(it.metric))?'metric':'range',range:it.range||'period',days:it.days||7,metric:it.metric||'checkins',targetType:it.targetType||'all',newFilter:it.newFilter||'none',target:it.target||'',aggregate:it.aggregate||'sum'};
+  const existingEnt=parseEntityTarget(it.target);
+  condPanel={visible:true,kind:'metric',path:path,anchor:anchor,step:(isPointMetric(it.metric)||isAssetHoldMetric(it.metric)||(it.targetType==='entity'&&isEntityPointMetric(it.metric)))?'metric':'range',range:it.range||'period',days:it.days||7,metric:it.metric||'checkins',targetType:it.targetType||'all',newFilter:it.newFilter||'none',target:it.target||'',aggregate:it.aggregate||'sum',entityKind:(it.targetType==='entity'&&existingEnt)?existingEnt.kind:''};
   renderCondPanel();
   positionCondPanel(anchor);
 }
 function openCondOpPanel(path,anchor){
-  condPanel={visible:true,kind:'op',path:path,anchor:anchor,step:'range',range:'period',days:7,metric:'checkins',targetType:'all',newFilter:'none',target:'',aggregate:'sum'};
+  condPanel={visible:true,kind:'op',path:path,anchor:anchor,step:'range',range:'period',days:7,metric:'checkins',targetType:'all',newFilter:'none',target:'',aggregate:'sum',entityKind:''};
   renderCondPanel();
   positionCondPanel(anchor);
 }
@@ -293,6 +344,26 @@ function pickCondMetric(metric){
     positionCondPanel(condPanel.anchor);
     return;
   }
+  // 情境指标：主体固定为情境，必须在「阶段 1 单主体直达」之前拦截
+  if(isChoreTagMetric(metric)){
+    condPanel.targetType='tag';
+    if(metric==='chore_tag_overdue')condPanel.range='today';
+    condPanel.step='tag';
+    renderCondPanel();
+    positionCondPanel(condPanel.anchor);
+    return;
+  }
+  // 实体专属指标：候选集只有 entity。同样必须在「阶段 1 单主体直达」之前拦截，
+  // 否则 B6 的短路会把它提交成 targetType:'all'（实体语义直接丢失）。
+  if(isEntityOnlyMetric(metric)){
+    if(!condAllowEntity){toast('当前入口不支持按单个事项统计','warn');return;}
+    condPanel.targetType='entity';
+    if(isPointMetric(metric))condPanel.range='today';
+    condPanel.step='entityKind';
+    renderCondPanel();
+    positionCondPanel(condPanel.anchor);
+    return;
+  }
   // 阶段 3 门槛指标：点态无窗口；里程碑/预算分类需要先选实体
   if(isGateMetric(metric)){
     if(metric==='lifetime_achievement'){condPanel.range='total';commitCondValue('all','','none','sum');return;}
@@ -305,10 +376,13 @@ function pickCondMetric(metric){
     positionCondPanel(condPanel.anchor);
     return;
   }
-  // 阶段 1 指标没有「新增筛选 / 聚合」概念：按主体类型直达
+  // 阶段 1 指标没有「新增筛选 / 聚合」概念：按主体类型直达。
+  // 直达判据必须是「候选集恰为 ['all']」：只有一个非 all 候选（如 ['entity'] / ['milestone']）
+  // 时绝不提交成 all，否则会重演 B6 的实体丢失。
   if(isStage1Metric(metric)){
     if(isPointMetric(metric))condPanel.range='today';
-    if(condTargetTypesFor(metric).length===1){commitCondValue('all','','none','sum');return;}
+    const types=condTargetTypesFor(metric,condAllowEntity);
+    if(types.length===1&&types[0]==='all'){commitCondValue('all','','none','sum');return;}
     condPanel.step='targetType';
     renderCondPanel();
     positionCondPanel(condPanel.anchor);
@@ -319,7 +393,27 @@ function pickCondMetric(metric){
   positionCondPanel(condPanel.anchor);
 }
 function pickCondTargetType(tt){
+  // 事件模式下单个事项的点态指标没有稳定窗口：与编译期 FLOW_EVENT_POINT_METRIC 同一口径，提前拦住
+  if(tt==='entity'&&condEventMode&&isEntityPointMetric(condPanel.metric)){
+    toast('事件触发不能用单个事项的点态指标，请改用周期触发或手动执行','warn');
+    return;
+  }
   condPanel.targetType=tt;
+  // entity 必须在阶段 1 的 task/domain 映射之前拦截，否则会被当成领域
+  if(tt==='entity'){
+    // 实体点态指标（含只在单实体下才点态的 affair_progress）统一按「今天」求值
+    if(isEntityPointMetric(condPanel.metric))condPanel.range='today';
+    condPanel.step='entityKind';
+    renderCondPanel();
+    positionCondPanel(condPanel.anchor);
+    return;
+  }
+  if(tt==='tag'){
+    condPanel.step='tag';
+    renderCondPanel();
+    positionCondPanel(condPanel.anchor);
+    return;
+  }
   if(isAssetMetric(condPanel.metric)){
     condPanel.step='asset';
     renderCondPanel();
@@ -393,6 +487,30 @@ function pickCondBudgetCat(id){
 }
 function pickCondAsset(id){
   commitCondValue('asset',id,'none','sum');
+}
+// 情境主体：target 存标签键（忽略 @ 与大小写），展示时再反查原样拼写
+function pickCondTag(key){
+  commitCondValue('tag',String(key==null?'':key),'none','sum');
+}
+// 实体候选集：项目 / 杂事，默认排除已归档（新建条件选到归档事项几乎不是本意）
+function condEntityCandidates(kind){
+  const list=kind==='chore'?(state.chores||[]):(state.affairs||[]);
+  return list.filter(x=>x&&!x.archived);
+}
+// 实体主体：两步选择——先定项目/杂事，再选具体个体；target 存 'kind:id'
+function pickCondEntityKind(kind){
+  if(COND_ENTITY_KINDS.indexOf(kind)<0)return;
+  condPanel.entityKind=kind;
+  condPanel.targetType='entity';
+  condPanel.step='entity';
+  renderCondPanel();
+  positionCondPanel(condPanel.anchor);
+}
+function pickCondEntity(ref){
+  const parsed=parseEntityTarget(ref);
+  if(!parsed)return;
+  condPanel.targetType='entity';
+  commitCondValue('entity',parsed.kind+':'+parsed.id,'none','sum');
 }
 function pickCondAggregate(agg){
   commitCondValue(condPanel.targetType,condPanel.target,condPanel.newFilter,agg);
@@ -468,4 +586,4 @@ function updateCondPreview(){
 
 export function setCondDraft(v){condDraft=v;}
 
-export { condDraft, condDraftUI, condPanel, countCondLeaves, condListAt, condNodeAt, condMetricChipText, condItemRow, condGroupInnerHTML, condGroupHTML, renderCondNodes, renderCondTree, setCondDraftContext, resetCondDraftUI, addCondItem, addCondGroup, removeCondNode, changeGroupMode, getCondPanelEl, positionCondPanel, renderCondPanel, openCondMetricPanel, openCondOpPanel, pickCondRange, confirmCondDays, pickCondMetric, pickCondTargetType, pickCondNewFilter, pickCondDomain, pickCondTask, pickCondMilestone, pickCondBudgetCat, pickCondAsset, pickCondAggregate, commitCondValue, commitCondOp, closeCondPanel, editCondValue };
+export { condDraft, condDraftUI, condPanel, countCondLeaves, condListAt, condNodeAt, condMetricChipText, condItemRow, condGroupInnerHTML, condGroupHTML, renderCondNodes, renderCondTree, setCondDraftContext, resetCondDraftUI, addCondItem, addCondGroup, removeCondNode, changeGroupMode, getCondPanelEl, positionCondPanel, renderCondPanel, openCondMetricPanel, openCondOpPanel, pickCondRange, confirmCondDays, pickCondMetric, pickCondTargetType, pickCondNewFilter, pickCondDomain, pickCondTask, pickCondMilestone, pickCondBudgetCat, pickCondAsset, pickCondTag, pickCondEntityKind, pickCondEntity, condEntityCandidates, pickCondAggregate, commitCondValue, commitCondOp, closeCondPanel, editCondValue };

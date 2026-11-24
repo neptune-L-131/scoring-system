@@ -64,6 +64,34 @@ describe('创建事项动作原子', () => {
   });
 });
 
+describe('创建事项：情境标签', () => {
+  it('杂事按模板创建时写入归一后的标签（去空白、去重、超限截断）', () => {
+    addFlow({ steps: [createStep({ kind: 'chore', name: '带情境杂事', tags: [' @电脑 ', '@阅读', '@电脑'] })] });
+    const r = api.FlowEngine.runFlow('f1', { ts: T });
+    expect(r.ok).toBe(true);
+    const c = api.getState().chores[0];
+    expect(c.tags).toEqual(['@电脑', '@阅读']);
+  });
+
+  it('任务/项目不接受 tags，编译期拒绝', () => {
+    addFlow({ steps: [createStep({ kind: 'task', name: '任务', domainId: 'd_default', amount: 0, tags: ['@电脑'] })] });
+    const c = api.compile(api.getLive().flows[0]);
+    expect(c.ok).toBe(false);
+    expect(c.errors.some(e => e.code === 'FLOW_BAD_PARAMS' && e.detail === 'tags')).toBe(true);
+  });
+
+  it('tags 非数组 / 超条数 / 超长 / 空串在编译期拒绝', () => {
+    const cases = ['@电脑', ['a', 'b', 'c', 'd', 'e', 'f', 'g'], ['@超过十二个字符的情境标签很长'], ['  ']];
+    cases.forEach(function (tags) {
+      api.patchState(s => { s.flows = []; });
+      addFlow({ steps: [createStep({ kind: 'chore', name: '杂事', tags: tags })] });
+      const c = api.compile(api.getLive().flows[0]);
+      expect(c.ok).toBe(false);
+      expect(c.errors.some(e => e.code === 'FLOW_BAD_PARAMS' && e.detail === 'tags')).toBe(true);
+    });
+  });
+});
+
 describe('商品执行权：付款与执行同生共死', () => {
   it('购买成功：扣钱并执行一次，购买流水与运行记录互相可识别', () => {
     addFlow({ steps: [createStep({ kind: 'chore', name: '买来的杂事' })] });

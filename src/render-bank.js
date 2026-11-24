@@ -309,10 +309,15 @@ function ledgerShadowMatch(r){
 }
 function ledgerVisibleRows(){
   const rows=(state.logs||[]).map(function(l){return{log:l,shadow:false,time:Number(l.time)||0};});
+  // 撤销留痕：只读副本并入列表，按原时间归位；不参与账务/统计/筛选计数
+  if(state.ext&&Array.isArray(state.ext.reversedLogs)){
+    state.ext.reversedLogs.forEach(function(l){rows.push({log:l,shadow:false,reversed:true,time:Number(l&&l.time)||0});});
+  }
   if(ledgerState.withShadow&&state.ext&&Array.isArray(state.ext.shadow)){
     state.ext.shadow.forEach(function(r){rows.push({log:r,shadow:true,time:Number(r&&r.ts)||0});});
   }
   const out=rows.filter(function(row){
+    if(row.reversed)return ledgerLogMatch(row.log);
     return row.shadow?ledgerShadowMatch(row.log):ledgerLogMatch(row.log);
   });
   out.sort(function(a,b){return b.time-a.time;});
@@ -528,6 +533,20 @@ function bankUndoRun(runId){
 }
 function ledgerRowHTML(row,undoableSrc){
   if(row.shadow)return ledgerShadowRowHTML(row.log);
+  if(row.reversed){
+    // 已撤销：整行置灰、标注「已撤销」，不提供撤销/因果等任何操作（按钮直接消失）
+    const l=row.log;
+    const v=logRowView(l,[]);
+    const amt=Number(l.amt)||0;
+    const dir=amt>0?'in':amt<0?'out':'flat';
+    return '<div class="ledger-row reversed '+dir+(l.st==='card'?' asset':'')+'">'
+      +logItemHTML({
+        dot:'x',
+        desc:'<span class="log-src">'+esc(ledgerSrcGroup(l).name)+'</span>'+esc(l.desc?String(l.desc):'未知')+'<span class="log-rev">已撤销</span>',
+        amt:v.amount,amtCls:v.amtCls,time:fmtTime(v.time),
+      })
+      +'</div>';
+  }
   const l=row.log;
   const v=logRowView(l,undoableSrc);
   const amt=Number(l.amt)||0;
@@ -602,7 +621,9 @@ const EVENT_FAIL_TEXT={
   FLOW_EVENT_FAILED:'动作流执行失败',
 };
 function ledgerEventFailKind(kind){
-  return kind==='purchase'?'购买':'打卡';
+  if(kind==='purchase')return '购买';
+  if(kind==='chore.completed')return '杂事';
+  return '打卡';
 }
 function ledgerEventFailReason(r){
   const msg=String((r&&r.message)||'').trim();
@@ -650,9 +671,10 @@ function ledgerEventFailHTML(){
 function renderBankLogs(){
   const all=state.logs||[];
   const rows=ledgerVisibleRows();
+  const revCount=(state.ext&&Array.isArray(state.ext.reversedLogs))?state.ext.reversedLogs.length:0;
   const meta=document.getElementById('logMeta');
   if(meta){
-    let txt=all.length+' 条';
+    let txt=(all.length+revCount)+' 条';
     if(ledgerFilterActive())txt+=' · 命中 '+rows.length+' 条';
     if(rows.length>LOG_DISPLAY)txt+='（仅显示最近 '+LOG_DISPLAY+' 条）';
     meta.textContent=txt;
@@ -661,7 +683,8 @@ function renderBankLogs(){
   const ll=document.getElementById('logList');
   if(!ll)return;
   const failHTML=ledgerEventFailHTML();
-  if(!all.length){
+  // 主账本可能已被撤销清空，但撤销留痕副本仍需展示
+  if(!all.length&&!rows.length){
     ll.innerHTML=failHTML+'<div class="empty" style="padding:24px"><p style="margin:0">暂无记录</p></div>';
     return;
   }
@@ -736,7 +759,7 @@ function renderShadowList(){
   const list=(state.ext&&Array.isArray(state.ext.shadow))?state.ext.shadow:[];
   if(meta)meta.textContent=list.length?(list.length+' 条'):'暂无';
   if(!list.length){
-    el.innerHTML='<div class="empty" style="padding:16px"><p style="margin:0">暂无余额调整（贷款、撤销、活动回收等会记录在这里）</p></div>';
+    el.innerHTML='<div class="empty" style="padding:16px"><p style="margin:0">暂无余额调整（贷款、撤销、动作流回收等会记录在这里）</p></div>';
     return;
   }
   el.innerHTML=list.map(function(r){

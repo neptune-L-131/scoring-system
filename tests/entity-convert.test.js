@@ -67,6 +67,22 @@ describe('entity-convert：杂事 → 项目（同 id 换表）', () => {
     expect(s.conversions[0].snapshot.name).toBe('交水费');
   });
 
+  it('转换双向静默保留情境，无情境界面也不丢数据', () => {
+    api.patchState(s => { s.chores.find(c => c.id === 'c1').tags = ['在电脑前', '有电话']; });
+    expect(api.choreToAffair('c1').ok).toBe(true);
+    expect(api.getState().affairs.find(a => a.id === 'c1').tags).toEqual(['在电脑前', '有电话']);
+    expect(api.affairToChore('c1').ok).toBe(true);
+    expect(api.getState().chores.find(c => c.id === 'c1').tags).toEqual(['在电脑前', '有电话']);
+  });
+
+  it('撤销转换后情境随快照原样恢复', () => {
+    api.patchState(s => { s.chores.find(c => c.id === 'c1').tags = ['在电脑前']; });
+    const before = api.getState().chores.find(c => c.id === 'c1');
+    api.choreToAffair('c1');
+    expect(api.undoConversion().ok).toBe(true);
+    expect(api.getState().chores.find(c => c.id === 'c1')).toEqual(before);
+  });
+
   it('已完成杂事转换后视为已完成项目，且不补发进度', () => {
     api.choreToAffair('c2');
     const a = api.getState().affairs.find(x => x.id === 'c2');

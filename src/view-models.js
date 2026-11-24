@@ -73,6 +73,7 @@ function choreCardView(c) {
     plannedAt: c.plannedAt || null,
     progressAmount: choreProgressOf(c).amount,
     overdueDays: choreOverdueDays(c),
+    tags: Array.isArray(c.tags) ? c.tags.slice() : [],
     cycle: cy ? { unit: cy.unit, interval: cy.interval, nextDue: cy.nextDue } : null,
   };
 }

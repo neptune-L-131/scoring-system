@@ -100,6 +100,7 @@ function useTaskExemption(taskId, assetId) {
     toast(errText(r && r.error), 'err');
     return r || { ok: false };
   }
+  // runAssetUse 的 execute 以 save:'none' 执行，落盘与渲染由调用方收尾
   save();
   render();
   const t = (state.tasks || []).find(function (x) { return x && x.id === taskId; });

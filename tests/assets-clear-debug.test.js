@@ -113,6 +113,31 @@ describe('导入：3 <= v <= 4 兼容', () => {
   });
 });
 
+describe('清空数据：撤销与事件运行时集合一并归零', () => {
+  it('conversions / affairDeleteUndo / ext.events 清空后不存在可撤销项', () => {
+    api.patchState(s => {
+      s.conversions = [{ id: 'cv1', at: 1, dir: 'chore->affair', entityId: 'x', snapshot: {}, affairUndo: {} }];
+      s.affairDeleteUndo = [{ v: 1, id: 'du1', at: 1, mode: 'pool', affair: { id: 'a1', name: '旧项目' }, chores: [] }];
+      s.choreDeleteUndo = [{ v: 1, id: 'cu1', at: 1, chore: { id: 'c1', name: '旧杂事' }, index: 0, orderIndex: 0 }];
+      s.assetDeleteUndo = [{ v: 1, id: 'au1', at: 1, def: { id: 'star', name: '星星' }, index: 1 }];
+      s.ext.events = { v: 1, recent: [{ key: 'ev1', kind: 'flow-event-error' }] };
+    });
+    expect(api.lastConversion()).not.toBe(null);
+
+    api.clearDataResults();
+    const s = api.getState();
+
+    expect(s.conversions).toEqual([]);
+    expect(s.affairDeleteUndo).toEqual([]);
+    expect(s.choreDeleteUndo).toEqual([]);
+    expect(s.assetDeleteUndo).toEqual([]);
+    expect(s.ext.events).toEqual({ v: 1, recent: [] });
+    expect(api.lastConversion()).toBe(null);
+    expect(api.canUndoConversion()).toBe(false);
+    expect(api.restoreAffairDeletion('du1').ok).toBe(false);
+  });
+});
+
 describe('资产自检：只报告、不修复、不误报', () => {
   const labels = ['资产定义 vs 卡片余额', '资产计量 vs 资产定义', '动作流运行记录完整性'];
 

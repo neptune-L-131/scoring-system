@@ -244,3 +244,19 @@ describe('事务边界', () => {
     expect(s.logs.length).toBe(0);
   });
 });
+
+describe('反向：委派杂事手动完成不会自动完成项目步骤', () => {
+  it('手动勾选委派杂事只写杂事完成态，步骤与项目完成态保持为空', () => {
+    seed({
+      chores: [chore('c1')],
+      affairs: [affair('a1', [step({ text: '交水费', ...ref('c1') })])],
+    });
+    api.toggleChoreDone('c1');
+
+    const s = api.getState();
+    expect(s.chores[0].done).toBe(true);
+    expect(s.affairs[0].steps[0].doneAt).toBeNull();
+    expect(s.affairs[0].doneAt).toBeNull();
+    expect(s.affairs[0].currentCell).toBe(0);
+  });
+});

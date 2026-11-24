@@ -98,18 +98,6 @@ export function resolveActionBudget(entity,opts){
   }
   return{status:'ok',plan:plan,bind:bind,cat:cat,amount:amount};
 }
-export function markActionBudgetDone(kind,id,amount){
-  budgetDrafts['delete'](draftKey(kind,id));
-  const entity=findEntity(kind,id);
-  if(!entity||!entity.budget)return;
-  if(entity.budget.mode==='prompt')entity.budget.lastAmount=round4(Math.max(0,Number(amount)||0));
-}
-function findEntity(kind,id){
-  if(kind==='task')return (state.tasks||[]).find(function(x){return x.id===id;})||null;
-  if(kind==='affair')return (state.affairs||[]).find(function(x){return x.id===id;})||null;
-  if(kind==='chore')return (state.chores||[]).find(function(x){return x.id===id;})||null;
-  return null;
-}
 export function budgetRefOf(entry,plan,extra){
   if(!entry)return null;
   return{

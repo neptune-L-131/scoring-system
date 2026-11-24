@@ -50,6 +50,7 @@ const EXPORT_NAMES = [
   // 杂事标签 + 容器侧排序（chore-list.js）
   'normalizeChoreTag', 'normalizeChoreTags', 'normalizeChoreOrder', 'reconcileChoreOrder',
   'choreOrderInsert', 'choreOrderRemove', 'choreOrderMove', 'sortChoresByOrder',
+  'choreTagKey', 'choreTagMatches', 'choreTagIncludes', 'collectChoreTags', 'setChoreTagFilter',
   'CHORE_TAG_MAX_COUNT', 'CHORE_TAG_MAX_LEN',
   // 账户差额 / 统计
   'emptyAccountSums', 'accountSumsAdd', 'statsDiffs', 'noteInvisible', 'noteEvicted',
@@ -74,6 +75,9 @@ const EXPORT_NAMES = [
   'validProductTier', 'isArchivedEntity', 'normalizeCondItem',
   'normalizeCondNode', 'normalizeCondition', 'defaultChoreConfig', 'normalizeChoreConfig',
   'migrateChore',
+  // 单实体目标编辑器（D2）
+  'setCondEntityAllowed', 'isCondEntityAllowed', 'pickCondEntityKind', 'pickCondEntity',
+  'condEntityCandidates',
   // 条件求值
   'evalCondition', 'evalNode', 'evalCondItem', 'logDomainsOf', 'logMatchesTarget',
   'taskMatchesTarget', 'domainMatchesTarget', 'eachStatsBucket', 'rangeStats', 'opSatisfied',
@@ -122,11 +126,11 @@ const EXPORT_NAMES = [
   'openAssetModal', 'handleAssetSave', 'toggleAssetEnabled',
   'archiveAssetDef', 'unarchiveAssetDef', 'delAssetDef',
   // 动作流前台 UI（阶段 4 S9）
-  'validateFlowDraft', 'sanitizeFlowSteps', 'renderFlowPanel', 'flowUndoBlockReason',
+  'validateFlowDraft', 'sanitizeFlowSteps', 'renderFlowPanel', 'flowUndoBlockReason', 'flowRunLine',
   'flowErrorText', 'flowUndoErrorText', 'openFlowModal', 'closeFlowModal',
   'handleFlowSave', 'flowTriggerChanged', 'flowCondModeChange', 'flowStepAtomChanged',
   'flowStepParamChanged', 'flowStepMove', 'flowStepDelete', 'flowAddStep',
-  'flowAddBranch', 'toggleFlowEnabled', 'dryRunFlow', 'executeFlow', 'undoFlowRunUI',
+  'flowAddBranch', 'toggleFlowEnabled', 'delFlow', 'delCurrentFlow', 'dryRunFlow', 'executeFlow', 'undoFlowRunUI',
   // 常量（按值导出）
   'SCHEMA_VERSION', 'LOG_MAX', 'LOG_DISPLAY', 'SHADOW_MAX', 'AUDIT_MAX',
   'ASSET_VERSION', 'FLOW_VERSION', 'FLOW_MAX_STEPS', 'FLOW_RUN_KEEP',
@@ -273,7 +277,7 @@ async function loadFromModules() {
     'flow-engine.js',
     'events.js',
     'event-bus.js',
-    'library.js', 'work-ui-state.js', 'shell.js', 'render-work.js', 'entity-convert.js', 'render-bank.js', 'asset-ui.js', 'render-shop.js',
+    'library.js', 'work-ui-state.js', 'shell.js', 'chore-render.js', 'render-work.js', 'entity-convert.js', 'render-bank.js', 'asset-ui.js', 'render-shop.js',
     'render-budget.js', 'cycle.js', 'cond-ui.js', 'flow-ui.js', 'asset-use.js', 'ui-events.js', 'undo.js',
     'modals.js', 'data.js', 'pwa.js', 'debug.js', 'startup.js',
   ];

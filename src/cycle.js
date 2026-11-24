@@ -1,6 +1,7 @@
 import { BudgetEngine } from './budget.js';
 import { COND_RANGES } from './constants.js';
-import { isAffairMetric, isAssetHoldMetric, isAssetMetric, isChoreMetric, isPointMetric, fmt } from './pure.js';
+import { isAffairMetric, isAssetHoldMetric, isAssetMetric, isChoreMetric, isEntityMetricFor, isEntityOnlyMetric, isPointMetric, parseEntityTarget, fmt } from './pure.js';
+import { choreTagKey, collectChoreTags } from './chore-list.js';
 import { state } from './state.js';
 import { relativeDay } from './time.js';
 import { domainName, taskNameLabel } from './utils.js';
@@ -32,16 +33,21 @@ const COND_METRICS=[
   {v:'budget_period_overspend',n:'本周期超支'},
   {v:'budget_entry_count',n:'本周期笔数'},
   {v:'task_idle',n:'任务不活跃天数'},
-  {v:'affair_completed',n:'项目完成数'},
-  {v:'affair_steps',n:'项目推进步数'},
-  {v:'affair_stall',n:'项目停滞天数'},
-  {v:'affair_progress',n:'项目进度值'},
+  {v:'affair_completed',n:'项目完成数',entityName:'完成数'},
+  {v:'affair_steps',n:'项目推进步数',entityName:'推进步数'},
+  {v:'affair_stall',n:'项目停滞天数',entityName:'停滞天数'},
+  {v:'affair_progress',n:'项目进度值',entityName:'进度值'},
   {v:'affair_achievement',n:'项目成果点'},
-  {v:'chore_completed',n:'杂事完成数'},
+  {v:'affair_cell',n:'项目当前格数',entityName:'当前格数'},
+  {v:'chore_completed',n:'杂事完成数',entityName:'完成数'},
   {v:'chore_overdue',n:'杂事超期件数'},
   {v:'chore_decay',n:'杂事腐化值'},
   {v:'chore_batches',n:'杂事结算次数'},
-  {v:'chore_idle',n:'杂事不活跃天数'},
+  {v:'chore_idle',n:'杂事不活跃天数',entityName:'不活跃天数'},
+  {v:'chore_overdue_days',n:'杂事超期天数',entityName:'超期天数'},
+  {v:'chore_cycle_due_in',n:'杂事距下次到期天数',entityName:'距下次到期天数'},
+  {v:'chore_tag_overdue',n:'带情境的杂事超期件数'},
+  {v:'chore_tag_completed',n:'带情境的杂事完成数'},
   {v:'lifetime_achievement',n:'累计获得成果点'},
   {v:'domain_activity',n:'领域活跃次数'},
   {v:'milestone_unlocked',n:'里程碑已解锁'},
@@ -51,12 +57,12 @@ const COND_METRICS=[
   {v:'asset_issued',n:'已发放数量'},
   {v:'asset_spent',n:'已消耗数量'}
 ];
-const COND_TARGET_TYPES=[{v:'all',n:'全部'},{v:'domain',n:'按领域'},{v:'task',n:'按任务'},{v:'milestone',n:'按里程碑'},{v:'budget',n:'按预算分类'},{v:'asset',n:'按资产'}];
+const COND_TARGET_TYPES=[{v:'all',n:'全部'},{v:'domain',n:'按领域'},{v:'task',n:'按任务'},{v:'milestone',n:'按里程碑'},{v:'budget',n:'按预算分类'},{v:'asset',n:'按资产'},{v:'tag',n:'按情境'},{v:'entity',n:'按单个事项'}];
 const COND_NEW_FILTERS=[{v:'none',n:'当前'},{v:'new_task',n:'本周期新增任务'},{v:'new_domain',n:'本周期新增领域'}];
 const COND_AGGREGATES=[{v:'sum',n:'总计'},{v:'any',n:'任意单个'}];
 // 主体类型：成果点仅全部；计数类(新增任务/新增领域)支持全部+领域；值类(打卡/活力/进度)支持全部+领域+任务
 // 阶段 1：项目类支持全部+领域；杂事类仅全部；任务不活跃支持全部+领域+任务
-function condTargetTypesFor(metric){
+function condBaseTargetTypesFor(metric){
   if(metric==='achievement'||metric==='lifetime_achievement')return ['all'];
   if(metric==='milestone_unlocked')return ['milestone'];
   if(metric==='budget_remaining')return ['budget'];
@@ -64,9 +70,24 @@ function condTargetTypesFor(metric){
   if(metric==='domain_activity')return ['domain'];
   if(metric.indexOf('budget_')===0)return ['all'];
   if(metric==='new_tasks'||metric==='new_domains')return ['all','domain'];
+  // 情境指标：主体固定为「某一个情境」，不进入单主体直达
+  if(isChoreTagMetric(metric))return ['tag'];
   if(isChoreMetric(metric))return ['all'];
   if(isAffairMetric(metric))return ['all','domain'];
   return ['all','domain','task'];
+}
+// 该指标是否属于某个单实体白名单（项目 / 杂事）
+function isEntityMetricKey(metric){
+  return isEntityMetricFor('affair',metric)||isEntityMetricFor('chore',metric);
+}
+// allowEntity 是能力开关：只有动作流条件编辑器会传 true（见 cond-ui.js）。
+// 关闭时：实体专属指标没有任何可选主体；共享指标保持既有聚合主体。
+// 打开时：实体专属指标只返回 entity；共享指标在既有主体后追加 entity（不牺牲聚合录入）。
+function condTargetTypesFor(metric,allowEntity){
+  if(isEntityOnlyMetric(metric))return allowEntity?['entity']:[];
+  const types=condBaseTargetTypesFor(metric);
+  if(allowEntity&&isEntityMetricKey(metric))return types.concat(['entity']);
+  return types;
 }
 // 新增筛选选项（仅值类指标；按主体限制可用项）
 function condNewFilterOptions(targetType){
@@ -80,7 +101,10 @@ function rangeLabel(range,days){
   return r?r.n:'本周期';
 }
 function metricNameLabel(it){
-  return (COND_METRICS.find(m=>m.v===it.metric)||{}).n||it.metric;
+  const m=COND_METRICS.find(x=>x.v===it.metric)||{};
+  // 单实体目标下主体短语已含「项目/杂事」，指标名用短名避免重复
+  if(it.targetType==='entity'&&m.entityName)return m.entityName;
+  return m.n||it.metric;
 }
 function condEntityWord(it){
   return it.newFilter==='new_domain'?'领域':'任务';
@@ -91,9 +115,26 @@ function condIsMulti(it){
   if(it.targetType==='all'&&it.aggregate==='any')return true;
   return false;
 }
+// 情境指标：超期是点态、完成是窗口，主体都只能是某一个情境
+function isChoreTagMetric(metric){return metric==='chore_tag_overdue'||metric==='chore_tag_completed';}
 // 主体+新增短语（不含范围与聚合）
 function condScopePhrase(it){
   const t=it.target||'';
+  if(it.targetType==='tag'){
+    if(!t)return '（未选择情境）';
+    const key=choreTagKey(t);
+    const hit=collectChoreTags(state.chores,{includeArchived:true}).find(function(x){return x.key===key;});
+    return hit?('情境「'+hit.label+'」'):('情境「'+key+'」已不存在');
+  }
+  if(it.targetType==='entity'){
+    if(!t)return '（未选择事项）';
+    const ref=parseEntityTarget(t);
+    if(!ref)return '（事项引用无效）';
+    const list=ref.kind==='affair'?(state.affairs||[]):(state.chores||[]);
+    const hit=list.find(function(x){return x&&x.id===ref.id;});
+    const word=ref.kind==='affair'?'项目':'杂事';
+    return hit?(word+'「'+String(hit.name||ref.id)+'」'):(word+'「'+ref.id+'」已不存在');
+  }
   if(it.newFilter==='new_task'){
     if(it.targetType==='domain'&&t)return domainName(t)+'新增任务';
     return '新增任务';
@@ -135,7 +176,16 @@ function rangeTimeWord(it,act){
 function condItemLabel(it){
   if(!it)return '';
   if(isPointMetric(it.metric)||isAssetHoldMetric(it.metric))return metricLabel(it)+' '+opLabel(it.op)+' '+fmt(it.value);
-  return rangeLabel(it.range,it.days)+' · '+metricLabel(it)+' '+opLabel(it.op)+' '+fmt(it.value);
+  // 主体已经是情境时，再拼「带情境的杂事完成数」会重复：保留情境主体，只把指标名收短为「完成数」。
+  // 只改这一处展示拼接：指标键、COND_METRICS、condScopePhrase 都不动。
+  let name;
+  if(it.targetType==='tag'&&it.metric==='chore_tag_completed'){
+    const scope=condScopePhrase(it);
+    name=(scope?scope+'·':'')+'完成数';
+  }else{
+    name=metricLabel(it);
+  }
+  return rangeLabel(it.range,it.days)+' · '+name+' '+opLabel(it.op)+' '+fmt(it.value);
 }
 function condNodeLabel(node){
   if(node&&node.group)return '（'+((node.items||[]).map(condNodeLabel).join(node.mode==='any'?' 或 ':' 且 '))+'）';
@@ -172,5 +222,5 @@ function condNLNode(node,act){
 
 
 
-export { toggleAcc, fmtDate, periodLabel, COND_METRICS, COND_TARGET_TYPES, COND_NEW_FILTERS, COND_AGGREGATES, condTargetTypesFor, condNewFilterOptions, rangeLabel, metricNameLabel, condEntityWord, condIsMulti, condScopePhrase, metricLabel, opLabel, rangeTimeWord, condItemLabel, condNodeLabel, condNLLeaf, condNLNode };
+export { toggleAcc, fmtDate, periodLabel, COND_METRICS, COND_TARGET_TYPES, COND_NEW_FILTERS, COND_AGGREGATES, condTargetTypesFor, isChoreTagMetric, condNewFilterOptions, rangeLabel, metricNameLabel, condEntityWord, condIsMulti, condScopePhrase, metricLabel, opLabel, rangeTimeWord, condItemLabel, condNodeLabel, condNLLeaf, condNLNode };
 

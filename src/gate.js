@@ -11,7 +11,7 @@ import { state } from './state.js';
 // 由 app.js 按功能拆分（第五轮可维护性重构），行为不变。
 
 // ===== 成果点：累计获得（单调累加）与已计入清单 =====
-// 只有真实“获得”来源计入：里程碑解锁 / 周期活动奖励 / 项目奖励。
+// 只有真实“获得”来源计入：里程碑解锁 / 动作流奖励 / 项目奖励。
 // 贷款、退款、撤销、手动修正都不计入；里程碑按 achId 记录已计入数额，撤销后再解锁不重复累计。
 function noteAchievementEarned(delta,entry){
   if(!state.ext)return;

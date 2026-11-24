@@ -397,7 +397,7 @@ function handleAchSave(){
 }
 
 // ===== 商品门槛编辑器（通用条件树）=====
-// 条件树与周期活动共用 condDraft / renderCondTree / evalNode，不另起一套求值器。
+// 条件树与动作流共用 condDraft / renderCondTree / evalNode，不另起一套求值器。
 function onProdGateModeChange(){
   const sel=document.getElementById('prodGateMode');
   condDraft.mode=sel&&sel.value==='any'?'any':'all';

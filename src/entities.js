@@ -1,7 +1,7 @@
 import { affairActive } from './cond-eval.js';
 import { AFFAIR_CURVES } from './constants.js';
 import { choreIsCyclic } from './chore-cycle.js';
-import { choreOrderInsert } from './chore-list.js';
+import { choreOrderInsert, normalizeChoreTags } from './chore-list.js';
 import { idleDaysSince, dayKey, affairLastAdvance, effectiveLastTs, now, uid } from './pure.js';
 import { BudgetEngine } from './budget.js';
 import { processDueFlows } from './flow-scheduler.js';
@@ -18,7 +18,9 @@ import { state } from './state.js';
 // 从未活跃过的任务保持原样（与旧 processMetabolism 语义一致，交还用户处理）。
 function archiveIdleEntities(entity,idleDays,ts,actName,dryRun){
   const days=Math.max(1,Math.round(Number(idleDays)||1));
-  const label=actName||'周期活动';
+  const label=actName||'自动归档';
+  // 无调用方标签时读作「已自动归档」；显式标签保持「已由「…」归档」，避免重复“归档”二字
+  const by=actName?('已由「'+label+'」归档'):'已自动归档';
   let n=0;
   function hit(d){return d!==null&&d>=days;}
   if(entity==='affair'){
@@ -29,7 +31,7 @@ function archiveIdleEntities(entity,idleDays,ts,actName,dryRun){
       n++;
       if(dryRun)return;
       a.archived=true;a.archivedAt=now();
-      Ledger.event('项目「'+a.name+'」停滞 '+d+' 天，已由「'+label+'」归档','affair-archive',{affairId:a.id});
+      Ledger.event('项目「'+a.name+'」停滞 '+d+' 天，'+by,'affair-archive',{affairId:a.id});
     });
     return n;
   }
@@ -45,7 +47,7 @@ function archiveIdleEntities(entity,idleDays,ts,actName,dryRun){
       n++;
       if(dryRun)return;
       c.archived=true;c.archivedAt=now();
-      Ledger.event('杂事「'+c.name+'」不活跃 '+d+' 天，已由「'+label+'」归档','chore-archive',{choreId:c.id});
+      Ledger.event('杂事「'+c.name+'」不活跃 '+d+' 天，'+by,'chore-archive',{choreId:c.id});
     });
     return n;
   }
@@ -56,7 +58,7 @@ function archiveIdleEntities(entity,idleDays,ts,actName,dryRun){
     n++;
     if(dryRun)return;
     t.archived=true;t.archivedAt=now();
-    Ledger.event('任务「'+t.name+'」不活跃 '+d+' 天，已由「'+label+'」归档','archive',{taskId:t.id});
+    Ledger.event('任务「'+t.name+'」不活跃 '+d+' 天，'+by,'archive',{taskId:t.id});
   });
   return n;
 }
@@ -125,6 +127,8 @@ function createEntitiesFromTemplate(kind, spec, ts) {
   const base = String(s.name || '').trim();
   const did = String(s.domainId || '');
   const amount = Number(s.amount) || 0;
+  // 情境标签只对杂事有意义：与手建杂事共用同一套归一（去空、去重、超限截断）。
+  const tags = kind === 'chore' ? normalizeChoreTags(s.tags) : [];
   const out = [];
   for (let i = 0; i < count; i += 1) {
     const name = count > 1 ? base + '（' + (i + 1) + '）' : base;
@@ -139,7 +143,7 @@ function createEntitiesFromTemplate(kind, spec, ts) {
     } else if (kind === 'chore') {
       const c = {
         id: uid(), name: name, done: false, doneAt: null, plannedAt: null, createdAt: at,
-        settled: false, freshDays: null, decayKey: null, tags: [],
+        settled: false, freshDays: null, decayKey: null, tags: tags.slice(),
       };
       if (!Array.isArray(state.chores)) state.chores = [];
       state.chores.push(c);

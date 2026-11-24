@@ -12,6 +12,7 @@ import {
 } from './constants.js';
 import { checkAchievements, exemptTaskCore } from './business.js';
 import { archiveIdleEntities, assetGrantCore, createEntitiesFromTemplate } from './entities.js';
+import { normalizeChoreTags } from './chore-list.js';
 import { Ledger } from './ledger.js';
 import { state } from './state.js';
 import { periodKeyOf } from './time.js';
@@ -385,7 +386,13 @@ function entityCreate(ctx, params) {
   } else if (params.domainId !== undefined && String(params.domainId).trim() !== '') {
     fail('FLOW_BAD_PARAMS', { field: 'domainId' });
   }
-  const list = createEntitiesFromTemplate(kind, { name: name, count: count, domainId: domainId, amount: amount }, ctx.ts);
+  // 情境标签只允许出现在杂事上；编译期已拦，这里保留运行时兜底。
+  let tags = [];
+  if (params.tags !== undefined && params.tags !== null) {
+    if (kind !== 'chore') fail('FLOW_BAD_PARAMS', { field: 'tags' });
+    tags = normalizeChoreTags(params.tags);
+  }
+  const list = createEntitiesFromTemplate(kind, { name: name, count: count, domainId: domainId, amount: amount, tags: tags }, ctx.ts);
   const kindName = kindLabel(kind);
   list.forEach(function (e) {
     Ledger.event('按模板创建' + kindName + '「' + e.name + '」', 'entity-create', {
@@ -470,7 +477,7 @@ const FLOW_ATOMS = {
   },
   'entity.create': {
     id: 'entity.create', name: '创建事项',
-    params: ['kind', 'name', 'domainId', 'amount', 'count'], run: entityCreate,
+    params: ['kind', 'name', 'domainId', 'amount', 'count', 'tags'], run: entityCreate,
     describe: p => '创建 ' + (Number(p.count) > 1 ? Number(p.count) + ' 个' : '') +
       kindLabel(p.kind) + '「' + (p.name || '') + '」',
   },

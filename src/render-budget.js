@@ -1,5 +1,6 @@
 import { registerRenderer } from './render.js';
 import { BudgetEngine } from './budget.js';
+import { runCommand } from './command.js';
 import { normalizeCondition } from './cond-model.js';
 import { addCondGroup, addCondItem, renderCondTree, resetCondDraftUI, setCondDraftContext } from './cond-ui.js';
 import { BUDGET_RULE_KINDS, BUDGET_RULE_NAMES, BUDGET_TARGET_NAMES, CURRENCIES } from './constants.js';
@@ -201,6 +202,7 @@ function confirmReverseRefundEntry(id){
   if(!confirm('撤销这笔退回？\n只回退本期退回金额；已花金额、结余奖励与已发奖惩都不受影响。'))return;
   const r=BudgetEngine.reverseRefund(id);
   if(!r.ok){toast(r.reason||'撤销退回失败','err');return;}
+  // reverseRefund 的 txn 为 save:'none'，由这里统一收尾
   save();render();
   toast('已撤销退回');
 }
@@ -570,14 +572,18 @@ function confirmDelBudgetCategory(id){
   const cat=BudgetEngine.category(id);
   if(!cat)return;
   if(!confirm('删除预算分类「'+cat.name+'」？\n（该分类的周期实例与账本明细会一并删除；商品绑定会解除）'))return;
-  const bd=state.ext.budgets;
-  bd.categories=bd.categories.filter(function(c){return c.id!==id;});
-  delete bd.current[id];
-  delete bd.periods[id];
-  bd.ledger=(bd.ledger||[]).filter(function(e){return e.categoryId!==id;});
-  state.products.forEach(function(p){if(p.budget&&p.budget.categoryId===id)p.budget={categoryId:'',amount:0};});
-  save();render();
-  toast('预算分类已删除');
+  runCommand({
+    label:'del-budget-category',
+    toast:'预算分类已删除',
+    run:function(){
+      const bd=state.ext.budgets;
+      bd.categories=bd.categories.filter(function(c){return c.id!==id;});
+      delete bd.current[id];
+      delete bd.periods[id];
+      bd.ledger=(bd.ledger||[]).filter(function(e){return e.categoryId!==id;});
+      state.products.forEach(function(p){if(p.budget&&p.budget.categoryId===id)p.budget={categoryId:'',amount:0};});
+    }
+  });
 }
 function openQuickRecordModal(catId){
   const cats=BudgetEngine.categories().filter(function(c){return c.enabled&&!c.archived;});
@@ -738,6 +744,7 @@ function quickRecordBudget(catId,amount,note,ts,opts){
       toast(info.reason||'退回失败','err');
       return{ok:false,error:rr.error};
     }
+    // 退回走 save:'none' 的事务，这里统一收尾
     save();render();
     toast('已退回「'+plan.cat.name+'」+'+money(plan.amount,currencyOf(plan.cat)));
     return{ok:true,plan:plan,result:rr.value};
@@ -755,6 +762,7 @@ function quickRecordBudget(catId,amount,note,ts,opts){
   let msg='已记「'+plan.cat.name+'」'+money(plan.amount,currencyOf(plan.cat));
   (plan.effects||[]).forEach(function(e){msg+=' · '+e.desc});
   if(plan.topup.amount)msg+=' · 扩容 '+fmt(plan.topup.amount)+'（-'+fmt(plan.topup.cost)+' '+BUDGET_TARGET_NAMES[plan.topup.currency]+'）';
+  // 记账事务同样以 save:'none' 执行，这里统一收尾
   save();render();toast(msg);
   return{ok:true,plan:plan,result:r.value};
 }

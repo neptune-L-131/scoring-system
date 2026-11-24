@@ -1,5 +1,6 @@
 import { BudgetEngine } from './budget.js';
 import { checkAchievements } from './business.js';
+import { choreOrderRemove } from './chore-list.js';
 import { runCommand } from './command.js';
 import { BACKUP_KEY, STAGE_PRESET_KEY } from './constants.js';
 import { defaults, newExtState, tierCurrency } from './defaults.js';
@@ -152,6 +153,8 @@ function delDomain(id){
     }
 
     state.domains=state.domains.filter(x=>x.id!==id);
+    // 筛选状态指向被删领域时同步清空，否则任务列表会按一个不存在的领域过滤成空白
+    if(state.filterDomain===id)state.filterDomain=null;
     Ledger.event('删除领域「'+d.name+'」','delete-domain',{
       domCopy:domCopy,domIndex:domIndex,progressVal:progressVal,
       affectedTasks:affectedTasks,affectedAchs:affectedAchs,
@@ -870,18 +873,19 @@ function unlockTask(taskId){
   if(!t||!t.archived)return;
   const cost=3;
   if((state.scores.vitality||0)<cost){toast('活力点不足（需要'+cost+'点）','err');return}
-  const txr=Ledger.txn(function(){
-    t.archived=false;
-    delete t.archivedAt;
-    // Reset streak/debt so it's a fresh start
-    t.pendingDebt=0;
-    delete t.lastDebtDate;
-    Ledger.spend('vitality',cost,{src:'unlock',desc:'解锁归档任务「'+t.name+'」 (-'+cost+'活力)',taskId:t.id});
-  },{label:'unlock',save:'none',render:false});
-  if(!txr.ok)return;
-  save();
-  toast('已解锁「'+t.name+'」，可重新打卡');
-  render();
+  runCommand({
+    label:'unlock',
+    silentFail:true,
+    toast:'已解锁「'+t.name+'」，可重新打卡',
+    run:function(){
+      t.archived=false;
+      delete t.archivedAt;
+      // Reset streak/debt so it's a fresh start
+      t.pendingDebt=0;
+      delete t.lastDebtDate;
+      Ledger.spend('vitality',cost,{src:'unlock',desc:'解锁归档任务「'+t.name+'」 (-'+cost+'活力)',taskId:t.id});
+    }
+  });
 }
 
 // ===== 手动修正余额（用于修复历史版本重复扣减造成的余额偏差） =====
@@ -902,17 +906,18 @@ function manualAdjustBalance(){
   if(!isFinite(amt)){toast('请输入有效数字','err');return}
   if(amt===0){toast('调整值为 0，未做修改','err');return}
   const after=Math.round((before+amt)*10000)/10000;
-  const txr=Ledger.txn(function(){
-    Ledger.post({
-      op:'adjust',account:key,target:after,
-      entry:{st:key,amt:amt,desc:'手动修正'+label+'余额 '+fmt(before)+' → '+fmt(after),src:'manual-adjust',dom:'',before:before,after:after},
-      reason:{src:'manual-adjust'}
-    });
-  },{label:'manual-adjust',save:'none',render:false});
-  if(!txr.ok)return;
-  save();
-  toast(label+'已修正：'+fmt(before)+' → '+fmt(after));
-  render();
+  runCommand({
+    label:'manual-adjust',
+    silentFail:true,
+    toast:label+'已修正：'+fmt(before)+' → '+fmt(after),
+    run:function(){
+      Ledger.post({
+        op:'adjust',account:key,target:after,
+        entry:{st:key,amt:amt,desc:'手动修正'+label+'余额 '+fmt(before)+' → '+fmt(after),src:'manual-adjust',dom:'',before:before,after:after},
+        reason:{src:'manual-adjust'}
+      });
+    }
+  });
 }
 
 // ===== 清除数据 =====
@@ -922,6 +927,12 @@ function clearDataResults(){
   state.scores={vitality:0,progress:{},achievement:0};
   state.loans=[];
   state.logs=[];
+  // 撤销/事件类运行时数据：清空后不应还能撤销已不存在的转换或项目删除，也不该残留旧事件
+  state.conversions=[];
+  state.affairDeleteUndo=[];
+  state.choreDeleteUndo=[];
+  state.assetDeleteUndo=[];
+  state.ext.events=emptyExt.events;
   // 资产：定义（assetDefs）与动作流（flows）属于用户配置，保留；
   // 余额（cards）、周期计量（assetMeters）、运行记录（flowRuns）属于运行时状态，归零。
   const zeroCards={};
@@ -943,13 +954,15 @@ function clearDataResults(){
   state.ext.budgets.ledger=[];
   state.ext.audit=[];
   state.ext.shadow=[];
+  // 撤销留痕副本随主账本一并清空，避免清空后仍能看到已撤销记录
+  state.ext.reversedLogs=[];
   // 结果型扩展数据随清空归零；商品门槛等配置类字段保留
   state.ext.activity={};
   state.ext.achievementCounted={};
 
   // 任务：清零所有运行时状态，让卡片等价于“刚创建但打过 0 次卡”；
   // 任务定义（名称/分值/领域/集合/利率等）与 id/createdAt/archived/archivedAt 一律保留。
-  // lastCheckIn=null 本次是有意放开：自动归档已迁移为周期活动规则，
+  // lastCheckIn=null 本次是有意放开：自动归档已迁移为动作流规则，
   // 归档动作遇到“从未活跃”的任务会跳过（不归档、不删除）。
   state.tasks.forEach(t=>{
     t.lastCheckIn=null;
@@ -990,9 +1003,66 @@ function clearDataResults(){
   });
 
   closeModal('clearDataModal');
+  // 纯内存批量赋值，无中途失败路径；重置动作直接落盘
   save();
   render();
   toast('已清除数据成果，所有设定已保留');
+}
+
+// ===== 杂事删除撤销 =====
+// 与项目删除同构：删除前整笔快照（对象、原下标、choreOrder 名次），最多留最近 5 条。
+// 恢复用快照里的对象克隆，循环杂事的 nextDue / lastDue 原样回填，不重新计算。
+const CHORE_DELETE_UNDO_LIMIT=5;
+function choreDeleteUndoList(){
+  if(!Array.isArray(state.choreDeleteUndo))state.choreDeleteUndo=[];
+  return state.choreDeleteUndo;
+}
+function deleteChoreCore(choreId){
+  const id=String(choreId||'');
+  const chores=Array.isArray(state.chores)?state.chores:[];
+  const c=chores.find(function(x){return x&&x.id===id;});
+  if(!c)return {ok:false,reason:'杂事已不存在'};
+  const order=Array.isArray(state.choreOrder)?state.choreOrder:[];
+  const rec={
+    v:1,
+    id:uid(),
+    at:now(),
+    chore:clone(c),
+    index:chores.indexOf(c),
+    orderIndex:order.indexOf(id),
+  };
+  state.chores=chores.filter(function(x){return x&&x.id!==id;});
+  state.choreOrder=choreOrderRemove(state.choreOrder,id);
+  const list=choreDeleteUndoList();
+  list.push(rec);
+  while(list.length>CHORE_DELETE_UNDO_LIMIT)list.shift();
+  Ledger.event('删除杂事「'+c.name+'」','chore-delete');
+  return {ok:true,undoId:rec.id};
+}
+function restoreChoreDeletion(recId){
+  const list=choreDeleteUndoList();
+  const at=list.findIndex(function(x){return x&&x.id===recId;});
+  if(at<0)return {ok:false,reason:'没有可恢复的删除记录'};
+  const rec=list[at];
+  const c=rec&&rec.chore;
+  if(!c||typeof c!=='object'||Array.isArray(c)||!c.id)return {ok:false,reason:'删除记录已损坏'};
+  // 冲突校验在任何写入之前：同 id 已存在则整笔拒绝，不做半恢复。
+  if((state.chores||[]).some(function(x){return x&&x.id===c.id;}))return {ok:false,reason:'杂事已存在，无法恢复'};
+  if(!Array.isArray(state.chores))state.chores=[];
+  let index=Number(rec.index);
+  if(!isFinite(index))index=state.chores.length;
+  index=Math.max(0,Math.min(Math.floor(index),state.chores.length));
+  state.chores.splice(index,0,clone(c));
+  // choreOrder 按原位置插回；删除时本就不在序列里（orderIndex<0）的不凭空插入。
+  if(!Array.isArray(state.choreOrder))state.choreOrder=[];
+  const oi=Number(rec.orderIndex);
+  if(isFinite(oi)&&oi>=0&&state.choreOrder.indexOf(c.id)<0){
+    const j=Math.max(0,Math.min(Math.floor(oi),state.choreOrder.length));
+    state.choreOrder.splice(j,0,c.id);
+  }
+  list.splice(at,1);
+  Ledger.event('恢复杂事「'+c.name+'」','chore-restore',{choreId:c.id});
+  return {ok:true,id:c.id};
 }
 
 // 彻底重置，效果等同于从未使用过本应用（主题设置保留）
@@ -1015,4 +1085,4 @@ function clearEverything(){
   toast('已清除全部设置与数据');
 }
 
-export { addCollection, delCollection, renameCollection, addDomain, delDomain, renameDomain, pendingTaskSave, saveTaskData, resolveDomainChange, cancelDomainChange, finalizeTaskSave, recalcTaskHistory, delTask, saveAchData, delAch, openMetricModal, getCheckedMetricDomains, handleMetricSave, delMetric, addShopCategory, delShopCategory, renameShopCategory, fillShopCatSelect, productGateContext, saveProdData, delProd, buyProduct, processDailyTaskDebts, unlockTask, _loanAutoPaySkipOnce, loanInterestStart, processLoans, processLoansWithDecayReserve, skipNextLoanAutoPay, manualAdjustBalance, clearDataResults, clearEverything };
+export { addCollection, delCollection, renameCollection, addDomain, delDomain, renameDomain, pendingTaskSave, saveTaskData, resolveDomainChange, cancelDomainChange, finalizeTaskSave, recalcTaskHistory, delTask, saveAchData, delAch, openMetricModal, getCheckedMetricDomains, handleMetricSave, delMetric, addShopCategory, delShopCategory, renameShopCategory, fillShopCatSelect, productGateContext, saveProdData, delProd, buyProduct, processDailyTaskDebts, unlockTask, _loanAutoPaySkipOnce, loanInterestStart, processLoans, processLoansWithDecayReserve, skipNextLoanAutoPay, manualAdjustBalance, clearDataResults, clearEverything, deleteChoreCore, restoreChoreDeletion, CHORE_DELETE_UNDO_LIMIT };

@@ -2,9 +2,10 @@
 // 把「条件树 → 指标取值」中依赖全局 state 的叶子求值集中在这里；
 // 结构递归与比较在内核 cond-kernel.js，本文件不 import entities / ledger / render，
 // 也不被 conditions.js 之外的业务模块反向依赖（budget 通过 provider 注册注入）。
-import { choreIsCyclic } from './chore-cycle.js';
+import { choreCycleOf, choreIsCyclic } from './chore-cycle.js';
+import { choreTagIncludes, choreTagKey } from './chore-list.js';
 import { evalNode as evalTreeNode, opSatisfied } from './cond-kernel.js';
-import { affairLastAdvance, condWindowByRange, dayKey, effectiveLastTs, getTaskDomainIds, idleDaysSince, isAffairMetric, isAssetMetric, isChoreMetric, isPointMetric, isArchivedEntity, round2, validRange } from './pure.js';
+import { affairLastAdvance, affairSteps, condWindowByRange, dayKey, dayStart, effectiveLastTs, getTaskDomainIds, idleDaysSince, isAffairMetric, isAssetMetric, isChoreMetric, isEntityMetricFor, isEntityOnlyMetric, isPointMetric, isArchivedEntity, parseEntityTarget, round2, validRange } from './pure.js';
 import { state } from './state.js';
 import { dayDiff } from './time.js';
 import { activityCountForDomain, choreOverdueDays, domainProgress, totalProgress } from './utils.js';
@@ -14,8 +15,17 @@ const POINT_METRIC_PROVIDERS=Object.create(null);
 function registerPointMetricProvider(metric,fn){
   if(metric&&typeof fn==='function')POINT_METRIC_PROVIDERS[metric]=fn;
 }
-function pointMetricValue(metric,it,ts){
-  const tt=it.targetType||'all';
+// 情境键是否「仍然存在」：现存标签或任一历史快照里出现过即算存在。
+// 历史快照也要算，否则「改标签不回溯历史」的既有归因（见 chore_tag_completed 用例）会被误判为情境已删除。
+function choreTagKnown(key){
+  if(!key)return false;
+  return (state.chores||[]).some(function(c){
+    if(choreTagIncludes(c&&c.tags,key))return true;
+    const hist=Array.isArray(c&&c.history)?c.history:[];
+    return hist.some(function(e){return e&&choreTagIncludes(e.tags,key);});
+  });
+}
+function pointMetricValue(metric,it,ts){  const tt=it.targetType||'all';
   const target=it.target||'';
   if(metric==='task_idle'){
     let tasks=(state.tasks||[]).filter(t=>!t.archived);
@@ -41,6 +51,14 @@ function pointMetricValue(metric,it,ts){
   if(metric==='chore_overdue'){
     // 超期件数只由“到期日 + 是否本周期已完成”决定（choreOverdueDays 内部已处理完成态）
     return (state.chores||[]).filter(c=>!c.archived&&choreOverdueDays(c,ts)>0).length;
+  }
+  if(metric==='chore_tag_overdue'){
+    // 点态：当前仍超期且带该情境的件数。事件触发模式会在编译期拒绝点态指标。
+    // 情境键缺失（没有任何现存标签或历史快照）时返回 NaN，由比较层判不成立；
+    // 不复刻 0 兜底 —— 0 在 < / <= 下可能为真，会让「情境已删除」被误判为满足。
+    const key=choreTagKey(target);
+    if(!key||!choreTagKnown(key))return NaN;
+    return (state.chores||[]).filter(c=>!c.archived&&choreOverdueDays(c,ts)>0&&choreTagIncludes(c.tags,key)).length;
   }
   if(metric==='chore_idle'){
     let max=0;
@@ -318,7 +336,7 @@ function affairWindowValue(metric,it,w,range){
   }
   return 0;
 }
-function choreWindowValue(metric,w,range){
+function choreWindowValue(metric,it,w,range){
   if(metric==='chore_completed'){
     // 循环杂事按完成记录逐条计：doneAt 会被最新一次完成覆盖，不能作为计数口径。
     // 一次性杂事沿用 doneAt 判定。
@@ -335,6 +353,36 @@ function choreWindowValue(metric,w,range){
         return;
       }
       if(c.doneAt&&inWindow(c.doneAt))n++;
+    });
+    return n;
+  }
+  if(metric==='chore_tag_completed'){
+    // 与 chore_completed 共用窗口口径；只多一层情境过滤。
+    // 循环杂事按每条完成记录的 tags 快照归因；快照缺失时回落当前标签（不静默计 0）。
+    const key=choreTagKey(it&&it.target);
+    // 与点态口径一致：情境键不存在（现存标签与历史快照都没有）→ NaN（判不成立）。
+    // 情境仍存在但窗口内没有完成记录时仍是 0，语义不变。
+    if(!key||!choreTagKnown(key))return NaN;
+    let n=0;
+    (state.chores||[]).forEach(function(c){
+      const inWindow=function(ts){return range==='total'||(ts>=w.start&&ts<w.end);};
+      if(choreIsCyclic(c)){
+        (Array.isArray(c.history)?c.history:[]).forEach(function(e){
+          if(!e||!Number(e.due))return;
+          const ts=Number(e.ts)||0;
+          if(!(ts>0&&inWindow(ts)))return;
+          const tags=Array.isArray(e.tags)?e.tags:(Array.isArray(c.tags)?c.tags:[]);
+          if(choreTagIncludes(tags,key))n++;
+        });
+        return;
+      }
+      if(c.doneAt&&inWindow(c.doneAt)){
+        // 一次性杂事：优先取最近一条完成记录的标签快照，缺失时按当前标签归因
+        const hist=Array.isArray(c.history)?c.history:[];
+        const last=hist.length?hist[hist.length-1]:null;
+        const tags=(last&&Array.isArray(last.tags))?last.tags:(Array.isArray(c.tags)?c.tags:[]);
+        if(choreTagIncludes(tags,key))n++;
+      }
     });
     return n;
   }
@@ -357,7 +405,78 @@ function evalCountMetric(it,w){
   }
   return opSatisfied(val,it.op,v);
 }
-function evalCondItem(it,act,ts){
+// ===== 单实体条件（D1）=====
+// 一次 evalCondition 内只建一次索引；findEntity 是线性扫描，逐叶子调用会退化成 O(n·叶子数)。
+function entityIndex(ctx){
+  if(ctx&&ctx.entityIndex)return ctx.entityIndex;
+  const idx={task:new Map(),affair:new Map(),chore:new Map()};
+  (state.tasks||[]).forEach(function(e){if(e&&e.id!=null)idx.task.set(String(e.id),e);});
+  (state.affairs||[]).forEach(function(e){if(e&&e.id!=null)idx.affair.set(String(e.id),e);});
+  (state.chores||[]).forEach(function(e){if(e&&e.id!=null)idx.chore.set(String(e.id),e);});
+  if(ctx)ctx.entityIndex=idx;
+  return idx;
+}
+// 单实体取值：只读实体自身字段/当刻状态，或对该实体做窗口计数。
+// 取不到（非循环杂事问循环指标）返回 NaN，由调用方判不成立。
+function entityMetricValueFor(kind,metric,e,w,range,ts){
+  if(kind==='affair'){
+    if(metric==='affair_cell')return Math.max(0,Math.round(Number(e.currentCell)||0));
+    if(metric==='affair_steps'){
+      let n=0;
+      affairSteps(e).forEach(function(s){
+        if(range==='total'?!!s.doneAt:(s.doneAt>=w.start&&s.doneAt<w.end))n++;
+      });
+      return n;
+    }
+    if(metric==='affair_stall'){
+      const d=idleDaysSince(affairLastAdvance(e)||e.createdAt,ts);
+      return d===null?NaN:d;
+    }
+    if(metric==='affair_progress')return Number(e.alreadyGiven)||0;
+    if(metric==='affair_completed')return (range==='total'?!!e.doneAt:!!(e.doneAt&&e.doneAt>=w.start&&e.doneAt<w.end))?1:0;
+    return NaN;
+  }
+  if(kind==='chore'){
+    if(metric==='chore_completed'){
+      // 与 choreWindowValue 同口径：循环杂事按 history 逐条计，一次性用 doneAt。
+      let n=0;
+      const inWindow=function(t){return range==='total'||(t>=w.start&&t<w.end);};
+      if(choreIsCyclic(e)){
+        (Array.isArray(e.history)?e.history:[]).forEach(function(r){
+          if(!r||!Number(r.due))return;
+          const t=Number(r.ts)||0;
+          if(t>0&&inWindow(t))n++;
+        });
+        return n;
+      }
+      if(e.doneAt&&inWindow(e.doneAt))n++;
+      return n;
+    }
+    if(metric==='chore_overdue_days')return choreOverdueDays(e,ts);
+    if(metric==='chore_idle'){
+      const d=idleDaysSince(e.doneAt||e.plannedAt||e.createdAt,ts);
+      return d===null?NaN:d;
+    }
+    if(metric==='chore_cycle_due_in'){
+      const cy=choreCycleOf(e);
+      if(!cy||!cy.nextDue)return NaN;
+      return dayDiff(dayStart(cy.nextDue),dayStart(ts));
+    }
+    return NaN;
+  }
+  return NaN;
+}
+function evalEntityItem(it,w,range,ts,ctx){
+  const ref=parseEntityTarget(it.target);
+  if(!ref||!isEntityMetricFor(ref.kind,it.metric))return false;
+  const e=entityIndex(ctx)[ref.kind].get(ref.id);
+  // 不存在（含转换后原 kind 已无此 id）→ 不成立；归档实体仍在索引里，照常求值。
+  if(!e)return false;
+  const val=entityMetricValueFor(ref.kind,it.metric,e,w,range,ts);
+  if(!Number.isFinite(val))return false;
+  return opSatisfied(val,it.op,Number(it.value)||0);
+}
+function evalCondItem(it,act,ts,ctx){
   const v=Number(it.value)||0;
   const range=validRange(it.range)?it.range:'period';
   // 预算指标：只读当前预算周期上下文（由 BudgetEngine 注入 act.budgetCtx）
@@ -375,6 +494,10 @@ function evalCondItem(it,act,ts){
     return opSatisfied(val,it.op,v);
   }
   const w=range==='total'?{start:0,end:ts+1}:condWindowByRange(range,act,ts,it.days);
+  // 单实体条件：目标不存在 / 指标与 kind 不匹配 / 取不到值 一律判不成立（fail-closed）。
+  if((it.targetType||'all')==='entity')return evalEntityItem(it,w,range,ts,ctx);
+  // 实体专属指标配非实体目标属于非法组合：宁可判不成立，也不套用聚合读法给出 0。
+  if(isEntityOnlyMetric(it.metric))return false;
   // 自定义资产：持有数量是点态值（事件发生时刻即确定），发放/消耗按窗口汇总
   if(isAssetMetric(it.metric))return opSatisfied(assetMetricValue(it.metric,it,w),it.op,v);
   // 阶段 3：领域活跃度读活跃度索引（不遍历日志，不受日志截断影响）
@@ -387,7 +510,7 @@ function evalCondItem(it,act,ts){
   // 阶段 1：点态指标（不活跃天数/超期件数）与项目、杂事指标
   if(isPointMetric(it.metric))return opSatisfied(pointMetricValue(it.metric,it,ts),it.op,v);
   if(isAffairMetric(it.metric))return opSatisfied(affairWindowValue(it.metric,it,w,range),it.op,v);
-  if(isChoreMetric(it.metric))return opSatisfied(choreWindowValue(it.metric,w,range),it.op,v);
+  if(isChoreMetric(it.metric))return opSatisfied(choreWindowValue(it.metric,it,w,range),it.op,v);
   // 成果点：全局累计，无主体/新增/聚合概念
   if(it.metric==='achievement'){
     const val=range==='total'?(state.scores.achievement||0):rangeStats(w.start,w.end).achievement;
@@ -417,7 +540,8 @@ function evalCondItem(it,act,ts){
 }
 function evalCondition(act,ts){
   const c=act.condition||{mode:'all',items:[]};
-  return evalTreeNode({group:true,mode:c.mode==='any'?'any':'all',items:c.items||[]},{evalLeaf:function(n){return evalCondItem(n,act,ts);}});
+  const ctx={entityIndex:null};
+  return evalTreeNode({group:true,mode:c.mode==='any'?'any':'all',items:c.items||[]},{evalLeaf:function(n){return evalCondItem(n,act,ts,ctx);}});
 }
 
 export { weekScore, evalCondition, logDomainsOf, logMatchesTarget, taskMatchesTarget, domainMatchesTarget, eachStatsBucket, rangeStats, taskMetricValue, domainMetricValue, condLeafEntities, entityMetricValue, affairActive, pointMetricValue, sumLogsInWindow, countLogsInWindow, logAffairDomain, affairWindowValue, choreWindowValue, evalCountMetric, evalCondItem, assetMetricValue, assetMovementInWindow, registerPointMetricProvider };

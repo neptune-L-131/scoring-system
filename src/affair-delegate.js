@@ -250,6 +250,12 @@ function restoreAffairDeletion(recId) {
 //
 // 必须在调用方事务内调用（affairApplyProgress 的 runCommand）；失败由外层整单回滚。
 // 返回被自动判定完成的杂事 [{id,name}]（完成提示与撤销快照用），没有则返回空数组。
+//
+// 反向不对称（刻意如此，不是漏写）：
+//   项目完成 → 委派杂事自动完成（本函数）；
+//   杂事完成 → 项目步骤 **不** 自动完成。
+// 理由：项目进度是用户对阶段的判断，不能被单个杂事拖动。杂事完成只作为「可推进」的
+// 提示显示在步骤行，是否勾掉这一步仍由用户决定，因此也绝不在这里写 step.doneAt。
 function affairAutoCompleteDelegatedChores(a, ts) {
   const at = (isFinite(Number(ts)) && Number(ts) > 0) ? Number(ts) : now();
   const byId = new Map();

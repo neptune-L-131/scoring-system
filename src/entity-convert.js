@@ -114,6 +114,8 @@ function choreToAffair(id) {
     archivedAt: null,
     budget: c.budget || null,
     budgetRef: c.budgetRef || null,
+    // 情境随记录保留；项目当前没有情境界面，转换期间不可见，但不丢数据
+    tags: Array.isArray(c.tags) ? c.tags.slice() : [],
   };
   const rec = baseRecord('chore->affair', c.id, clone(c), stashAffairUndo(c.id));
   state.chores = state.chores.filter(function (x) { return x.id !== c.id; });
@@ -153,7 +155,7 @@ function affairToChore(id) {
     // 项目的产出走进度轴；转为杂事后不保留“每次完成产出”，只保留领域归属
     progressAmount: 0,
     progressDomainIds: a.domainId ? [a.domainId] : [],
-    tags: [],
+    tags: Array.isArray(a.tags) ? a.tags.slice() : [],
   };
   const rec = baseRecord('affair->chore', a.id, clone(a), stashAffairUndo(a.id));
   state.affairs = state.affairs.filter(function (x) { return x.id !== a.id; });

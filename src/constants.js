@@ -69,6 +69,9 @@ const STAGE_PRESET_KEY='score_sys_stage_presets';
 const BACKUP_KEY='score_sys_last_backup';
 const LOG_MAX=300;
 const LOG_DISPLAY=100;
+// 撤销留痕：旁挂副本只用于流水面板灰显，独立于主账本；
+// 上限刻意远小于 LOG_MAX，且不参与 LOG_MAX 的容量计算，避免变相扩大日志容量。
+const REVERSED_LOG_KEEP=100;
 const WEEK_ANCHOR_NAMES={1:'周一',2:'周二',3:'周三',4:'周四',5:'周五',6:'周六',7:'周日'};
 const AFFAIR_CURVES={
   even:[10,20,30,40,50,60,70,80,90,100],
@@ -79,7 +82,11 @@ const AFFAIR_CURVES={
 const COND_METRIC_KEYS=['checkins','vitality','progress','achievement','new_tasks','new_domains','budget_entry_amount','budget_period_spent','budget_period_overspend','budget_entry_count',
   // 阶段 1：项目 / 杂事 / 任务不活跃
   'affair_completed','affair_steps','affair_stall','affair_progress','affair_achievement',
+  // 单实体条件（D1）：只对 targetType:'entity' 有意义
+  'affair_cell','chore_overdue_days','chore_cycle_due_in',
   'chore_completed','chore_overdue','chore_decay','chore_batches','chore_idle','task_idle',
+  // 情境指标：超期为点态，完成数为窗口（与 chore_completed 同口径）
+  'chore_tag_overdue','chore_tag_completed',
   // 阶段 3：商品门槛通用条件
   'lifetime_achievement','domain_activity','milestone_unlocked','checkin_streak','budget_remaining',
   // 阶段 6：自定义资产（持有 / 本期发放 / 本期消耗）
@@ -89,10 +96,21 @@ const COND_METRIC_KEYS=['checkins','vitality','progress','achievement','new_task
 const COND_ASSET_METRICS=['asset_hold','asset_issued','asset_spent'];
 const ASSET_LOG_CATS=['issue','spend','expire','freeze','unfreeze','adjust'];
 const ASSET_LOG_CAT_NAMES={issue:'发放',spend:'消耗',expire:'过期',freeze:'冻结',unfreeze:'解冻',adjust:'手动调整'};
-const COND_POINT_METRICS=['affair_stall','chore_overdue','chore_idle','task_idle',
+const COND_POINT_METRICS=['affair_stall','chore_overdue','chore_idle','task_idle','chore_tag_overdue',
+  'affair_cell','chore_overdue_days','chore_cycle_due_in',
   'lifetime_achievement','milestone_unlocked','checkin_streak','budget_remaining'];
-const COND_AFFAIR_METRICS=['affair_completed','affair_steps','affair_stall','affair_progress','affair_achievement'];
-const COND_CHORE_METRICS=['chore_completed','chore_overdue','chore_decay','chore_batches','chore_idle'];
+const COND_AFFAIR_METRICS=['affair_completed','affair_steps','affair_stall','affair_progress','affair_achievement','affair_cell'];
+const COND_CHORE_METRICS=['chore_completed','chore_overdue','chore_decay','chore_batches','chore_idle','chore_tag_overdue','chore_tag_completed','chore_overdue_days','chore_cycle_due_in'];
+// 单实体目标（D1）：首批只允许项目 / 杂事。target 存 'kind:id'。
+const COND_ENTITY_KINDS=['affair','chore'];
+const COND_ENTITY_METRICS={
+  affair:['affair_cell','affair_steps','affair_stall','affair_progress','affair_completed'],
+  chore:['chore_completed','chore_overdue_days','chore_idle','chore_cycle_due_in']
+};
+// 实体条件下哪些指标是点态：事件触发编译期据此拒绝（window 型仍可编译）。
+const COND_ENTITY_POINT_METRICS=['affair_cell','affair_stall','affair_progress','chore_overdue_days','chore_idle','chore_cycle_due_in'];
+// 只在单实体目标下才有定义的指标（其余 affair_*/chore_* 仍保留聚合语义）。
+const COND_ENTITY_ONLY_METRICS=['affair_cell','chore_overdue_days','chore_cycle_due_in'];
 const COND_GATE_METRICS=['lifetime_achievement','domain_activity','milestone_unlocked','checkin_streak','budget_remaining'];
 const COND_RANGES=[
   {v:'period',n:'本周期'},
@@ -101,4 +119,4 @@ const COND_RANGES=[
   {v:'today',n:'今天'}
 ];
 
-export { KEY, THEME_KEY, SCHEMA_VERSION, CHORE_TAG_MAX_COUNT, CHORE_TAG_MAX_LEN, ASSET_VERSION, FLOW_VERSION, FLOW_MAX_STEPS, FLOW_MAX_DEPTH, FLOW_RUN_KEEP, FLOW_IDEM_KEEP, FLOW_ATOM_MAX_CURRENCY, FLOW_ATOM_MAX_ASSET, FLOW_ATOM_MAX_ARCHIVE, FLOW_ATOM_MAX_NOTES, FLOW_ATOM_NOTE_MAX_LEN, FLOW_ATOM_IDLE_DAYS_MAX, FLOW_ATOM_MAX_CREATE, FLOW_ATOM_CREATE_NAME_MAX, PRODUCT_EXEC_MAX_PER_PERIOD, EVENT_KEEP, EVENT_MAX_FLOWS_PER_EVENT, EVENT_DEPTH_MAX, PROD_TIERS, PROD_TIER_NAMES, ACTIVITY_MAX_DAYS, STATS_VERSION, STATS_KEEP_DAYS, STATS_ENTITY_MAPS, STATS_SCALARS, SHADOW_MAX, ACH_EARN_SOURCES, BUDGET_VERSION, BUDGET_RULE_KINDS, BUDGET_RULE_NAMES, BUDGET_TARGET_NAMES, CURRENCIES, BUDGET_LEDGER_MAX, BUDGET_PERIOD_KEEP, AUDIT_MAX, STAGE_NAMES, STAGE_PRESET_KEY, BACKUP_KEY, LOG_MAX, LOG_DISPLAY, WEEK_ANCHOR_NAMES, AFFAIR_CURVES, COND_METRIC_KEYS, COND_ASSET_METRICS, ASSET_LOG_CATS, ASSET_LOG_CAT_NAMES, COND_POINT_METRICS, COND_AFFAIR_METRICS, COND_CHORE_METRICS, COND_GATE_METRICS, COND_RANGES };
+export { KEY, THEME_KEY, SCHEMA_VERSION, CHORE_TAG_MAX_COUNT, CHORE_TAG_MAX_LEN, ASSET_VERSION, FLOW_VERSION, FLOW_MAX_STEPS, FLOW_MAX_DEPTH, FLOW_RUN_KEEP, FLOW_IDEM_KEEP, FLOW_ATOM_MAX_CURRENCY, FLOW_ATOM_MAX_ASSET, FLOW_ATOM_MAX_ARCHIVE, FLOW_ATOM_MAX_NOTES, FLOW_ATOM_NOTE_MAX_LEN, FLOW_ATOM_IDLE_DAYS_MAX, FLOW_ATOM_MAX_CREATE, FLOW_ATOM_CREATE_NAME_MAX, PRODUCT_EXEC_MAX_PER_PERIOD, EVENT_KEEP, EVENT_MAX_FLOWS_PER_EVENT, EVENT_DEPTH_MAX, PROD_TIERS, PROD_TIER_NAMES, ACTIVITY_MAX_DAYS, STATS_VERSION, STATS_KEEP_DAYS, STATS_ENTITY_MAPS, STATS_SCALARS, SHADOW_MAX, ACH_EARN_SOURCES, BUDGET_VERSION, BUDGET_RULE_KINDS, BUDGET_RULE_NAMES, BUDGET_TARGET_NAMES, CURRENCIES, BUDGET_LEDGER_MAX, BUDGET_PERIOD_KEEP, AUDIT_MAX, STAGE_NAMES, STAGE_PRESET_KEY, BACKUP_KEY, LOG_MAX, LOG_DISPLAY, REVERSED_LOG_KEEP, WEEK_ANCHOR_NAMES, AFFAIR_CURVES, COND_METRIC_KEYS, COND_ASSET_METRICS, ASSET_LOG_CATS, ASSET_LOG_CAT_NAMES, COND_POINT_METRICS, COND_AFFAIR_METRICS, COND_CHORE_METRICS, COND_GATE_METRICS, COND_RANGES, COND_ENTITY_KINDS, COND_ENTITY_METRICS, COND_ENTITY_POINT_METRICS, COND_ENTITY_ONLY_METRICS };

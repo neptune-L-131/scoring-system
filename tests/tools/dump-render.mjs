@@ -88,6 +88,21 @@ api.resetState({
       ach: { enabled: false, amount: 0 }, createdAt: at(1, 9), startedAt: null, doneAt: null,
       archived: true, archivedAt: at(4, 9),
     },
+    // 盲区 1：已归档项目仍持有委派步骤，其杂事必须回到待办池并打上「委派项目已归档」标记
+    {
+      id: 'a6', name: '归档委派项目', totalReward: 3, curve: { type: 'even', values: [10, 20, 30, 40, 50, 60, 70, 80, 90, 100] },
+      currentCell: 0, alreadyGiven: 0, domainId: 'd2', plannedAt: null,
+      steps: [{ text: '已归档的委派步骤', doneAt: null, plannedAt: null, choreRef: { id: 'c5', origin: 'inline' } }],
+      ach: { enabled: false, amount: 0 }, createdAt: at(1, 9), startedAt: at(1, 9), doneAt: null,
+      archived: true, archivedAt: at(4, 9),
+    },
+    // 盲区 2：议程里既有委派步骤、又有它引用的杂事；杂事进议程时步骤必须去重
+    {
+      id: 'a7', name: '议程去重项目', totalReward: 4, curve: { type: 'even', values: [10, 20, 30, 40, 50, 60, 70, 80, 90, 100] },
+      currentCell: 0, alreadyGiven: 0, domainId: 'd2', plannedAt: null,
+      steps: [{ text: '今日委派步骤', doneAt: null, plannedAt: at(10, 9), choreRef: { id: 'c6', origin: 'inline' } }],
+      ach: { enabled: false, amount: 0 }, createdAt: at(2, 9), startedAt: at(2, 9), doneAt: null, archived: false,
+    },
   ],
   affairPresets: [{
     id: 'ap1', name: '常规项目', totalReward: 8, curve: { type: 'even', values: [10, 20, 30, 40, 50, 60, 70, 80, 90, 100] },
@@ -98,6 +113,10 @@ api.resetState({
     { id: 'c2', name: '洗车', createdAt: at(1, 9), plannedAt: at(10, 8), done: true, doneAt: at(10, 9), archived: false, freshDays: 5, settled: false, decayKey: null },
     { id: 'c3', name: '归档杂事', createdAt: at(1, 9), plannedAt: null, done: true, doneAt: at(2, 9), archived: true, archivedAt: at(3, 9), freshDays: 5, settled: false, decayKey: null },
     { id: 'c4', name: '浇花', createdAt: at(2, 9), plannedAt: null, done: false, doneAt: null, archived: false, freshDays: 5, settled: false, decayKey: null },
+    // 盲区 1：被已归档项目委派，但仍应留在待办池
+    { id: 'c5', name: '归档项目委派杂事', createdAt: at(10, 8), plannedAt: at(11, 9), done: false, doneAt: null, archived: false, freshDays: 5, settled: false, decayKey: null },
+    // 盲区 2：与 a7 的委派步骤同一天进入议程，用于验证去重
+    { id: 'c6', name: '议程委派杂事', createdAt: at(2, 9), plannedAt: at(10, 9), done: false, doneAt: null, archived: false, freshDays: 5, settled: false, decayKey: null },
   ],
   achievements: [
     { id: 'ach1', name: '跑满 100 公里', domainId: 'd_default', threshold: 100, points: 5, unlocked: false, unlockedAt: null },
@@ -169,6 +188,7 @@ const out = {
     archiveGroups: capturePanel('archiveGroups'),
     chorePanel: capturePanel('chorePanel'),
     affairPanel: capturePanel('affairPanel'),
+    todayAgenda: capturePanel('todayAgenda'),
     logList: capturePanel('logList'),
     shadowList: capturePanel('shadowList'),
     achGroups: capturePanel('achGroups'),

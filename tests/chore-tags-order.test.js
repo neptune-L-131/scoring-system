@@ -57,6 +57,119 @@ describe('标签：形状守卫与独立命名空间', () => {
   });
 });
 
+describe('情境：标签键与卡片显示', () => {
+  it('choreTagKey 忽略前导 @ 与大小写；只有 @ 时回退原文', () => {
+    expect(api.choreTagKey('  @电脑 ')).toBe('电脑');
+    expect(api.choreTagKey('电脑')).toBe('电脑');
+    expect(api.choreTagKey('PC')).toBe(api.choreTagKey('pc'));
+    expect(api.choreTagKey('@')).toBe('@');
+    expect(api.choreTagKey('')).toBe('');
+    expect(api.choreTagMatches('@电脑', '电脑')).toBe(true);
+    expect(api.choreTagMatches('电脑', '有电话')).toBe(false);
+  });
+
+  it('choreTagIncludes 按键判重，@ 与大小写不产生第二个', () => {
+    expect(api.choreTagIncludes(['电脑'], '@电脑')).toBe(true);
+    expect(api.choreTagIncludes(['PC'], 'pc')).toBe(true);
+    expect(api.choreTagIncludes(['电脑'], '有电话')).toBe(false);
+  });
+
+  it('collectChoreTags 按使用次数排序，同键取首次拼写，可按归档过滤', () => {
+    const chores = [
+      { tags: ['有电话'] },
+      { tags: ['@电脑', 'PC', '有电话'] },
+      { tags: ['出门'], archived: true },
+    ];
+    const all = api.collectChoreTags(chores, { includeArchived: true });
+    expect(all.map(x => x.key)).toEqual(['有电话', '电脑', 'pc', '出门']);
+    expect(all[0].count).toBe(2);
+    expect(all[1].label).toBe('@电脑');
+    const live = api.collectChoreTags(chores, { includeArchived: false });
+    expect(live.map(x => x.key)).toEqual(['有电话', '电脑', 'pc']);
+  });
+
+  it('卡片最多显示前 3 个情境，其余收成 +n；无标签不产生节点', () => {
+    api.resetState({
+      domains: [{ id: 'd_default', name: '默认' }],
+      logs: [],
+      chores: [
+        Object.assign(choreRow('a', '四条情境'), { tags: ['情境一', '情境二', '情境三', '情境四'] }),
+        Object.assign(choreRow('b', '没有情境'), { tags: [] }),
+      ],
+    });
+    api.resetWorkUiState();
+    api.renderWork();
+    const html = globalThis.document.getElementById('chorePanel').innerHTML;
+    expect((html.match(/class="chore-tags"/g) || []).length).toBe(1);
+    expect((html.match(/<span class="tag d/g) || []).length).toBe(4);
+    expect(html).toContain('+1');
+  });
+});
+
+describe('待办池：情境筛选', () => {
+  it('没有任何情境时不渲染筛选条', () => {
+    api.resetState({
+      domains: [{ id: 'd_default', name: '默认' }],
+      logs: [],
+      chores: [choreRow('a', '没有情境')],
+    });
+    api.resetWorkUiState();
+    api.renderWork();
+    const html = globalThis.document.getElementById('chorePanel').innerHTML;
+    expect(html).not.toContain('chore-tag-filter');
+  });
+
+  it('有情境才渲染；单选过滤待办；再次点击同一项取消', () => {
+    api.resetState({
+      domains: [{ id: 'd_default', name: '默认' }],
+      logs: [],
+      chores: [
+        Object.assign(choreRow('a', '电脑上的事'), { tags: ['电脑'] }),
+        Object.assign(choreRow('b', '电话上的事'), { tags: ['电话'] }),
+        Object.assign(choreRow('c', '没有情境')),
+        Object.assign(choreRow('d', '已完成的电话事'), { tags: ['电话'], done: true, doneAt: at(9, 9) }),
+      ],
+    });
+    api.resetWorkUiState();
+    api.renderWork();
+    let html = globalThis.document.getElementById('chorePanel').innerHTML;
+    expect(html).toContain('chore-tag-filter');
+    expect((html.match(/chore-tag-fbtn/g) || []).length).toBe(3);
+
+    api.setChoreTagFilter('电脑');
+    html = globalThis.document.getElementById('chorePanel').innerHTML;
+    expect(html).toContain('data-chore-id="a"');
+    expect(html).not.toContain('data-chore-id="b"');
+    expect(html).not.toContain('data-chore-id="c"');
+    // 已完成区不受「此刻情境」影响
+    expect(html).toContain('data-chore-id="d"');
+
+    api.setChoreTagFilter('电脑');
+    html = globalThis.document.getElementById('chorePanel').innerHTML;
+    expect(html).toContain('data-chore-id="a"');
+    expect(html).toContain('data-chore-id="b"');
+    expect(html).toContain('data-chore-id="c"');
+  });
+
+  it('筛选键失效时自动回到全部', () => {
+    api.resetState({
+      domains: [{ id: 'd_default', name: '默认' }],
+      logs: [],
+      chores: [Object.assign(choreRow('a', '电脑上的事'), { tags: ['电脑'] })],
+    });
+    api.resetWorkUiState();
+    api.renderWork();
+    api.setChoreTagFilter('电脑');
+    expect(api.getState().chores[0].tags).toEqual(['电脑']);
+    // 剔除最后一个该情境后重新渲染：筛选键失效，自动回到全部
+    api.patchState(function(s){ s.chores[0].tags = []; });
+    api.renderWork();
+    const html = globalThis.document.getElementById('chorePanel').innerHTML;
+    expect(html).not.toContain('chore-tag-filter');
+    expect(html).toContain('data-chore-id="a"');
+  });
+});
+
 describe('排序：序列形状与幂等修复', () => {
   it('归一：去重、丢弃非字符串/空串/已不存在的实体', () => {
     expect(api.normalizeChoreOrder(undefined)).toEqual([]);

@@ -9,6 +9,7 @@ import { state } from './state.js';
 // ===== Tab =====
 function goTab(name){
   // 打开预算页是惰性结算触发点之一：先把已结束周期结清再展示
+  // reconcileAll 的 txn 为 save:'none'；确有结算变化时才由这里落盘
   if(name==='budget'&&BudgetEngine.reconcileAll())save();
   // 只有真正切到另一个标签页才复位滚动；重复点当前标签不打断阅读位置
   const prev=document.querySelector('.tab.active');

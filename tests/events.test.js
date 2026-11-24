@@ -23,8 +23,8 @@ beforeEach(() => {
 });
 
 describe('事件对象与载荷', () => {
-  it('只接受打卡与购买两类事件，键由类型与来源 id 组成', () => {
-    expect(api.EVENT_KINDS).toEqual(['checkin', 'purchase']);
+  it('只接受打卡、购买与杂事完成三类事件，键由类型与来源 id 组成', () => {
+    expect(api.EVENT_KINDS).toEqual(['checkin', 'purchase', 'chore.completed']);
     const ev = checkinEvent('t1', { taskId: 't1', streak: 3, cost: 0, foo: 'bar' });
     expect(ev).toMatchObject({ v: 1, kind: 'checkin', key: 'checkin:t1', sourceId: 't1', occurredAt: T });
     expect(ev.payload).toEqual({ taskId: 't1', streak: 3, cost: 0 });
@@ -32,6 +32,20 @@ describe('事件对象与载荷', () => {
     expect(api.makeEvent('checkin', '', T, {})).toBeNull();
     expect(api.makeEvent('checkin', 't1', 0, {})).toBeNull();
     expect(api.eventKeyOf('purchase', 'o1')).toBe('purchase:o1');
+  });
+
+  it('杂事完成事件：一次性用完成时刻、循环用到期日作来源 id', () => {
+    const oneOff = api.makeChoreCompletedEvent({ id: 'c1', name: '洗碗' }, { ts: T, due: 0 });
+    expect(oneOff).toMatchObject({ kind: 'chore.completed', key: 'chore.completed:c1:done:' + T, occurredAt: T });
+    expect(oneOff.payload).toEqual({ choreId: 'c1', name: '洗碗', doneAt: T, due: 0 });
+
+    const due = T - 86400000;
+    const cyc = api.makeChoreCompletedEvent({ id: 'c2', name: '浇花', cycle: { unit: 'week' } }, { ts: T, due: due });
+    expect(cyc.key).toBe('chore.completed:c2:due:' + due);
+    expect(cyc.payload).toMatchObject({ choreId: 'c2', cycleUnit: 'week', due: due });
+    // 同一次循环完成重复构造，键稳定不变
+    expect(api.makeChoreCompletedEvent({ id: 'c2' }, { ts: T + 1000, due: due }).key).toBe(cyc.key);
+    expect(api.makeChoreCompletedEvent({ id: 'c3' }, { ts: 0, due: 0 })).toBeNull();
   });
 
   it('购买事件保留资产支付明细，非法金额被丢弃', () => {

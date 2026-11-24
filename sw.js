@@ -16,7 +16,7 @@
 // tests/sw-assets.test.js 会校验：清单与仓库实际文件一致、VERSION 与缓存名一致。
 'use strict';
 
-const VERSION = '2026-11-22.12';
+const VERSION = '2026-11-24.2';
 const CACHE = 'score-sys-' + VERSION;
 
 // 整版清单（相对 sw.js 所在目录）
@@ -69,6 +69,8 @@ const PRECACHE = [
   './src/view-models.js',
   './src/render-targets.js',
   './src/render-work.js',
+  './src/chore-render.js',
+  './src/stage-bars.js',
   './src/render-bank.js',
   './src/asset-ui.js',
   './src/asset-use.js',

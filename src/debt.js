@@ -41,6 +41,7 @@ function processDailyTaskDebts(silent=false){
     task.lastDebtDate=todayTs;
   });
 
+  // silent 时由调度器/调用方统一落盘；独立调用才在这里收尾
   if(!silent)save();
 }
 
